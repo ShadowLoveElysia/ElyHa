@@ -11,9 +11,15 @@
   const ghostUtils = window.ElyhaWebGhostUtils || {};
   const graphUtils = window.ElyhaWebGraphUtils || {};
   const textUtils = window.ElyhaWebTextUtils || {};
+  const diffUtils = window.ElyhaWebDiffUtils || {};
+  const artifactUtils = window.ElyhaWebArtifactUtils || {};
   const apiActions = window.ElyhaWebApiActions || {};
   const aiActions = window.ElyhaWebAiActions || {};
   const configActions = window.ElyhaWebConfigActions || {};
+  const workflowActions = window.ElyhaWebAppWorkflowActions || {};
+  const appGhostActions = window.ElyhaWebAppGhostActions || {};
+  const projectActions = window.ElyhaWebAppProjectActions || {};
+  const nodeActions = window.ElyhaWebAppNodeActions || {};
 
   const NODE_WIDTH = constants.NODE_WIDTH || 224;
   const NODE_HEIGHT = constants.NODE_HEIGHT || 120;
@@ -88,6 +94,16 @@
   const isWorkflowOutlineConfirmedValue = textUtils.isWorkflowOutlineConfirmed;
   const parseBeatListValue = textUtils.parseBeatList;
   const beatTitleValue = textUtils.beatTitle;
+  const normalizeDiffKindValue = diffUtils.normalizeDiffKind;
+  const diffPrefixValue = diffUtils.diffPrefix;
+  const resolveActiveChatContextValue = artifactUtils.resolveActiveChatContext;
+  const nextArtifactDiffNodeIdValue = artifactUtils.nextArtifactDiffNodeId;
+  const shouldShowArtifactDiffValue = artifactUtils.shouldShowArtifactDiff;
+  const buildDefaultWorkflowStateValue = workflowActions.buildDefaultWorkflowState;
+  const createWorkflowActionHandlersValue = workflowActions.createWorkflowActionHandlers;
+  const createGhostActionHandlersValue = appGhostActions.createGhostActionHandlers;
+  const createProjectActionHandlersValue = projectActions.createProjectActionHandlers;
+  const createNodeActionHandlersValue = nodeActions.createNodeActionHandlers;
 
   if (
     !apiRequest ||
@@ -133,12 +149,28 @@
     !isWorkflowBackgroundConfirmedValue ||
     !isWorkflowOutlineConfirmedValue ||
     !parseBeatListValue ||
-    !beatTitleValue
+    !beatTitleValue ||
+    !normalizeDiffKindValue ||
+    !diffPrefixValue ||
+    !resolveActiveChatContextValue ||
+    !nextArtifactDiffNodeIdValue ||
+    !shouldShowArtifactDiffValue ||
+    !buildDefaultWorkflowStateValue ||
+    !createWorkflowActionHandlersValue ||
+    !createGhostActionHandlersValue ||
+    !createProjectActionHandlersValue ||
+    !createNodeActionHandlersValue
   ) {
     throw new Error("Web runtime modules failed to load. Please check /web/static/web/*.js");
   }
 
   function App() {
+    const buildDefaultWorkflowState = buildDefaultWorkflowStateValue;
+    const resolveActiveChatContext = resolveActiveChatContextValue;
+    const nextArtifactDiffNodeId = nextArtifactDiffNodeIdValue;
+    const shouldShowArtifactDiff = shouldShowArtifactDiffValue;
+    const normalizeDiffKind = normalizeDiffKindValue;
+    const diffPrefix = diffPrefixValue;
     const [locale, setLocale] = useState(function () {
       const cached = window.localStorage.getItem("elyha_web_locale") || DEFAULT_LOCALE;
       return SUPPORTED_LOCALES.includes(cached) ? cached : DEFAULT_LOCALE;
@@ -302,26 +334,11 @@
       return normalizePersistedChatMessages(persistedWebState.chat_messages);
     });
     const [chatBusy, setChatBusy] = useState(false);
-    const [chatWorkflow, setChatWorkflow] = useState({
-      enabled: false,
-      step: "idle",
-      mode: "",
-      sync_context: "",
-      sync_background_markdown: "",
-      sync_must_confirm: [],
-      sync_citations: [],
-      sync_risk_notes: [],
-      specify: "",
-      clarify_questions: [],
-      clarify_answers: "",
-      plan_notes: "",
-      constraints: "",
-      tone: "",
-      outline_markdown: "",
-      chapter_beats: [],
-      next_steps: []
+    const [chatWorkflow, setChatWorkflow] = useState(function () {
+      return buildDefaultWorkflowState();
     });
     const [artifactDiffSegments, setArtifactDiffSegments] = useState([]);
+    const [artifactDiffNodeId, setArtifactDiffNodeId] = useState("");
     const [collapsedGroupIds, setCollapsedGroupIds] = useState(function () {
       const raw = persistedWebState.collapsed_group_ids;
       if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
@@ -743,1066 +760,6 @@
       });
     }
 
-    function buildDefaultWorkflowState() {
-      return {
-        enabled: false,
-        step: "idle",
-        mode: "",
-        sync_context: "",
-        sync_background_markdown: "",
-        sync_must_confirm: [],
-        sync_citations: [],
-        sync_risk_notes: [],
-        specify: "",
-        clarify_questions: [],
-        clarify_answers: "",
-        plan_notes: "",
-        constraints: "",
-        tone: "",
-        outline_markdown: "",
-        chapter_beats: [],
-        next_steps: []
-      };
-    }
-
-    const parseWorkflowMode = parseWorkflowModeValue;
-    const isWorkflowBackgroundConfirmed = isWorkflowBackgroundConfirmedValue;
-    const isWorkflowOutlineConfirmed = isWorkflowOutlineConfirmedValue;
-    const parseBeatList = parseBeatListValue;
-    const beatTitle = function (beat, index) {
-      return beatTitleValue(beat, index, {
-        defaultPrefix: t("web.outline.default_scene_prefix")
-      });
-    };
-
-    async function materializeWorkflowGraphPlan(flow) {
-      if (!projectId) {
-        return false;
-      }
-      const beats = parseBeatList(flow.chapter_beats, 12);
-      if (beats.length === 0) {
-        return false;
-      }
-      const groupNode = await runApi(
-        function () {
-          return apiRequest("/api/projects/" + projectId + "/nodes", {
-            method: "POST",
-            body: {
-              title: t("web.outline.default_group_title"),
-              type: "group",
-              status: "draft",
-              storyline_id: null,
-              pos_x: 120,
-              pos_y: 120,
-              metadata: {
-                group_kind: "chapter",
-                group_width: 920,
-                group_height: 520,
-                ai_from_workflow: true,
-                ai_workflow_mode: flow.mode || "original"
-              }
-            }
-          });
-        },
-        null
-      );
-      if (!groupNode) {
-        return false;
-      }
-      const created = [];
-      for (let index = 0; index < beats.length; index += 1) {
-        const beat = beats[index];
-        const node = await runApi(
-          function () {
-            return apiRequest("/api/projects/" + projectId + "/nodes", {
-              method: "POST",
-              body: {
-                title: beatTitle(beat, index),
-                type: "chapter",
-                status: "draft",
-                storyline_id: null,
-                pos_x: 170 + index * 220,
-                pos_y: 220,
-                metadata: {
-                  group_parent_id: groupNode.id,
-                  group_binding: "bound",
-                  ai_from_workflow: true,
-                  content: String(beat || ""),
-                  summary: String(beat || "").slice(0, 180),
-                  narrative_index: index + 1
-                }
-              }
-            });
-          },
-          null
-        );
-        if (node) {
-          created.push(node);
-        }
-      }
-      for (let i = 1; i < created.length; i += 1) {
-        await runApi(
-          function () {
-            return apiRequest("/api/projects/" + projectId + "/edges", {
-              method: "POST",
-              body: {
-                source_id: created[i - 1].id,
-                target_id: created[i].id,
-                label: "next"
-              }
-            });
-          },
-          null
-        );
-      }
-      await refreshProjectData(projectId, true);
-      await validateGraph();
-      pushToast("ok", t("web.workflow.graph_created", { count: String(created.length) }));
-      return created.length > 0;
-    }
-
-    async function saveWorkflowOutlineNode(flow) {
-      if (!projectId) {
-        return false;
-      }
-      const outlineText = String(flow.outline_markdown || "").trim();
-      if (!outlineText) {
-        return false;
-      }
-      const node = await runApi(
-        function () {
-          return apiRequest("/api/projects/" + projectId + "/nodes", {
-            method: "POST",
-            body: {
-              title: t("web.outline.default_node_title"),
-              type: "chapter",
-              status: "generated",
-              storyline_id: null,
-              pos_x: 120,
-              pos_y: 120,
-              metadata: {
-                project_outline: true,
-                outline_kind: "project_outline",
-                outline_mode: flow.mode || "",
-                outline_sync_context: String(flow.sync_context || ""),
-                outline_sync_background: String(flow.sync_background_markdown || ""),
-                outline_sync_must_confirm: parseBeatList(flow.sync_must_confirm, 16),
-                outline_sync_citations: parseBeatList(flow.sync_citations, 20),
-                outline_sync_risk_notes: parseBeatList(flow.sync_risk_notes, 12),
-                outline_questions: parseBeatList(flow.clarify_questions, 12),
-                outline_clarify_answers: String(flow.clarify_answers || ""),
-                outline_plan_notes: String(flow.plan_notes || ""),
-                outline_constraints: String(flow.constraints || ""),
-                outline_tone: String(flow.tone || ""),
-                outline_chapter_beats: parseBeatList(flow.chapter_beats, 20),
-                outline_next_steps: parseBeatList(flow.next_steps, 12),
-                content: outlineText,
-                summary: outlineText.slice(0, 200)
-              }
-            }
-          });
-        },
-        null
-      );
-      if (!node) {
-        return false;
-      }
-      await refreshProjectData(projectId, true);
-      setSelectedNodeId(node.id);
-      setSidebarTab("node");
-      setChatContextNodeId(node.id);
-      setChatOpen(true);
-      setArtifactOpen(false);
-      pushToast("ok", t("web.outline.saved"));
-      return true;
-    }
-
-    function createGhostPlansFromOptions(sourceNodeId, options) {
-      const source = nodesRef.current.find(function (item) {
-        return item.id === sourceNodeId;
-      });
-      if (!source || !Array.isArray(options) || options.length === 0) {
-        return [];
-      }
-      const sourceSize = nodeRenderSize(source);
-      const baseX = asNumber(source.pos_x, 0) + sourceSize.width + 170;
-      const baseY = asNumber(source.pos_y, 0);
-      const created = [];
-      options.forEach(function (option, index) {
-        const title = String(option && option.title ? option.title : "").trim() || t("web.ghost.untitled");
-        const description = String(option && option.description ? option.description : "").trim();
-        const outlineSteps = pickGhostOutlineSteps(option, description);
-        const summary = description || (outlineSteps.length > 0 ? outlineSteps[0] : "-");
-        const sentiment = normalizeGhostSentiment(
-          option && option.sentiment
-            ? option.sentiment
-            : inferGhostSentimentFromText(title, [summary].concat(outlineSteps).join("\n"))
-        );
-        const rootId = ghostIdWithSeed("root_" + index.toString());
-        const rootPlan = {
-          id: rootId,
-          source_id: sourceNodeId,
-          source_ghost_id: "",
-          chain_root_id: rootId,
-          chain_index: 0,
-          source_title: source.title,
-          title: title.slice(0, 200),
-          description: summary,
-          outline_steps: outlineSteps,
-          sentiment: sentiment,
-          storyline_id: source.storyline_id || "",
-          pos_x: baseX + index * 230,
-          pos_y: baseY + (index - 1) * 140,
-          created_at: new Date().toISOString()
-        };
-        created.push(rootPlan);
-        let parent = rootPlan;
-        const followUps = outlineSteps.slice(1, 3);
-        while (followUps.length < 2) {
-          followUps.push(t("web.ghost.chain_fallback", { index: followUps.length + 1 }));
-        }
-        followUps.forEach(function (stepText, stepIndex) {
-          const childId = ghostIdWithSeed("next_" + index.toString() + "_" + (stepIndex + 1).toString());
-          const childTitle = title + " · " + t("web.ghost.chain_step", { index: stepIndex + 1 });
-          const child = {
-            id: childId,
-            source_id: sourceNodeId,
-            source_ghost_id: parent.id,
-            chain_root_id: rootId,
-            chain_index: stepIndex + 1,
-            source_title: source.title,
-            title: childTitle.slice(0, 200),
-            description: String(stepText || "").trim() || "-",
-            outline_steps: [String(stepText || "").trim() || "-"],
-            sentiment: sentiment,
-            storyline_id: source.storyline_id || "",
-            pos_x: asNumber(parent.pos_x, 0) + 248,
-            pos_y: asNumber(parent.pos_y, 0),
-            created_at: new Date().toISOString()
-          };
-          created.push(child);
-          parent = child;
-        });
-      });
-      return created;
-    }
-
-    const ghostOutlineText = ghostOutlineTextValue;
-    const sentimentToneColor = sentimentToneColorValue;
-
-    function archiveGhostPayload(plan) {
-      if (!plan || typeof plan !== "object") {
-        return null;
-      }
-      return {
-        id: String(plan.id || ghostIdWithSeed("archived_src")),
-        source_id: String(plan.source_id || ""),
-        source_ghost_id: String(plan.source_ghost_id || ""),
-        chain_root_id: String(plan.chain_root_id || plan.id || ""),
-        chain_index: Math.max(0, Math.floor(asNumber(plan.chain_index, 0))),
-        source_title: String(plan.source_title || ""),
-        title: String(plan.title || t("web.ghost.untitled")).slice(0, 200),
-        description: String(plan.description || "").trim(),
-        outline_steps: normalizeGhostOutlineSteps(plan.outline_steps || plan.description, 3),
-        sentiment: normalizeGhostSentiment(plan.sentiment),
-        storyline_id: String(plan.storyline_id || ""),
-        pos_x: asNumber(plan.pos_x, 0),
-        pos_y: asNumber(plan.pos_y, 0),
-        created_at: String(plan.created_at || new Date().toISOString())
-      };
-    }
-
-    function archiveGhostPlans(projectValue, plansToArchive) {
-      const archived = safeArray(plansToArchive)
-        .map(function (plan) {
-          const payload = archiveGhostPayload(plan);
-          if (!payload) {
-            return null;
-          }
-          return {
-            id: "ghost_arc_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8),
-            project_id: String(projectValue || ""),
-            archived_at: new Date().toISOString(),
-            payload: payload
-          };
-        })
-        .filter(Boolean);
-      if (archived.length === 0) {
-        return 0;
-      }
-      setGhostArchive(function (prev) {
-        return archived.concat(prev).slice(0, 260);
-      });
-      return archived.length;
-    }
-
-    function restoreGhostFromArchive(archiveId) {
-      const picked = ghostArchive.find(function (item) {
-        return item.id === archiveId;
-      });
-      if (!picked || !picked.payload || typeof picked.payload !== "object") {
-        return false;
-      }
-      setGhostArchive(function (prev) {
-        return prev.filter(function (item) {
-          return item.id !== archiveId;
-        });
-      });
-      const restoredPlan = picked.payload;
-      const restored = Object.assign({}, restoredPlan, {
-        id: ghostIdWithSeed("restored"),
-        created_at: new Date().toISOString(),
-        source_ghost_id: String(restoredPlan.source_ghost_id || "")
-      });
-      setGhostPlans(function (prev) {
-        return prev.concat([restored]);
-      });
-      setExpandedGhostIds(function (prev) {
-        return Object.assign({}, prev, { [restored.id]: true });
-      });
-      pushToast("ok", t("web.ghost.archive_restored"));
-      return true;
-    }
-
-    function removeGhostArchiveItem(archiveId) {
-      const exists = ghostArchive.some(function (item) {
-        return item.id === archiveId;
-      });
-      if (!exists) {
-        return false;
-      }
-      setGhostArchive(function (prev) {
-        return prev.filter(function (item) {
-          return item.id !== archiveId;
-        });
-      });
-      return true;
-    }
-
-    function clearGhostArchiveForProject(projectValue) {
-      const projectText = String(projectValue || "");
-      const deleted = ghostArchive.filter(function (item) {
-        return String(item.project_id || "") === projectText;
-      }).length;
-      if (deleted === 0) {
-        return 0;
-      }
-      setGhostArchive(function (prev) {
-        return prev.filter(function (item) {
-          return String(item.project_id || "") !== projectText;
-        });
-      });
-      pushToast("ok", t("web.ghost.archive_cleared", { count: deleted }));
-      return deleted;
-    }
-
-    const pruneGhostStateMap = pruneGhostStateMapValue;
-
-    function toggleGhostPreview(ghostId) {
-      if (!ghostId) {
-        return;
-      }
-      setExpandedGhostIds(function (prev) {
-        const next = Object.assign({}, prev);
-        if (next[ghostId]) {
-          delete next[ghostId];
-        } else {
-          next[ghostId] = true;
-        }
-        return next;
-      });
-    }
-
-    function toggleGhostSelection(ghostId) {
-      if (!ghostId) {
-        return;
-      }
-      setSelectedGhostIds(function (prev) {
-        const next = Object.assign({}, prev);
-        if (next[ghostId]) {
-          delete next[ghostId];
-        } else {
-          next[ghostId] = true;
-        }
-        return next;
-      });
-    }
-
-    async function fuseSelectedGhostPlans() {
-      if (!projectId || ghostFusionBusy) {
-        return false;
-      }
-      const selectedIds = Object.keys(selectedGhostIds).filter(function (ghostId) {
-        return Boolean(selectedGhostIds[ghostId]);
-      });
-      if (selectedIds.length !== 2) {
-        pushToast("warn", t("web.ghost.fuse_need_two"));
-        return false;
-      }
-      const selectedPlans = selectedIds
-        .map(function (ghostId) {
-          return ghostPlans.find(function (item) {
-            return item.id === ghostId;
-          });
-        })
-        .filter(Boolean);
-      if (selectedPlans.length !== 2) {
-        pushToast("warn", t("web.ghost.fuse_not_found"));
-        return false;
-      }
-      const sourceId = String(selectedPlans[0].source_id || "").trim();
-      if (!sourceId || selectedPlans.some(function (item) {
-        return String(item.source_id || "").trim() !== sourceId;
-      })) {
-        pushToast("warn", t("web.ghost.fuse_same_source_required"));
-        return false;
-      }
-      const sourceNode = nodesRef.current.find(function (item) {
-        return item.id === sourceId;
-      });
-      if (!sourceNode) {
-        pushToast("warn", t("web.ghost.fuse_source_missing"));
-        return false;
-      }
-      const first = selectedPlans[0];
-      const second = selectedPlans[1];
-      const mergePrompt = [
-        "@plan Merge these two branch ideas into one coherent branch for the same source node.",
-        "Output exactly one line in this format: Title: Description",
-        "Idea A title: " + String(first.title || ""),
-        "Idea A description: " + String(first.description || "-"),
-        "Idea B title: " + String(second.title || ""),
-        "Idea B description: " + String(second.description || "-")
-      ].join("\n");
-      setGhostFusionBusy(true);
-      try {
-        const outcome = await runApiDetailed(
-          function () {
-            return apiRequest("/api/ai/chat", {
-              method: "POST",
-              timeout_ms: aiRequestTimeoutMs(),
-              body: {
-                project_id: projectId,
-                node_id: sourceId,
-                message: mergePrompt,
-                token_budget: Math.max(600, Math.floor(asNumber(aiConfig.token_budget, 2200)))
-              }
-            });
-          },
-          null
-        );
-        if (!outcome.ok || !outcome.data) {
-          return false;
-        }
-        const payload = outcome.data;
-        const options = Array.isArray(payload.suggested_options) ? payload.suggested_options : [];
-        const picked = options[0] || {};
-        const fallbackReply = String(payload.reply || "").trim();
-        const fusedTitle = String(picked.title || "").trim() || t("web.ghost.fuse_default_title");
-        const fusedDescription = String(picked.description || "").trim() || fallbackReply || "-";
-        const created = createGhostPlansFromOptions(sourceId, [
-          {
-            title: fusedTitle,
-            description: fusedDescription
-          }
-        ]);
-        if (created.length === 0) {
-          return false;
-        }
-        const fused = created[0];
-        const targetX = Math.max(asNumber(first.pos_x, 0), asNumber(second.pos_x, 0)) + 250;
-        const targetY = (asNumber(first.pos_y, 0) + asNumber(second.pos_y, 0)) / 2;
-        const deltaX = targetX - asNumber(fused.pos_x, 0);
-        const deltaY = targetY - asNumber(fused.pos_y, 0);
-        const shifted = created.map(function (item) {
-          return Object.assign({}, item, {
-            pos_x: asNumber(item.pos_x, 0) + deltaX,
-            pos_y: asNumber(item.pos_y, 0) + deltaY,
-            fused_from: selectedIds.slice()
-          });
-        });
-        setGhostPlans(function (prev) {
-          return prev.concat(shifted);
-        });
-        setSelectedGhostIds({});
-        setExpandedGhostIds(function (prev) {
-          return Object.assign({}, prev, { [fused.id]: true });
-        });
-        addActivity("info", "ghost plans fused: " + selectedIds.join(",") + " -> " + fused.id);
-        pushToast("ok", t("web.ghost.fused_created"));
-        return true;
-      } finally {
-        setGhostFusionBusy(false);
-      }
-    }
-
-    async function adoptGhostPlan(ghostId) {
-      if (!projectId) {
-        return false;
-      }
-      const ghost = ghostPlans.find(function (item) {
-        return item.id === ghostId;
-      });
-      if (!ghost) {
-        return false;
-      }
-      const sourceNode = nodesRef.current.find(function (item) {
-        return item.id === ghost.source_id;
-      });
-      const createdNode = await runApi(
-        function () {
-          return apiRequest("/api/projects/" + projectId + "/nodes", {
-            method: "POST",
-            body: {
-              title: ghost.title,
-              type: "branch",
-              status: sourceNode ? sourceNode.status : "draft",
-              storyline_id: String(ghost.storyline_id || "").trim() || null,
-              pos_x: ghost.pos_x,
-              pos_y: ghost.pos_y,
-              metadata: {
-                summary: ghost.description,
-                content: ghost.description,
-                ai_from_ghost_plan: true,
-                ai_from_ghost_source: ghost.source_id,
-                ai_from_ghost_adopted_at: new Date().toISOString()
-              }
-            }
-          });
-        },
-        null
-      );
-      if (!createdNode) {
-        return false;
-      }
-      if (ghost.source_id) {
-        const edge = await runApi(
-          function () {
-            return apiRequest("/api/projects/" + projectId + "/edges", {
-              method: "POST",
-              body: {
-                source_id: ghost.source_id,
-                target_id: createdNode.id,
-                label: t("web.ghost.edge_label")
-              }
-            });
-          },
-          null
-        );
-        if (!edge) {
-          return false;
-        }
-      }
-      const adoptedRootId = String(ghost.chain_root_id || ghost.id);
-      const sameSource = ghostPlans.filter(function (item) {
-        return String(item.source_id || "") === String(ghost.source_id || "");
-      });
-      const sameSourceIds = new Set(
-        sameSource.map(function (item) {
-          return item.id;
-        })
-      );
-      const unadopted = sameSource.filter(function (item) {
-        return String(item.chain_root_id || item.id) !== adoptedRootId;
-      });
-      const unadoptedIds = new Set(
-        unadopted.map(function (item) {
-          return item.id;
-        })
-      );
-      if (unadoptedIds.size > 0) {
-        setRetiringGhostIds(function (prev) {
-          const next = Object.assign({}, prev);
-          unadoptedIds.forEach(function (ghostPlanId) {
-            next[ghostPlanId] = true;
-          });
-          return next;
-        });
-        await new Promise(function (resolve) {
-          window.setTimeout(resolve, 260);
-        });
-      }
-      const archivedCount = archiveGhostPlans(projectId, unadopted);
-      setGhostPlans(function (prev) {
-        return prev.filter(function (item) {
-          return String(item.source_id || "") !== String(ghost.source_id || "");
-        });
-      });
-      setExpandedGhostIds(function (prev) {
-        const next = Object.assign({}, prev);
-        Object.keys(next).forEach(function (id) {
-          if (sameSourceIds.has(id)) {
-            delete next[id];
-          }
-        });
-        return next;
-      });
-      setSelectedGhostIds(function (prev) {
-        const next = Object.assign({}, prev);
-        Object.keys(next).forEach(function (id) {
-          if (sameSourceIds.has(id)) {
-            delete next[id];
-          }
-        });
-        return next;
-      });
-      if (unadoptedIds.size > 0) {
-        setRetiringGhostIds(function (prev) {
-          const next = Object.assign({}, prev);
-          unadoptedIds.forEach(function (ghostPlanId) {
-            delete next[ghostPlanId];
-          });
-          return next;
-        });
-      }
-      addActivity("success", "ghost plan adopted: " + createdNode.id);
-      pushToast("ok", t("web.ghost.adopted"));
-      if (archivedCount > 0) {
-        pushToast("ok", t("web.ghost.archive_moved", { count: archivedCount }));
-      }
-      await refreshProjectData(projectId, true);
-      await validateGraph();
-      return true;
-    }
-
-    function previewGhostPlan(ghostId) {
-      const ghost = ghostPlans.find(function (item) {
-        return item.id === ghostId;
-      });
-      if (!ghost) {
-        return;
-      }
-      toggleGhostPreview(ghostId);
-    }
-
-    function deleteGhostRoute(ghostId) {
-      const ghost = ghostPlans.find(function (item) {
-        return item.id === ghostId;
-      });
-      if (!ghost) {
-        return false;
-      }
-      const sourceId = String(ghost.source_id || "");
-      const routeRootId = String(ghost.chain_root_id || ghost.id);
-      const removed = ghostPlans.filter(function (item) {
-        const sameSource = String(item.source_id || "") === sourceId;
-        const sameRoute = String(item.chain_root_id || item.id) === routeRootId;
-        return sameSource && sameRoute;
-      });
-      const removedIds = new Set(
-        removed.map(function (item) {
-          return item.id;
-        })
-      );
-      if (removedIds.size === 0) {
-        return false;
-      }
-      setGhostPlans(function (prev) {
-        return prev.filter(function (item) {
-          return !removedIds.has(item.id);
-        });
-      });
-      setExpandedGhostIds(function (prev) {
-        const next = Object.assign({}, prev);
-        removedIds.forEach(function (id) {
-          delete next[id];
-        });
-        return next;
-      });
-      setSelectedGhostIds(function (prev) {
-        const next = Object.assign({}, prev);
-        removedIds.forEach(function (id) {
-          delete next[id];
-        });
-        return next;
-      });
-      setRetiringGhostIds(function (prev) {
-        const next = Object.assign({}, prev);
-        removedIds.forEach(function (id) {
-          delete next[id];
-        });
-        return next;
-      });
-      addActivity("info", "ghost route deleted: " + routeRootId + " (" + removedIds.size.toString() + ")");
-      pushToast("ok", t("web.ghost.deleted_route", { count: removedIds.size }));
-      return true;
-    }
-
-    async function acceptSuggestedNode(nodeId) {
-      if (!projectId || !nodeId) {
-        return true;
-      }
-      const target = nodesRef.current.find(function (item) {
-        return item.id === nodeId;
-      });
-      if (!target || !nodeIsSuggested(target)) {
-        return true;
-      }
-      const nextMeta = nodeMetadataObject(target);
-      delete nextMeta.ai_suggested;
-      nextMeta.ai_suggestion_state = "accepted";
-      nextMeta.ai_suggestion_accepted_at = new Date().toISOString();
-      const updated = await runApi(
-        function () {
-          return apiActions.updateNodeAction(projectId, nodeId, { metadata: nextMeta });
-        },
-        null
-      );
-      return Boolean(updated);
-    }
-
-    async function clearSuggestedNodes(showToastMessage) {
-      const localCount = ghostPlans.length;
-      if (localCount > 0) {
-        setGhostPlans([]);
-        setExpandedGhostIds({});
-        setSelectedGhostIds({});
-        setRetiringGhostIds({});
-      }
-      if (!projectId) {
-        return localCount;
-      }
-      const result = await runApi(
-        function () {
-          return apiActions.clearSuggestedNodesAction(projectId);
-        },
-        null
-      );
-      if (!result) {
-        return 0;
-      }
-      const deleted = Math.max(0, Math.floor(asNumber(result.deleted, 0)));
-      const total = deleted + localCount;
-      if (showToastMessage) {
-        pushToast("ok", t("web.chat.suggestions_cleared", { count: total }));
-      }
-      if (deleted > 0) {
-        addActivity("info", "suggestions cleared: " + deleted.toString());
-        await refreshProjectData(projectId, true);
-        await validateGraph();
-      }
-      return total;
-    }
-
-    async function handleWorkflowChat(text) {
-      if (!outlineRequired) {
-        return false;
-      }
-      if (chatContextNodeId.trim()) {
-        return false;
-      }
-      const message = String(text || "").trim();
-      const current = chatWorkflow && typeof chatWorkflow === "object" ? chatWorkflow : buildDefaultWorkflowState();
-      if (!current.enabled) {
-        return false;
-      }
-      const step = String(current.step || "start");
-      if (step === "start") {
-        const mode = parseWorkflowMode(message);
-        if (!mode) {
-          appendChatMessage("assistant", t("web.workflow.need_mode"), t("web.chat.route_label", { route: "workflow" }));
-          return true;
-        }
-        setChatWorkflow(function (prev) {
-          return Object.assign({}, prev, { mode: mode, step: "goal" });
-        });
-        appendChatMessage("assistant", t("web.workflow.ask_goal"), t("web.chat.route_label", { route: "workflow" }));
-        return true;
-      }
-      if (step === "goal") {
-        if (message.length < 6) {
-          appendChatMessage("assistant", t("web.workflow.need_goal"), t("web.chat.route_label", { route: "workflow" }));
-          return true;
-        }
-        setChatWorkflow(function (prev) {
-          return Object.assign({}, prev, { step: "sync" });
-        });
-        setOutlineGuideField("goal", message);
-        appendChatMessage("assistant", t("web.workflow.ask_sync"), t("web.chat.route_label", { route: "workflow" }));
-        return true;
-      }
-      if (step === "sync") {
-        if (message.length < 8) {
-          appendChatMessage("assistant", t("web.workflow.need_sync"), t("web.chat.route_label", { route: "workflow" }));
-          return true;
-        }
-        const syncOutcome = await runApiDetailed(
-          function () {
-            return apiRequest("/api/ai/workflow/sync", {
-              method: "POST",
-              timeout_ms: aiRequestTimeoutMs(),
-              body: {
-                project_id: projectId,
-                goal: String(outlineGuideForm.goal || ""),
-                sync_context: message,
-                mode: String(current.mode || ""),
-                constraints: String(current.constraints || ""),
-                tone: String(current.tone || ""),
-                token_budget: Math.max(1000, Math.floor(asNumber(aiConfig.token_budget, 2200) / 2))
-              }
-            });
-          },
-          null
-        );
-        if (!syncOutcome.ok) {
-          appendChatMessage("assistant", t("web.workflow.sync_failed"), t("web.chat.route_label", { route: "workflow" }));
-          return true;
-        }
-        const syncPayload = syncOutcome.data || {};
-        const backgroundMarkdown = String(syncPayload.background_markdown || "").trim();
-        const mustConfirm = parseBeatList(syncPayload.must_confirm, 10);
-        const citations = parseBeatList(syncPayload.citations, 12);
-        const risks = parseBeatList(syncPayload.risk_notes, 8);
-        setChatWorkflow(function (prev) {
-          return Object.assign({}, prev, {
-            sync_context: message,
-            sync_background_markdown: backgroundMarkdown,
-            sync_must_confirm: mustConfirm,
-            sync_citations: citations,
-            sync_risk_notes: risks,
-            step: "sync_confirm"
-          });
-        });
-        setOutlineGuideField("sync_context", message);
-        appendChatMessage(
-          "assistant",
-          t("web.workflow.sync_ready") +
-            "\n\n" +
-            (backgroundMarkdown || "-") +
-            (mustConfirm.length > 0
-              ? "\n\n[Must Confirm]\n" +
-                mustConfirm.map(function (item, index) {
-                  return String(index + 1) + ". " + item;
-                }).join("\n")
-              : "") +
-            (citations.length > 0
-              ? "\n\n[Citations]\n" +
-                citations.map(function (item, index) {
-                  return String(index + 1) + ". " + item;
-                }).join("\n")
-              : "") +
-            (risks.length > 0
-              ? "\n\n[Risk Notes]\n" +
-                risks.map(function (item, index) {
-                  return String(index + 1) + ". " + item;
-                }).join("\n")
-              : "") +
-            "\n\n" +
-            t("web.workflow.sync_confirm_keyword"),
-          t("web.chat.route_label", { route: "workflow" })
-        );
-        return true;
-      }
-      if (step === "sync_confirm") {
-        if (isWorkflowBackgroundConfirmed(message)) {
-          setChatWorkflow(function (prev) {
-            return Object.assign({}, prev, { step: "specify" });
-          });
-          appendChatMessage("assistant", t("web.workflow.ask_specify"), t("web.chat.route_label", { route: "workflow" }));
-          return true;
-        }
-        if (message.length < 2) {
-          appendChatMessage("assistant", t("web.workflow.sync_wait_confirm"), t("web.chat.route_label", { route: "workflow" }));
-          return true;
-        }
-        const mergedSync = [String(current.sync_context || "").trim(), message]
-          .filter(Boolean)
-          .join("\n[补充]\n");
-        const syncOutcome = await runApiDetailed(
-          function () {
-            return apiRequest("/api/ai/workflow/sync", {
-              method: "POST",
-              timeout_ms: aiRequestTimeoutMs(),
-              body: {
-                project_id: projectId,
-                goal: String(outlineGuideForm.goal || ""),
-                sync_context: mergedSync,
-                mode: String(current.mode || ""),
-                constraints: String(current.constraints || ""),
-                tone: String(current.tone || ""),
-                token_budget: Math.max(1000, Math.floor(asNumber(aiConfig.token_budget, 2200) / 2))
-              }
-            });
-          },
-          null
-        );
-        if (!syncOutcome.ok) {
-          appendChatMessage("assistant", t("web.workflow.sync_failed"), t("web.chat.route_label", { route: "workflow" }));
-          return true;
-        }
-        const syncPayload = syncOutcome.data || {};
-        const backgroundMarkdown = String(syncPayload.background_markdown || "").trim();
-        const mustConfirm = parseBeatList(syncPayload.must_confirm, 10);
-        const citations = parseBeatList(syncPayload.citations, 12);
-        const risks = parseBeatList(syncPayload.risk_notes, 8);
-        setChatWorkflow(function (prev) {
-          return Object.assign({}, prev, {
-            sync_context: mergedSync,
-            sync_background_markdown: backgroundMarkdown,
-            sync_must_confirm: mustConfirm,
-            sync_citations: citations,
-            sync_risk_notes: risks,
-            step: "sync_confirm"
-          });
-        });
-        setOutlineGuideField("sync_context", mergedSync);
-        appendChatMessage(
-          "assistant",
-          t("web.workflow.sync_ready") +
-            "\n\n" +
-            (backgroundMarkdown || "-") +
-            "\n\n" +
-            t("web.workflow.sync_confirm_keyword"),
-          t("web.chat.route_label", { route: "workflow" })
-        );
-        return true;
-      }
-      if (step === "specify") {
-        if (message.length < 8) {
-          appendChatMessage("assistant", t("web.workflow.need_specify"), t("web.chat.route_label", { route: "workflow" }));
-          return true;
-        }
-        setChatWorkflow(function (prev) {
-          return Object.assign({}, prev, { specify: message });
-        });
-        setOutlineGuideField("specify", message);
-        const clarifyOutcome = await runApiDetailed(
-          function () {
-            return apiRequest("/api/ai/workflow/clarify", {
-              method: "POST",
-              timeout_ms: aiRequestTimeoutMs(),
-              body: {
-                project_id: projectId,
-                goal: String(outlineGuideForm.goal || message),
-                sync_context: String(current.sync_context || ""),
-                specify: message,
-                constraints: String(current.constraints || ""),
-                tone: String(current.tone || ""),
-                token_budget: Math.max(900, Math.floor(asNumber(aiConfig.token_budget, 2200) / 2))
-              }
-            });
-          },
-          null
-        );
-        if (!clarifyOutcome.ok) {
-          appendChatMessage("assistant", t("web.workflow.clarify_failed"), t("web.chat.route_label", { route: "workflow" }));
-          return true;
-        }
-        const questions = parseBeatList(clarifyOutcome.data && clarifyOutcome.data.questions, 8);
-        setChatWorkflow(function (prev) {
-          return Object.assign({}, prev, {
-            clarify_questions: questions,
-            step: "clarify_answers"
-          });
-        });
-        setOutlineGuideField("questions", questions);
-        appendChatMessage(
-          "assistant",
-          t("web.workflow.ask_clarify_answers") +
-            "\n" +
-            questions.map(function (item, index) {
-              return String(index + 1) + ". " + item;
-            }).join("\n"),
-          t("web.chat.route_label", { route: "workflow" })
-        );
-        return true;
-      }
-      if (step === "clarify_answers") {
-        if (message.length < 8) {
-          appendChatMessage("assistant", t("web.workflow.need_clarify_answers"), t("web.chat.route_label", { route: "workflow" }));
-          return true;
-        }
-        setChatWorkflow(function (prev) {
-          return Object.assign({}, prev, {
-            clarify_answers: message,
-            step: "plan_notes"
-          });
-        });
-        setOutlineGuideField("clarify_answers", message);
-        appendChatMessage("assistant", t("web.workflow.ask_plan_notes"), t("web.chat.route_label", { route: "workflow" }));
-        return true;
-      }
-      if (step === "plan_notes") {
-        const planNotes = message;
-        setChatWorkflow(function (prev) {
-          return Object.assign({}, prev, {
-            plan_notes: planNotes,
-            step: "confirm_outline"
-          });
-        });
-        setOutlineGuideField("plan_notes", planNotes);
-        const planOutcome = await runApiDetailed(
-          function () {
-            return apiRequest("/api/ai/outline/guide", {
-              method: "POST",
-              timeout_ms: aiRequestTimeoutMs(),
-              body: {
-                project_id: projectId,
-                goal: String(outlineGuideForm.goal || ""),
-                sync_context: String(current.sync_context || ""),
-                specify: String(current.specify || ""),
-                clarify_answers: String(current.clarify_answers || ""),
-                plan_notes: planNotes,
-                constraints: String(current.constraints || ""),
-                tone: String(current.tone || ""),
-                token_budget: Math.max(1400, Math.floor(asNumber(aiConfig.token_budget, 2200)))
-              }
-            });
-          },
-          null
-        );
-        if (!planOutcome.ok) {
-          appendChatMessage("assistant", t("web.workflow.plan_failed"), t("web.chat.route_label", { route: "workflow" }));
-          return true;
-        }
-        const payload = planOutcome.data || {};
-        const outline = String(payload.outline_markdown || "").trim();
-        const beats = parseBeatList(payload.chapter_beats, 16);
-        const nextSteps = parseBeatList(payload.next_steps, 10);
-        setChatWorkflow(function (prev) {
-          return Object.assign({}, prev, {
-            outline_markdown: outline,
-            chapter_beats: beats,
-            next_steps: nextSteps
-          });
-        });
-        setOutlineGuideForm(function (prev) {
-          return Object.assign({}, prev, {
-            outline_markdown: outline,
-            chapter_beats: beats,
-            next_steps: nextSteps
-          });
-        });
-        appendChatMessage(
-          "assistant",
-          t("web.workflow.outline_ready") +
-            "\n\n" +
-            outline +
-            "\n\n" +
-            t("web.workflow.confirm_keyword"),
-          t("web.chat.route_label", { route: "workflow" })
-        );
-        return true;
-      }
-      if (step === "confirm_outline") {
-        if (!isWorkflowOutlineConfirmed(message)) {
-          appendChatMessage("assistant", t("web.workflow.wait_confirm"), t("web.chat.route_label", { route: "workflow" }));
-          return true;
-        }
-        const flow = chatWorkflow;
-        const saved = await saveWorkflowOutlineNode(flow);
-        if (!saved) {
-          appendChatMessage("assistant", t("web.workflow.save_outline_failed"), t("web.chat.route_label", { route: "workflow" }));
-          return true;
-        }
-        await materializeWorkflowGraphPlan(flow);
-        setChatWorkflow(buildDefaultWorkflowState());
-        appendChatMessage("assistant", t("web.workflow.done"), t("web.chat.route_label", { route: "workflow" }));
-        return true;
-      }
-      return false;
-    }
-
     async function sendChatMessage() {
       if (!projectId) {
         pushToast("warn", t("web.toast.project_required"));
@@ -1812,7 +769,7 @@
       if (!text || chatBusy) {
         return;
       }
-      const contextNodeId = chatContextNodeId.trim();
+      const contextNodeId = resolveActiveChatContext(chatContextNodeId, artifactContextNodeId);
       appendChatMessage("user", text, contextNodeId ? t("web.chat.context_node", { node_id: contextNodeId }) : t("web.chat.context_global"));
       setChatInput("");
       setChatBusy(true);
@@ -1878,6 +835,7 @@
         diffSegments = buildDiffSegments(beforeContent, replyText);
         applyNodeContentPatchLocal(contextNodeId, replyText);
       }
+      setArtifactDiffNodeId(nextArtifactDiffNodeId(route, contextNodeId));
       setArtifactDiffSegments(diffSegments);
       appendChatMessage("assistant", replyText, meta, { diffSegments: diffSegments });
       const options = Array.isArray(payload.suggested_options) ? payload.suggested_options : [];
@@ -1901,943 +859,223 @@
       }
     }
 
-    async function loadLocaleCatalog(nextLocale) {
-      const picked = SUPPORTED_LOCALES.includes(nextLocale) ? nextLocale : DEFAULT_LOCALE;
-      const result = await runApi(
-        function () {
-          return apiRequest("/web/i18n/" + picked + ".json");
-        },
-        null
-      );
-      if (result && typeof result === "object") {
-        setCatalog(result);
-        window.localStorage.setItem("elyha_web_locale", picked);
-      }
-    }
+    const projectActionHandlers = createProjectActionHandlersValue({
+      SUPPORTED_LOCALES: SUPPORTED_LOCALES,
+      DEFAULT_LOCALE: DEFAULT_LOCALE,
+      runApi: runApi,
+      runApiDetailed: runApiDetailed,
+      apiRequest: apiRequest,
+      configActions: configActions,
+      apiActions: apiActions,
+      applyRuntimePayload: applyRuntimePayload,
+      addActivity: addActivity,
+      setCatalog: setCatalog,
+      setLlmPresets: setLlmPresets,
+      setRuntimePresetTag: setRuntimePresetTag,
+      llmPresets: llmPresets,
+      setRuntimeSettings: setRuntimeSettings,
+      asBoolean: asBoolean,
+      pushToast: pushToast,
+      t: t,
+      projectId: projectId,
+      setProjects: setProjects,
+      setProjectId: setProjectId,
+      setProject: setProject,
+      setNodes: setNodes,
+      setEdges: setEdges,
+      setSelectedNodeId: setSelectedNodeId,
+      setValidationReport: setValidationReport,
+      setGhostPlans: setGhostPlans,
+      setExpandedGhostIds: setExpandedGhostIds,
+      setSelectedGhostIds: setSelectedGhostIds,
+      setRetiringGhostIds: setRetiringGhostIds,
+      setNodeFlowStates: setNodeFlowStates,
+      selectedNodeId: selectedNodeId,
+      setInsightData: setInsightData,
+      setInsightError: setInsightError,
+      setInsightBusy: setInsightBusy,
+      viewportRef: viewportRef,
+      nodesRef: nodesRef,
+      nodeRenderSize: nodeRenderSize,
+      zoom: zoom,
+      asNumber: asNumber,
+      setInsightHighlightNodeIds: setInsightHighlightNodeIds,
+      setMainView: setMainView,
+      setSidebarTab: setSidebarTab,
+      showInput: showInput,
+      project: project,
+      newProjectTitle: newProjectTitle,
+      setNewProjectTitle: setNewProjectTitle,
+      isMockProvider: isMockProvider,
+      outlineGuideForm: outlineGuideForm,
+      setOutlineGuideBusy: setOutlineGuideBusy,
+      aiRequestTimeoutMs: aiRequestTimeoutMs,
+      aiConfig: aiConfig,
+      setOutlineGuideForm: setOutlineGuideForm,
+      setChatContextNodeId: setChatContextNodeId,
+      setChatOpen: setChatOpen,
+      setArtifactOpen: setArtifactOpen,
+      showConfirm: showConfirm,
+      projectSettingsForm: projectSettingsForm,
+      setProjectSettingsForm: setProjectSettingsForm
+    });
+    const loadLocaleCatalog = projectActionHandlers.loadLocaleCatalog;
+    const loadRuntimeSettings = projectActionHandlers.loadRuntimeSettings;
+    const loadLlmPresets = projectActionHandlers.loadLlmPresets;
+    const applyRuntimePreset = projectActionHandlers.applyRuntimePreset;
+    const refreshProjects = projectActionHandlers.refreshProjects;
+    const refreshProjectData = projectActionHandlers.refreshProjectData;
+    const loadInsights = projectActionHandlers.loadInsights;
+    const focusNodeOnViewport = projectActionHandlers.focusNodeOnViewport;
+    const openNodeFromInsight = projectActionHandlers.openNodeFromInsight;
+    const validateGraph = projectActionHandlers.validateGraph;
+    const exportGraph = projectActionHandlers.exportGraph;
+    const createSnapshot = projectActionHandlers.createSnapshot;
+    const rollbackProject = projectActionHandlers.rollbackProject;
+    const createProject = projectActionHandlers.createProject;
+    const runOutlineGuide = projectActionHandlers.runOutlineGuide;
+    const saveOutlineNodeFromGuide = projectActionHandlers.saveOutlineNodeFromGuide;
+    const deleteProject = projectActionHandlers.deleteProject;
+    const toggleAllowCycles = projectActionHandlers.toggleAllowCycles;
+    const saveProjectSettings = projectActionHandlers.saveProjectSettings;
 
-    async function loadRuntimeSettings() {
-      const payload = await runApi(
-        function () {
-          return configActions.fetchRuntimeSettingsAction();
-        },
-        null
-      );
-      if (!payload) {
-        return;
-      }
-      applyRuntimePayload(payload, { syncLocale: true, syncAiDefaults: true });
-      addActivity("info", "runtime settings loaded");
-    }
+    const workflowActionHandlers = createWorkflowActionHandlersValue({
+      projectId: projectId,
+      runApi: runApi,
+      runApiDetailed: runApiDetailed,
+      apiRequest: apiRequest,
+      t: t,
+      parseWorkflowModeValue: parseWorkflowModeValue,
+      isWorkflowBackgroundConfirmedValue: isWorkflowBackgroundConfirmedValue,
+      isWorkflowOutlineConfirmedValue: isWorkflowOutlineConfirmedValue,
+      parseBeatListValue: parseBeatListValue,
+      beatTitleValue: beatTitleValue,
+      pushToast: pushToast,
+      refreshProjectData: refreshProjectData,
+      validateGraph: validateGraph,
+      setSelectedNodeId: setSelectedNodeId,
+      setSidebarTab: setSidebarTab,
+      setChatContextNodeId: setChatContextNodeId,
+      setChatOpen: setChatOpen,
+      setArtifactOpen: setArtifactOpen,
+      setChatWorkflow: setChatWorkflow,
+      setOutlineGuideField: setOutlineGuideField,
+      setOutlineGuideForm: setOutlineGuideForm,
+      outlineGuideForm: outlineGuideForm,
+      aiConfig: aiConfig,
+      asNumber: asNumber,
+      aiRequestTimeoutMs: aiRequestTimeoutMs,
+      appendChatMessage: appendChatMessage,
+      outlineRequired: outlineRequired,
+      chatContextNodeId: chatContextNodeId,
+      chatWorkflow: chatWorkflow
+    });
+    const materializeWorkflowGraphPlan = workflowActionHandlers.materializeWorkflowGraphPlan;
+    const saveWorkflowOutlineNode = workflowActionHandlers.saveWorkflowOutlineNode;
+    const handleWorkflowChat = workflowActionHandlers.handleWorkflowChat;
 
-    async function loadLlmPresets() {
-      const payload = await runApi(
-        function () {
-          return configActions.fetchLlmPresetsAction();
-        },
-        null
-      );
-      if (!Array.isArray(payload)) {
-        setLlmPresets([]);
-        return;
-      }
-      setLlmPresets(payload);
-      addActivity("info", "llm presets loaded: " + payload.length.toString());
-    }
+    const ghostActionHandlers = createGhostActionHandlersValue({
+      nodesRef: nodesRef,
+      nodeRenderSize: nodeRenderSize,
+      asNumber: asNumber,
+      t: t,
+      pickGhostOutlineSteps: pickGhostOutlineSteps,
+      normalizeGhostSentiment: normalizeGhostSentiment,
+      inferGhostSentimentFromText: inferGhostSentimentFromText,
+      ghostIdWithSeed: ghostIdWithSeed,
+      ghostOutlineTextValue: ghostOutlineTextValue,
+      sentimentToneColorValue: sentimentToneColorValue,
+      normalizeGhostOutlineSteps: normalizeGhostOutlineSteps,
+      safeArray: safeArray,
+      setGhostArchive: setGhostArchive,
+      ghostArchive: ghostArchive,
+      setGhostPlans: setGhostPlans,
+      setExpandedGhostIds: setExpandedGhostIds,
+      pushToast: pushToast,
+      setSelectedGhostIds: setSelectedGhostIds,
+      projectId: projectId,
+      ghostFusionBusy: ghostFusionBusy,
+      selectedGhostIds: selectedGhostIds,
+      ghostPlans: ghostPlans,
+      aiConfig: aiConfig,
+      runApiDetailed: runApiDetailed,
+      apiRequest: apiRequest,
+      aiRequestTimeoutMs: aiRequestTimeoutMs,
+      setGhostFusionBusy: setGhostFusionBusy,
+      addActivity: addActivity,
+      runApi: runApi,
+      validateGraph: validateGraph,
+      refreshProjectData: refreshProjectData,
+      setRetiringGhostIds: setRetiringGhostIds,
+      nodeIsSuggested: nodeIsSuggested,
+      nodeMetadataObject: nodeMetadataObjectValue,
+      apiActions: apiActions,
+      pruneGhostStateMapValue: pruneGhostStateMapValue
+    });
+    const createGhostPlansFromOptions = ghostActionHandlers.createGhostPlansFromOptions;
+    const ghostOutlineText = ghostActionHandlers.ghostOutlineText;
+    const sentimentToneColor = ghostActionHandlers.sentimentToneColor;
+    const pruneGhostStateMap = ghostActionHandlers.pruneGhostStateMap;
+    const restoreGhostFromArchive = ghostActionHandlers.restoreGhostFromArchive;
+    const removeGhostArchiveItem = ghostActionHandlers.removeGhostArchiveItem;
+    const clearGhostArchiveForProject = ghostActionHandlers.clearGhostArchiveForProject;
+    const toggleGhostPreview = ghostActionHandlers.toggleGhostPreview;
+    const toggleGhostSelection = ghostActionHandlers.toggleGhostSelection;
+    const fuseSelectedGhostPlans = ghostActionHandlers.fuseSelectedGhostPlans;
+    const adoptGhostPlan = ghostActionHandlers.adoptGhostPlan;
+    const previewGhostPlan = ghostActionHandlers.previewGhostPlan;
+    const deleteGhostRoute = ghostActionHandlers.deleteGhostRoute;
+    const acceptSuggestedNode = ghostActionHandlers.acceptSuggestedNode;
+    const clearSuggestedNodes = ghostActionHandlers.clearSuggestedNodes;
 
-    function applyRuntimePreset(presetTag) {
-      const tag = String(presetTag || "").trim();
-      setRuntimePresetTag(tag);
-      if (!tag) {
-        return;
-      }
-      const preset = llmPresets.find(function (item) {
-        return String(item.tag || "") === tag;
-      });
-      if (!preset) {
-        return;
-      }
-      setRuntimeSettings(function (prev) {
-        return Object.assign({}, prev, {
-          llm_provider: "llmrequester",
-          api_url: String(preset.api_url || prev.api_url || ""),
-          model_name: String(preset.default_model || prev.model_name || ""),
-          auto_complete: asBoolean(preset.auto_complete, prev.auto_complete)
-        });
-      });
-      pushToast("ok", t("web.toast.preset_applied", { preset: preset.name || preset.tag }));
-    }
-
-    async function refreshProjects(preferredId) {
-      const projectList = await runApi(
-        function () {
-          return apiActions.refreshProjectsAction();
-        },
-        null
-      );
-      if (!projectList) {
-        return;
-      }
-      setProjects(projectList);
-
-      const preferred = preferredId || projectId;
-      const hasPreferred = preferred && projectList.some(function (item) {
-        return item.id === preferred;
-      });
-      const nextId = hasPreferred ? preferred : projectList.length > 0 ? projectList[0].id : "";
-      setProjectId(nextId);
-      if (!nextId) {
-        setProject(null);
-        setNodes([]);
-        setEdges([]);
-        setSelectedNodeId("");
-        setValidationReport(null);
-        setGhostPlans([]);
-        setExpandedGhostIds({});
-        setSelectedGhostIds({});
-        setRetiringGhostIds({});
-        setNodeFlowStates({});
-      }
-    }
-
-    async function refreshProjectData(activeProjectId, keepSelection) {
-      if (!activeProjectId) {
-        return;
-      }
-      const data = await runApi(
-        async function () {
-          const result = await apiActions.refreshProjectDataAction(activeProjectId);
-          return [result.project, result.nodes, result.edges];
-        },
-        null
-      );
-      if (!data) {
-        return;
-      }
-      const loadedProject = data[0];
-      const loadedNodes = data[1];
-      const loadedEdges = data[2];
-
-      setProject(loadedProject);
-      setNodes(loadedNodes);
-      setEdges(loadedEdges);
-
-      if (keepSelection) {
-        const stillExists = loadedNodes.some(function (node) {
-          return node.id === selectedNodeId;
-        });
-        if (!stillExists) {
-          setSelectedNodeId("");
-        }
-      } else {
-        setSelectedNodeId("");
-      }
-    }
-
-    async function loadInsights(showToastMessage) {
-      if (!projectId) {
-        setInsightData(null);
-        setInsightError("");
-        return;
-      }
-      setInsightBusy(true);
-      setInsightError("");
-      const payload = await runApi(
-        function () {
-          return apiActions.fetchInsightsAction(projectId);
-        },
-        null
-      );
-      setInsightBusy(false);
-      if (!payload) {
-        setInsightError(t("web.insight.load_failed"));
-        return;
-      }
-      setInsightData(payload);
-      if (showToastMessage) {
-        pushToast("ok", t("web.insight.loaded"));
-      }
-    }
-
-    function focusNodeOnViewport(nodeId) {
-      const viewport = viewportRef.current;
-      if (!viewport || !nodeId) {
-        return;
-      }
-      const targetNode = nodesRef.current.find(function (item) {
-        return item.id === nodeId;
-      });
-      if (!targetNode) {
-        return;
-      }
-      const size = nodeRenderSize(targetNode);
-      const centerX = asNumber(targetNode.pos_x, 0) + size.width / 2;
-      const centerY = asNumber(targetNode.pos_y, 0) + size.height / 2;
-      const targetLeft = Math.max(0, Math.round(centerX * zoom - viewport.clientWidth / 2));
-      const targetTop = Math.max(0, Math.round(centerY * zoom - viewport.clientHeight / 2));
-      viewport.scrollTo({ left: targetLeft, top: targetTop, behavior: "smooth" });
-    }
-
-    function openNodeFromInsight(nodeIds) {
-      const list = Array.isArray(nodeIds) ? nodeIds.filter(Boolean) : [];
-      if (list.length === 0) {
-        return;
-      }
-      const targetId = String(list[0]);
-      setInsightHighlightNodeIds(list.slice(0, 256));
-      setMainView("story");
-      setSidebarTab("node");
-      setSelectedNodeId(targetId);
-      window.setTimeout(function () {
-        focusNodeOnViewport(targetId);
-      }, 20);
-    }
-
-    async function validateGraph() {
-      if (!projectId) {
-        pushToast("warn", t("web.toast.project_required"));
-        return;
-      }
-      const report = await runApi(
-        function () {
-          return apiActions.validateProjectAction(projectId);
-        },
-        t("web.toast.loaded")
-      );
-      if (!report) {
-        return;
-      }
-      setValidationReport(report);
-      addActivity("info", "validate: errors=" + report.errors + ", warnings=" + report.warnings);
-    }
-
-    async function exportGraph() {
-      if (!projectId) {
-        pushToast("warn", t("web.toast.project_required"));
-        return;
-      }
-      const traversal = await showInput(
-        t("web.modal.export_title"),
-        t("web.modal.export_body"),
-        t("web.modal.export_placeholder"),
-        "mainline"
-      );
-      if (traversal === null) {
-        return;
-      }
-      const payload = { traversal: traversal.trim() || "mainline" };
-      const result = await runApi(
-        function () {
-          return apiActions.exportProjectAction(projectId, payload.traversal);
-        },
-        null
-      );
-      if (!result) {
-        return;
-      }
-      pushToast("ok", t("web.toast.exported", { path: result.path }));
-      addActivity("success", "export => " + result.path);
-    }
-
-    async function createSnapshot() {
-      if (!projectId) {
-        pushToast("warn", t("web.toast.project_required"));
-        return;
-      }
-      const snapshot = await runApi(
-        function () {
-          return apiActions.createSnapshotAction(projectId);
-        },
-        null
-      );
-      if (!snapshot) {
-        return;
-      }
-      pushToast("ok", t("web.toast.snapshot", { revision: snapshot.revision }));
-      addActivity("success", "snapshot revision=" + snapshot.revision);
-      await refreshProjects(projectId);
-      await refreshProjectData(projectId, true);
-    }
-
-    async function rollbackProject() {
-      if (!projectId) {
-        pushToast("warn", t("web.toast.project_required"));
-        return;
-      }
-      const revisionText = await showInput(
-        t("web.modal.rollback_title"),
-        t("web.modal.rollback_body"),
-        t("web.modal.rollback_placeholder"),
-        String(project ? project.active_revision : 0)
-      );
-      if (revisionText === null) {
-        return;
-      }
-      const revision = Number(revisionText);
-      if (!Number.isInteger(revision) || revision < 0) {
-        pushToast("warn", t("web.toast.number_error"));
-        return;
-      }
-      const result = await runApi(
-        function () {
-          return apiActions.rollbackProjectAction(projectId, revision);
-        },
-        null
-      );
-      if (!result) {
-        return;
-      }
-      pushToast("ok", t("web.toast.rolled_back", { revision: revision }));
-      addActivity("success", "rollback => revision " + revision);
-      await refreshProjects(projectId);
-      await refreshProjectData(projectId, false);
-      await validateGraph();
-    }
-
-    async function createProject() {
-      const title = newProjectTitle.trim();
-      if (!title) {
-        return;
-      }
-      const created = await runApi(
-        function () {
-          return apiActions.createProjectAction(title);
-        },
-        t("web.toast.created")
-      );
-      if (!created) {
-        return;
-      }
-      setNewProjectTitle("");
-      await refreshProjects(created.id);
-      await refreshProjectData(created.id, false);
-      addActivity("success", "project created: " + created.id);
-    }
-
-    async function runOutlineGuide() {
-      if (!projectId) {
-        pushToast("warn", t("web.toast.project_required"));
-        return;
-      }
-      if (isMockProvider()) {
-        const blocked = t("web.ai.mock_blocked");
-        pushToast("warn", blocked);
-        return;
-      }
-      const goal = String(outlineGuideForm.goal || "").trim();
-      if (!goal) {
-        pushToast("warn", t("web.outline.missing_goal"));
-        return;
-      }
-      setOutlineGuideBusy(true);
-      const outcome = await runApiDetailed(
-        function () {
-          return apiRequest("/api/ai/outline/guide", {
-            method: "POST",
-            timeout_ms: aiRequestTimeoutMs(),
-            body: {
-              project_id: projectId,
-              goal: goal,
-              sync_context: String(outlineGuideForm.sync_context || ""),
-              specify: String(outlineGuideForm.specify || ""),
-              clarify_answers: String(outlineGuideForm.clarify_answers || ""),
-              plan_notes: String(outlineGuideForm.plan_notes || ""),
-              constraints: String(outlineGuideForm.constraints || ""),
-              tone: String(outlineGuideForm.tone || ""),
-              token_budget: Math.max(1200, Math.floor(asNumber(aiConfig.token_budget, 2200)))
-            }
-          });
-        },
-        null
-      );
-      setOutlineGuideBusy(false);
-      if (!outcome.ok) {
-        return;
-      }
-      const payload = outcome.data || {};
-      setOutlineGuideForm(function (prev) {
-        return Object.assign({}, prev, {
-          outline_markdown: String(payload.outline_markdown || ""),
-          questions: Array.isArray(payload.questions) ? payload.questions.slice(0, 12) : [],
-          chapter_beats: Array.isArray(payload.chapter_beats) ? payload.chapter_beats.slice(0, 20) : [],
-          next_steps: Array.isArray(payload.next_steps) ? payload.next_steps.slice(0, 12) : []
-        });
-      });
-      pushToast("ok", t("web.toast.ai_done"));
-      addActivity("success", "outline guide generated");
-    }
-
-    async function saveOutlineNodeFromGuide() {
-      if (!projectId) {
-        pushToast("warn", t("web.toast.project_required"));
-        return;
-      }
-      const outlineText = String(outlineGuideForm.outline_markdown || "").trim();
-      if (!outlineText) {
-        pushToast("warn", t("web.outline.missing_outline"));
-        return;
-      }
-      const node = await runApi(
-        function () {
-          return apiRequest("/api/projects/" + projectId + "/nodes", {
-            method: "POST",
-            body: {
-              title: t("web.outline.default_node_title"),
-              type: "chapter",
-              status: "generated",
-              storyline_id: null,
-              pos_x: 120,
-              pos_y: 120,
-              metadata: {
-                project_outline: true,
-                outline_kind: "project_outline",
-                outline_goal: String(outlineGuideForm.goal || ""),
-                outline_sync_context: String(outlineGuideForm.sync_context || ""),
-                outline_specify: String(outlineGuideForm.specify || ""),
-                outline_clarify_answers: String(outlineGuideForm.clarify_answers || ""),
-                outline_plan_notes: String(outlineGuideForm.plan_notes || ""),
-                outline_constraints: String(outlineGuideForm.constraints || ""),
-                outline_tone: String(outlineGuideForm.tone || ""),
-                outline_questions: Array.isArray(outlineGuideForm.questions) ? outlineGuideForm.questions : [],
-                outline_chapter_beats: Array.isArray(outlineGuideForm.chapter_beats)
-                  ? outlineGuideForm.chapter_beats
-                  : [],
-                outline_next_steps: Array.isArray(outlineGuideForm.next_steps) ? outlineGuideForm.next_steps : [],
-                content: outlineText,
-                summary: outlineText.slice(0, 200)
-              }
-            }
-          });
-        },
-        t("web.toast.created")
-      );
-      if (!node) {
-        return;
-      }
-      await refreshProjectData(projectId, true);
-      setSelectedNodeId(node.id);
-      setSidebarTab("node");
-      setChatContextNodeId(node.id);
-      setChatOpen(true);
-      setArtifactOpen(false);
-      pushToast("ok", t("web.outline.saved"));
-      addActivity("success", "outline node saved: " + node.id);
-    }
-
-    async function deleteProject() {
-      if (!project || !projectId) {
-        pushToast("warn", t("web.toast.project_required"));
-        return;
-      }
-      const confirmed = await showConfirm(
-        t("web.modal.project_delete_title"),
-        t("web.modal.project_delete_body", { title: project.title })
-      );
-      if (!confirmed) {
-        return;
-      }
-      const result = await runApi(
-        function () {
-          return apiActions.deleteProjectAction(projectId);
-        },
-        t("web.toast.deleted")
-      );
-      if (!result) {
-        return;
-      }
-      addActivity("success", "project deleted: " + projectId);
-      await refreshProjects("");
-    }
-
-    async function toggleAllowCycles() {
-      if (!project || !projectId) {
-        return;
-      }
-      const next = !project.settings.allow_cycles;
-      const updated = await runApi(
-        function () {
-          return apiActions.saveProjectSettingsAction(projectId, { allow_cycles: next });
-        },
-        t("web.toast.saved")
-      );
-      if (!updated) {
-        return;
-      }
-      setProject(updated);
-      setProjects(function (prev) {
-        return prev.map(function (item) {
-          return item.id === updated.id ? updated : item;
-        });
-      });
-      addActivity("info", "allow_cycles => " + String(next));
-    }
-
-    async function saveProjectSettings() {
-      if (!project || !projectId) {
-        pushToast("warn", t("web.toast.project_required"));
-        return;
-      }
-      const minutes = Math.floor(asNumber(projectSettingsForm.auto_snapshot_minutes, NaN));
-      const operations = Math.floor(asNumber(projectSettingsForm.auto_snapshot_operations, NaN));
-      if (!Number.isFinite(minutes) || !Number.isFinite(operations) || minutes <= 0 || operations <= 0) {
-        pushToast("warn", t("web.toast.number_error"));
-        return;
-      }
-      const updated = await runApi(
-        function () {
-          return apiActions.saveProjectSettingsAction(projectId, {
-            allow_cycles: project.settings.allow_cycles,
-            auto_snapshot_minutes: minutes,
-            auto_snapshot_operations: operations
-          });
-        },
-        t("web.toast.saved")
-      );
-      if (!updated) {
-        return;
-      }
-      setProject(updated);
-      setProjects(function (prev) {
-        return prev.map(function (item) {
-          return item.id === updated.id ? updated : item;
-        });
-      });
-      setProjectSettingsForm({
-        auto_snapshot_minutes: String(updated.settings.auto_snapshot_minutes),
-        auto_snapshot_operations: String(updated.settings.auto_snapshot_operations)
-      });
-      addActivity(
-        "success",
-        "project settings saved: minutes=" +
-          updated.settings.auto_snapshot_minutes +
-          ", ops=" +
-          updated.settings.auto_snapshot_operations
-      );
-    }
-
-    async function createNode() {
-      if (!projectId) {
-        pushToast("warn", t("web.toast.project_required"));
-        return;
-      }
-      if (outlineRequired) {
-        pushToast("warn", t("web.outline.required_before_node"));
-        setSidebarTab("project");
-        return;
-      }
-      const title = newNodeForm.title.trim();
-      if (!title) {
-        return;
-      }
-      const metadata = {};
-      const agentPreset = String(newNodeForm.agent_preset || "").trim();
-      if (agentPreset) {
-        metadata.agent_preset = agentPreset;
-      }
-      if (newNodeForm.type === "group") {
-        metadata.group_kind = newNodeForm.group_kind === "chapter" ? "chapter" : "phase";
-        metadata.group_width = Math.max(NODE_WIDTH * 1.8, asNumber(newNodeForm.group_width, 820));
-        metadata.group_height = Math.max(NODE_HEIGHT * 1.6, asNumber(newNodeForm.group_height, 460));
-      }
-      const payload = {
-        title: title,
-        type: newNodeForm.type,
-        status: newNodeForm.status,
-        storyline_id: newNodeForm.storyline_id.trim() || null,
-        pos_x: asNumber(newNodeForm.pos_x, 120),
-        pos_y: asNumber(newNodeForm.pos_y, 120),
-        metadata: metadata
-      };
-      const node = await runApi(
-        function () {
-          return apiActions.createNodeAction(projectId, payload);
-        },
-        t("web.toast.created")
-      );
-      if (!node) {
-        return;
-      }
-      setNewNodeForm(function (prev) {
-        return Object.assign({}, prev, {
-          title: "",
-          storyline_id: "",
-          agent_preset: "",
-          group_kind: "phase",
-          group_width: "820",
-          group_height: "460"
-        });
-      });
-      setSelectedNodeId(node.id);
-      addActivity("success", "node created: " + node.id);
-      await refreshProjectData(projectId, true);
-    }
-
-    async function saveInspector() {
-      if (!projectId || !selectedNodeId || !inspector) {
-        pushToast("warn", t("web.toast.node_required"));
-        return;
-      }
-      let metadata = {};
-      const source = (inspector.metadata_json || "").trim();
-      if (source) {
-        try {
-          const parsed = JSON.parse(source);
-          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-            pushToast("warn", t("web.toast.metadata_json_error"));
-            return;
-          }
-          metadata = parsed;
-        } catch (_error) {
-          pushToast("warn", t("web.toast.metadata_json_error"));
-          return;
-        }
-      }
-      const agentPreset = String(inspector.agent_preset || "").trim();
-      if (agentPreset) {
-        metadata.agent_preset = agentPreset;
-      }
-      if (inspector.type === "group") {
-        metadata.group_kind = inspector.group_kind === "chapter" ? "chapter" : "phase";
-        metadata.group_width = Math.max(NODE_WIDTH * 1.8, asNumber(inspector.group_width, 820));
-        metadata.group_height = Math.max(NODE_HEIGHT * 1.6, asNumber(inspector.group_height, 460));
-        delete metadata.group_binding;
-        delete metadata.group_parent_id;
-      } else {
-        const binding = inspector.group_binding === "bound" ? "bound" : "independent";
-        const parentId = String(inspector.group_parent_id || "").trim();
-        metadata = applyGroupBinding(metadata, binding, parentId);
-        delete metadata.group_kind;
-        delete metadata.group_width;
-        delete metadata.group_height;
-      }
-
-      const payload = {
-        title: inspector.title.trim() || "Untitled",
-        type: inspector.type,
-        status: inspector.status,
-        storyline_id: inspector.storyline_id.trim() || null,
-        metadata: metadata
-      };
-
-      const node = await runApi(
-        function () {
-          return apiActions.updateNodeAction(projectId, selectedNodeId, payload);
-        },
-        t("web.toast.saved")
-      );
-      if (!node) {
-        return;
-      }
-      addActivity("success", "node updated: " + node.id);
-      await refreshProjectData(projectId, true);
-      if (inspector.type === "group") {
-        await arrangeGroupChildren(node.id);
-      } else if ((inspector.group_binding || "independent") === "bound" && (inspector.group_parent_id || "").trim()) {
-        await arrangeGroupChildren(String(inspector.group_parent_id).trim());
-      }
-      await clearSuggestedNodes(false);
-    }
-
-    async function deleteNode() {
-      if (!projectId || !selectedNodeId) {
-        pushToast("warn", t("web.toast.node_required"));
-        return;
-      }
-      const selectedNode = nodes.find(function (item) {
-        return item.id === selectedNodeId;
-      });
-      if (!selectedNode) {
-        return;
-      }
-      const confirmed = await showConfirm(
-        t("web.modal.node_delete_title"),
-        t("web.modal.node_delete_body", { title: selectedNode.title })
-      );
-      if (!confirmed) {
-        return;
-      }
-      const result = await runApi(
-        function () {
-          return apiActions.deleteNodeAction(projectId, selectedNodeId);
-        },
-        t("web.toast.deleted")
-      );
-      if (!result) {
-        return;
-      }
-      setSelectedNodeId("");
-      addActivity("success", "node deleted: " + selectedNodeId);
-      await refreshProjectData(projectId, true);
-      await validateGraph();
-    }
-
-    async function deleteEdge(edgeId) {
-      if (!projectId) {
-        return;
-      }
-      const edge = edges.find(function (item) {
-        return item.id === edgeId;
-      });
-      if (!edge) {
-        return;
-      }
-      const confirmed = await showConfirm(
-        t("web.modal.edge_delete_title"),
-        t("web.modal.edge_delete_body", {
-          source: edge.source_id,
-          target: edge.target_id
-        })
-      );
-      if (!confirmed) {
-        return;
-      }
-      const result = await runApi(
-        function () {
-          return apiActions.deleteEdgeAction(projectId, edgeId);
-        },
-        t("web.toast.deleted")
-      );
-      if (!result) {
-        return;
-      }
-      addActivity("success", "edge deleted: " + edgeId);
-      await refreshProjectData(projectId, true);
-      await validateGraph();
-    }
-
-    async function createEdge(sourceId, targetId) {
-      if (!projectId) {
-        return;
-      }
-      const labelText = await showInput(
-        t("web.modal.edge_label_title"),
-        t("web.modal.edge_label_body"),
-        t("web.modal.edge_label_placeholder"),
-        ""
-      );
-      if (labelText === null) {
-        return;
-      }
-      const edge = await runApi(
-        function () {
-          return apiActions.createEdgeAction(projectId, sourceId, targetId, labelText.trim());
-        },
-        t("web.toast.created")
-      );
-      if (!edge) {
-        return;
-      }
-      const sourceAccepted = await acceptSuggestedNode(sourceId);
-      const targetAccepted = await acceptSuggestedNode(targetId);
-      if (!sourceAccepted || !targetAccepted) {
-        await refreshProjectData(projectId, true);
-        return;
-      }
-      addActivity("success", "edge created: " + edge.id);
-      await refreshProjectData(projectId, true);
-      await validateGraph();
-    }
-
-    async function reorderEdge(edgeId, direction) {
-      if (!projectId) {
-        return;
-      }
-      const edge = edges.find(function (item) {
-        return item.id === edgeId;
-      });
-      if (!edge) {
-        return;
-      }
-      const source = nodeById[edge.source_id];
-      if (source && source.type === "group") {
-        pushToast("warn", t("web.toast.edge_group_reorder_not_supported"));
-        return;
-      }
-      const siblings = edges
-        .filter(function (item) {
-          return item.source_id === edge.source_id;
-        })
-        .slice()
-        .sort(compareEdgesByNarrativeOrder);
-      if (siblings.length < 2) {
-        return;
-      }
-      const index = siblings.findIndex(function (item) {
-        return item.id === edgeId;
-      });
-      if (index < 0) {
-        return;
-      }
-      const targetIndex = index + direction;
-      if (targetIndex < 0 || targetIndex >= siblings.length) {
-        return;
-      }
-      const orderedIds = siblings.map(function (item) {
-        return item.id;
-      });
-      const temp = orderedIds[index];
-      orderedIds[index] = orderedIds[targetIndex];
-      orderedIds[targetIndex] = temp;
-      const result = await runApi(
-        function () {
-          return apiRequest("/api/projects/" + projectId + "/edges/reorder", {
-            method: "POST",
-            body: {
-              source_id: edge.source_id,
-              edge_ids: orderedIds
-            }
-          });
-        },
-        t("web.toast.saved")
-      );
-      if (!result) {
-        return;
-      }
-      addActivity("info", "edge reordered: source=" + edge.source_id);
-      await refreshProjectData(projectId, true);
-    }
-
-    async function runAi(action) {
-      if (!projectId || !selectedNodeId) {
-        pushToast("warn", t("web.toast.node_required"));
-        return;
-      }
-      if (isMockProvider()) {
-        const blocked = t("web.ai.mock_blocked");
-        setAiResult(blocked);
-        pushToast("warn", blocked);
-        return;
-      }
-      const tokenBudget = Math.max(1, Math.floor(asNumber(aiConfig.token_budget, 2200)));
-      let flowSuccess = false;
-      if (action === "generate_chapter") {
-        startNodeFlow(selectedNodeId, ["running"]);
-      } else if (action === "generate_branches") {
-        startNodeFlow(selectedNodeId, ["planning"]);
-      } else {
-        startNodeFlow(selectedNodeId, ["reviewing"]);
-      }
-
-      if (action === "generate_chapter") {
-        const outcome = await runApiDetailed(
-          function () {
-            return apiRequest("/api/generate/chapter", {
-              method: "POST",
-              timeout_ms: aiRequestTimeoutMs(),
-              body: {
-                project_id: projectId,
-                node_id: selectedNodeId,
-                token_budget: tokenBudget,
-                workflow_mode: aiConfig.workflow_mode
-              }
-            });
-          },
-          t("web.toast.ai_done")
-        );
-        if (!outcome.ok) {
-          setAiResult(t("web.ai.error_result", { message: outcome.error }));
-          stopNodeFlow(selectedNodeId);
-          return;
-        }
-        const result = outcome.data;
-        if (!result) {
-          setAiResult(t("web.ai.error_result", { message: "-" }));
-          stopNodeFlow(selectedNodeId);
-          return;
-        }
-        const content = String(result.content || "").trim();
-        const traceText = formatAgentTrace(result.agent_trace);
-        const resultText = traceText ? [content || "-", "", "---", traceText].join("\n") : content || "-";
-        setAiResult(resultText);
-        flowSuccess = true;
-      }
-
-      if (action === "generate_branches") {
-        const outcome = await runApiDetailed(
-          function () {
-            return apiRequest("/api/generate/branches", {
-              method: "POST",
-              timeout_ms: aiRequestTimeoutMs(),
-              body: {
-                project_id: projectId,
-                node_id: selectedNodeId,
-                n: 3,
-                token_budget: tokenBudget
-              }
-            });
-          },
-          t("web.toast.ai_done")
-        );
-        if (!outcome.ok) {
-          setAiResult(t("web.ai.error_result", { message: outcome.error }));
-          stopNodeFlow(selectedNodeId);
-          return;
-        }
-        const result = outcome.data;
-        if (!result) {
-          setAiResult(t("web.ai.error_result", { message: "-" }));
-          stopNodeFlow(selectedNodeId);
-          return;
-        }
-        const lines = (result.options || []).map(function (item, index) {
-          return (index + 1).toString() + ". " + item.title + "\n" + item.description;
-        });
-        setAiResult(lines.join("\n\n"));
-        flowSuccess = true;
-      }
-
-      if (action === "review_lore" || action === "review_logic") {
-        const endpoint = action === "review_lore" ? "/api/review/lore" : "/api/review/logic";
-        const outcome = await runApiDetailed(
-          function () {
-            return apiRequest(endpoint, {
-              method: "POST",
-              timeout_ms: aiRequestTimeoutMs(),
-              body: {
-                project_id: projectId,
-                node_id: selectedNodeId,
-                token_budget: tokenBudget
-              }
-            });
-          },
-          t("web.toast.ai_done")
-        );
-        if (!outcome.ok) {
-          setAiResult(t("web.ai.error_result", { message: outcome.error }));
-          stopNodeFlow(selectedNodeId);
-          return;
-        }
-        const result = outcome.data;
-        if (!result) {
-          setAiResult(t("web.ai.error_result", { message: "-" }));
-          stopNodeFlow(selectedNodeId);
-          return;
-        }
-        const issues = Array.isArray(result.issues) ? result.issues : [];
-        const text = [
-          "summary: " + (result.summary || "-"),
-          "score: " + String(result.score),
-          "",
-          "issues:",
-          issues.length > 0
-            ? issues.map(function (item, index) {
-                return "- " + (index + 1).toString() + ") " + String(item);
-              }).join("\n")
-            : "- none"
-        ].join("\n");
-        setAiResult(text);
-        flowSuccess = true;
-      }
-
-      addActivity("info", "ai action: " + action + " node=" + selectedNodeId);
-      await refreshProjectData(projectId, true);
-      if (flowSuccess) {
-        setTimeout(function () {
-          stopNodeFlow(selectedNodeId);
-        }, 320);
-      } else {
-        stopNodeFlow(selectedNodeId);
-      }
-    }
+    const nodeActionHandlers = createNodeActionHandlersValue({
+      projectId: projectId,
+      outlineRequired: outlineRequired,
+      pushToast: pushToast,
+      t: t,
+      setSidebarTab: setSidebarTab,
+      newNodeForm: newNodeForm,
+      NODE_WIDTH: NODE_WIDTH,
+      NODE_HEIGHT: NODE_HEIGHT,
+      asNumber: asNumber,
+      runApi: runApi,
+      runApiDetailed: runApiDetailed,
+      apiRequest: apiRequest,
+      apiActions: apiActions,
+      setNewNodeForm: setNewNodeForm,
+      setSelectedNodeId: setSelectedNodeId,
+      addActivity: addActivity,
+      refreshProjectData: refreshProjectData,
+      selectedNodeId: selectedNodeId,
+      inspector: inspector,
+      applyGroupBinding: applyGroupBindingValue,
+      arrangeGroupChildren: arrangeGroupChildren,
+      clearSuggestedNodes: clearSuggestedNodes,
+      showConfirm: showConfirm,
+      nodes: nodes,
+      edges: edges,
+      showInput: showInput,
+      acceptSuggestedNode: acceptSuggestedNode,
+      getNodeById: function () {
+        return nodeById;
+      },
+      compareEdgesByNarrativeOrder: compareEdgesByNarrativeOrder,
+      validateGraph: validateGraph,
+      aiRequestTimeoutMs: aiRequestTimeoutMs,
+      isMockProvider: isMockProvider,
+      setAiResult: setAiResult,
+      aiConfig: aiConfig,
+      startNodeFlow: startNodeFlow,
+      stopNodeFlow: stopNodeFlow,
+      formatAgentTrace: formatAgentTrace
+    });
+    const createNode = nodeActionHandlers.createNode;
+    const saveInspector = nodeActionHandlers.saveInspector;
+    const deleteNode = nodeActionHandlers.deleteNode;
+    const deleteEdge = nodeActionHandlers.deleteEdge;
+    const createEdge = nodeActionHandlers.createEdge;
+    const reorderEdge = nodeActionHandlers.reorderEdge;
+    const runAi = nodeActionHandlers.runAi;
 
     function onNodeClick(nodeId) {
       if (!edgeMode) {
@@ -4003,13 +2241,6 @@
 
     useEffect(
       function () {
-        setArtifactDiffSegments([]);
-      },
-      [chatContextNodeId, artifactContextNodeId]
-    );
-
-    useEffect(
-      function () {
         if (!projectId) {
           setOutlineGuideForm({
             goal: "",
@@ -4136,6 +2367,8 @@
           setArtifactContextNodeId("");
           setChatOpen(false);
           setArtifactOpen(false);
+          setArtifactDiffSegments([]);
+          setArtifactDiffNodeId("");
           setChatMessages([]);
           setGhostPlans([]);
           setExpandedGhostIds({});
@@ -4862,13 +3095,13 @@
                     "div",
                     { className: "chat-diff-body" },
                     item.diffSegments.slice(0, 420).map(function (segment, index) {
-                      const kind = String(segment && segment.type ? segment.type : "same");
-                      const className =
-                        kind === "add" ? "chat-diff-add" : kind === "del" ? "chat-diff-del" : "chat-diff-same";
+                      const kind = normalizeDiffKind(segment && segment.type);
+                      const className = "chat-diff-row chat-diff-row-" + kind;
                       return h(
-                        "span",
+                        "div",
                         { key: item.id + "_diff_" + index.toString(), className: className },
-                        String(segment && segment.text ? segment.text : "")
+                        h("span", { className: "chat-diff-prefix" }, diffPrefix(kind)),
+                        h("span", { className: "chat-diff-text" }, String(segment && segment.text ? segment.text : ""))
                       );
                     })
                   )
@@ -4930,6 +3163,7 @@
     const artifactContextText = artifactContextNode
       ? t("web.chat.context_node", { node_id: artifactContextNode.id })
       : t("web.chat.context_global");
+    const artifactDiffVisible = shouldShowArtifactDiff(artifactTargetId, artifactDiffNodeId, artifactDiffSegments);
 
     const insightPayload = insightData && typeof insightData === "object" ? insightData : null;
     const insightWords = insightPayload && Array.isArray(insightPayload.word_frequency) ? insightPayload.word_frequency : [];
@@ -6618,18 +4852,18 @@
                         h(
                           "div",
                           { className: "artifact-panel-body" },
-                          artifactDiffSegments.length > 0
+                          artifactDiffVisible
                             ? h(
                                 "div",
                                 { className: "chat-diff-body" },
                                 artifactDiffSegments.slice(0, 420).map(function (segment, index) {
-                                  const kind = String(segment && segment.type ? segment.type : "same");
-                                  const className =
-                                    kind === "add" ? "chat-diff-add" : kind === "del" ? "chat-diff-del" : "chat-diff-same";
+                                  const kind = normalizeDiffKind(segment && segment.type);
+                                  const className = "chat-diff-row chat-diff-row-" + kind;
                                   return h(
-                                    "span",
+                                    "div",
                                     { key: "artifact_diff_" + index.toString(), className: className },
-                                    String(segment && segment.text ? segment.text : "")
+                                    h("span", { className: "chat-diff-prefix" }, diffPrefix(kind)),
+                                    h("span", { className: "chat-diff-text" }, String(segment && segment.text ? segment.text : ""))
                                   );
                                 })
                               )

@@ -594,6 +594,8 @@ textarea {
   line-height: 1.35;
   font-size: 12px;
   font-family: "JetBrains Mono", "IBM Plex Mono", monospace;
+  display: grid;
+  gap: 4px;
 }
 
 .chat-diff-same {
@@ -610,6 +612,43 @@ textarea {
   color: #ffd5d0;
   background: rgba(240, 130, 120, 0.22);
   border-radius: 4px;
+  text-decoration: line-through;
+}
+
+.chat-diff-row {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr);
+  align-items: start;
+  gap: 6px;
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+
+.chat-diff-prefix {
+  font-weight: 700;
+  opacity: 0.9;
+}
+
+.chat-diff-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.chat-diff-row-same {
+  color: #d2e5f1;
+  background: rgba(108, 170, 194, 0.1);
+}
+
+.chat-diff-row-add {
+  color: #d9ffe9;
+  background: rgba(76, 212, 136, 0.34);
+  border: 1px solid rgba(118, 236, 166, 0.55);
+}
+
+.chat-diff-row-del {
+  color: #ffe0db;
+  background: rgba(239, 96, 118, 0.33);
+  border: 1px solid rgba(255, 142, 156, 0.52);
   text-decoration: line-through;
 }
 
