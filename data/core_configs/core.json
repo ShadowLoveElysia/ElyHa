@@ -1,0 +1,12 @@
+{
+  "locale": "zh",
+  "llm_provider": "mock",
+  "api_url": "",
+  "api_key": "",
+  "model_name": "",
+  "auto_complete": true,
+  "default_token_budget": 2200,
+  "default_workflow_mode": "multi_agent",
+  "web_host": "127.0.0.1",
+  "web_port": 8765
+}

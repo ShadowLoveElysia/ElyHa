@@ -1,0 +1,20 @@
+{
+  "locale": "zh",
+  "llm_provider": "llmrequester",
+  "api_url": "https://api.deepseek.com/v1",
+  "api_key": "sk-832c7b2321314d6eb443c193d004da85",
+  "model_name": "deepseek-chat",
+  "auto_complete": true,
+  "think_switch": false,
+  "think_depth": "medium",
+  "thinking_budget": 2048,
+  "web_search_enabled": false,
+  "web_search_context_size": "medium",
+  "web_search_max_results": 5,
+  "llm_request_timeout": 90,
+  "web_request_timeout_ms": 240000,
+  "default_token_budget": 2200,
+  "default_workflow_mode": "multi_agent",
+  "web_host": "127.0.0.1",
+  "web_port": 8765
+}
