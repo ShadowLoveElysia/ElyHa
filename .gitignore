@@ -14,6 +14,7 @@ dist/
 downloads/
 eggs/
 .eggs/
+!.data/core.json
 lib/
 lib64/
 parts/
@@ -189,3 +190,15 @@ cython_debug/
 elyha_web/static/web/APP_MODULES.md
 elyha_web/static/web/MIGRATION_PROGRESS.md
 /exports/测试
+
+# 忽略 data 目录下的所有内容
+/data/*
+
+# 但允许 core_configs 目录存在
+!/data/core_configs/
+
+# 忽略 core_configs 下的所有文件
+/data/core_configs/*
+
+# 只允许 core.json 被提交
+!/data/core_configs/core.json
