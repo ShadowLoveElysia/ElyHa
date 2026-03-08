@@ -142,6 +142,7 @@
           const parsed = Number(input);
           return Number.isFinite(parsed) ? parsed : fallbackValue;
         };
+    const isCollapsed = typeof opts.isGroupCollapsed === "function" ? opts.isGroupCollapsed : function () { return false; };
     const metadataOf = typeof opts.nodeMetadataObject === "function" ? opts.nodeMetadataObject : nodeMetadataObject;
     const groupSizeOf = typeof opts.groupRenderSizeByMetadata === "function" ? opts.groupRenderSizeByMetadata : groupRenderSizeByMetadata;
     const nodeSizeOf = typeof opts.nodeRenderSize === "function" ? opts.nodeRenderSize : function () {
@@ -153,7 +154,7 @@
     const nodeCenterY = asNumber(node.pos_y, 0) + nodeSize.height / 2;
     const groups = (allNodes || [])
       .filter(function (item) {
-        return item.type === "group" && item.id !== node.id;
+        return item.type === "group" && item.id !== node.id && !isCollapsed(item.id);
       })
       .sort(function (left, right) {
         const leftMeta = metadataOf(left);
@@ -168,11 +169,12 @@
       const size = groupSizeOf(groupMeta);
       const left = asNumber(group.pos_x, 0);
       const top = asNumber(group.pos_y, 0);
+      const inset = 40;
       if (
-        nodeCenterX >= left &&
-        nodeCenterX <= left + size.width &&
-        nodeCenterY >= top &&
-        nodeCenterY <= top + size.height
+        nodeCenterX >= left + inset &&
+        nodeCenterX <= left + size.width - inset &&
+        nodeCenterY >= top + inset &&
+        nodeCenterY <= top + size.height - inset
       ) {
         return group.id;
       }

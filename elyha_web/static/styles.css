@@ -204,6 +204,31 @@ textarea {
   font-size: 12px;
 }
 
+.inspector-preview-fold {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg-soft);
+}
+
+.inspector-preview-fold + .inspector-preview-fold {
+  margin-top: 6px;
+}
+
+.inspector-preview-head {
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.inspector-preview-body {
+  padding: 0 8px 8px;
+}
+
 .checkbox-field {
   gap: 6px;
 }
@@ -977,6 +1002,11 @@ textarea {
   opacity: 1;
 }
 
+.node-card.ghost-node.ghost-locked {
+  border-color: rgba(143, 182, 255, 0.78);
+  box-shadow: 0 0 0 2px rgba(143, 182, 255, 0.28) inset, 0 10px 20px rgba(0, 0, 0, 0.38);
+}
+
 .node-card.ghost-node.ghost-retiring {
   pointer-events: none;
   animation: ghost-retire 0.26s ease-in forwards;
@@ -1085,6 +1115,18 @@ textarea {
   color: #def2ff;
 }
 
+.ghost-lock-label {
+  display: inline-block;
+  width: fit-content;
+  border-radius: 999px;
+  border: 1px solid rgba(143, 182, 255, 0.66);
+  background: rgba(143, 182, 255, 0.2);
+  color: #e7efff;
+  padding: 1px 7px;
+  font-size: 11px;
+  line-height: 1.2;
+}
+
 .ghost-actions {
   display: flex;
   flex-wrap: wrap;
@@ -1117,6 +1159,12 @@ textarea {
   border-color: rgba(219, 150, 239, 0.62);
   background: rgba(188, 122, 220, 0.22);
   color: #f6e8ff;
+}
+
+.ghost-node-btn.lock {
+  border-color: rgba(143, 182, 255, 0.7);
+  background: rgba(143, 182, 255, 0.18);
+  color: #e7efff;
 }
 
 .ghost-node-btn.delete {

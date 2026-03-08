@@ -39,6 +39,233 @@
     const nodeMetadataObject = context.nodeMetadataObject;
     const apiActions = context.apiActions;
     const pruneGhostStateMapValue = context.pruneGhostStateMapValue;
+    const GHOST_ROUTE_CHILD_COUNT = 2;
+    const GHOST_MESSAGE_MAX_LEN = 3900;
+    const GHOST_ARCHIVE_FEEDBACK_LIMIT = 12;
+
+    function routeRootId(plan) {
+      return String(plan && (plan.chain_root_id || plan.id) ? plan.chain_root_id || plan.id : "");
+    }
+
+    function compareGhostPlanPosition(left, right) {
+      const leftX = asNumber(left && left.pos_x, 0);
+      const rightX = asNumber(right && right.pos_x, 0);
+      if (leftX !== rightX) {
+        return leftX - rightX;
+      }
+      const leftY = asNumber(left && left.pos_y, 0);
+      const rightY = asNumber(right && right.pos_y, 0);
+      if (leftY !== rightY) {
+        return leftY - rightY;
+      }
+      return String(left && left.id ? left.id : "").localeCompare(String(right && right.id ? right.id : ""));
+    }
+
+    function collectSourceRoutes(plans, sourceNodeId) {
+      const sourceId = String(sourceNodeId || "").trim();
+      if (!sourceId) {
+        return [];
+      }
+      const map = {};
+      safeArray(plans).forEach(function (plan) {
+        if (String(plan && plan.source_id ? plan.source_id : "").trim() !== sourceId) {
+          return;
+        }
+        const rootId = routeRootId(plan);
+        if (!rootId) {
+          return;
+        }
+        if (!map[rootId]) {
+          map[rootId] = [];
+        }
+        map[rootId].push(plan);
+      });
+      return Object.keys(map)
+        .map(function (rootId) {
+          const routePlans = map[rootId]
+            .slice()
+            .sort(function (left, right) {
+              const leftIndex = Math.max(0, Math.floor(asNumber(left && left.chain_index, 0)));
+              const rightIndex = Math.max(0, Math.floor(asNumber(right && right.chain_index, 0)));
+              if (leftIndex !== rightIndex) {
+                return leftIndex - rightIndex;
+              }
+              return compareGhostPlanPosition(left, right);
+            });
+          const root =
+            routePlans.find(function (item) {
+              return Math.max(0, Math.floor(asNumber(item && item.chain_index, 0))) === 0;
+            }) || routePlans[0];
+          return {
+            rootId: rootId,
+            root: root,
+            plans: routePlans,
+            locked: routePlans.some(function (item) {
+              return Boolean(item && item.locked);
+            })
+          };
+        })
+        .sort(function (left, right) {
+          return compareGhostPlanPosition(left.root, right.root);
+        });
+    }
+
+    function compactLine(text, maxLen) {
+      const normalized = String(text || "").replace(/\s+/g, " ").trim();
+      const limit = Math.max(24, Math.floor(asNumber(maxLen, 180)));
+      if (normalized.length <= limit) {
+        return normalized;
+      }
+      return normalized.slice(0, limit - 3) + "...";
+    }
+
+    function createGhostRouteFromOption(sourceNodeId, source, option, routeIndex, baseX, baseY) {
+      const title = String(option && option.title ? option.title : "").trim() || t("web.ghost.untitled");
+      const description = String(option && option.description ? option.description : "").trim();
+      const outlineSteps = pickGhostOutlineSteps(option, description);
+      const summary = description || (outlineSteps.length > 0 ? outlineSteps[0] : "-");
+      const sentiment = normalizeGhostSentiment(
+        option && option.sentiment
+          ? option.sentiment
+          : inferGhostSentimentFromText(title, [summary].concat(outlineSteps).join("\n"))
+      );
+      const nowIso = new Date().toISOString();
+      const rootId = ghostIdWithSeed("root_" + routeIndex.toString());
+      const rootPlan = {
+        id: rootId,
+        source_id: sourceNodeId,
+        source_ghost_id: "",
+        chain_root_id: rootId,
+        chain_index: 0,
+        source_title: source.title,
+        title: title.slice(0, 200),
+        description: summary,
+        outline_steps: outlineSteps,
+        sentiment: sentiment,
+        storyline_id: source.storyline_id || "",
+        pos_x: baseX,
+        pos_y: baseY,
+        locked: false,
+        created_at: nowIso
+      };
+      const created = [rootPlan];
+      let parent = rootPlan;
+      const followUps = outlineSteps.slice(1, 1 + GHOST_ROUTE_CHILD_COUNT);
+      while (followUps.length < GHOST_ROUTE_CHILD_COUNT) {
+        followUps.push(t("web.ghost.chain_fallback", { index: followUps.length + 1 }));
+      }
+      followUps.forEach(function (stepText, stepIndex) {
+        const childText = String(stepText || "").trim() || "-";
+        const childId = ghostIdWithSeed("next_" + routeIndex.toString() + "_" + (stepIndex + 1).toString());
+        const childTitle = title + " · " + t("web.ghost.chain_step", { index: stepIndex + 1 });
+        const child = {
+          id: childId,
+          source_id: sourceNodeId,
+          source_ghost_id: parent.id,
+          chain_root_id: rootId,
+          chain_index: stepIndex + 1,
+          source_title: source.title,
+          title: childTitle.slice(0, 200),
+          description: childText,
+          outline_steps: [childText],
+          sentiment: sentiment,
+          storyline_id: source.storyline_id || "",
+          pos_x: asNumber(parent.pos_x, 0) + 248,
+          pos_y: asNumber(parent.pos_y, 0),
+          locked: false,
+          created_at: nowIso
+        };
+        created.push(child);
+        parent = child;
+      });
+      return created;
+    }
+
+    function updateGhostRouteWithOption(route, sourceNodeId, source, option, routeIndex) {
+      const root = route.root;
+      const title = String(option && option.title ? option.title : "").trim() || t("web.ghost.untitled");
+      const description = String(option && option.description ? option.description : "").trim();
+      const outlineSteps = pickGhostOutlineSteps(option, description);
+      const summary = description || (outlineSteps.length > 0 ? outlineSteps[0] : "-");
+      const sentiment = normalizeGhostSentiment(
+        option && option.sentiment
+          ? option.sentiment
+          : inferGhostSentimentFromText(title, [summary].concat(outlineSteps).join("\n"))
+      );
+      const nowIso = new Date().toISOString();
+      const nextRoot = Object.assign({}, root, {
+        source_id: sourceNodeId,
+        source_ghost_id: "",
+        chain_root_id: route.rootId || String(root.id || ghostIdWithSeed("root_" + routeIndex.toString())),
+        chain_index: 0,
+        source_title: source.title,
+        title: title.slice(0, 200),
+        description: summary,
+        outline_steps: outlineSteps,
+        sentiment: sentiment,
+        storyline_id: source.storyline_id || "",
+        updated_at: nowIso
+      });
+      if (!nextRoot.created_at) {
+        nextRoot.created_at = nowIso;
+      }
+      const updated = [nextRoot];
+      let parent = nextRoot;
+      const followUps = outlineSteps.slice(1, 1 + GHOST_ROUTE_CHILD_COUNT);
+      while (followUps.length < GHOST_ROUTE_CHILD_COUNT) {
+        followUps.push(t("web.ghost.chain_fallback", { index: followUps.length + 1 }));
+      }
+      for (let stepIndex = 0; stepIndex < GHOST_ROUTE_CHILD_COUNT; stepIndex += 1) {
+        const childText = String(followUps[stepIndex] || "").trim() || "-";
+        const existingChild = route.plans.find(function (item) {
+          return Math.max(0, Math.floor(asNumber(item && item.chain_index, 0))) === stepIndex + 1;
+        });
+        if (existingChild) {
+          const childTitle = title + " · " + t("web.ghost.chain_step", { index: stepIndex + 1 });
+          const nextChild = Object.assign({}, existingChild, {
+            source_id: sourceNodeId,
+            source_ghost_id: parent.id,
+            chain_root_id: nextRoot.chain_root_id,
+            chain_index: stepIndex + 1,
+            source_title: source.title,
+            title: childTitle.slice(0, 200),
+            description: childText,
+            outline_steps: [childText],
+            sentiment: sentiment,
+            storyline_id: source.storyline_id || "",
+            updated_at: nowIso
+          });
+          if (!nextChild.created_at) {
+            nextChild.created_at = nowIso;
+          }
+          updated.push(nextChild);
+          parent = nextChild;
+        } else {
+          const childId = ghostIdWithSeed("next_" + routeIndex.toString() + "_" + (stepIndex + 1).toString());
+          const childTitle = title + " · " + t("web.ghost.chain_step", { index: stepIndex + 1 });
+          const child = {
+            id: childId,
+            source_id: sourceNodeId,
+            source_ghost_id: parent.id,
+            chain_root_id: nextRoot.chain_root_id,
+            chain_index: stepIndex + 1,
+            source_title: source.title,
+            title: childTitle.slice(0, 200),
+            description: childText,
+            outline_steps: [childText],
+            sentiment: sentiment,
+            storyline_id: source.storyline_id || "",
+            pos_x: asNumber(parent.pos_x, 0) + 248,
+            pos_y: asNumber(parent.pos_y, 0),
+            locked: false,
+            created_at: nowIso
+          };
+          updated.push(child);
+          parent = child;
+        }
+      }
+      return updated;
+    }
 
     function createGhostPlansFromOptions(sourceNodeId, options) {
       const source = nodesRef.current.find(function (item) {
@@ -52,60 +279,15 @@
       const baseY = asNumber(source.pos_y, 0);
       const created = [];
       options.forEach(function (option, index) {
-        const title = String(option && option.title ? option.title : "").trim() || t("web.ghost.untitled");
-        const description = String(option && option.description ? option.description : "").trim();
-        const outlineSteps = pickGhostOutlineSteps(option, description);
-        const summary = description || (outlineSteps.length > 0 ? outlineSteps[0] : "-");
-        const sentiment = normalizeGhostSentiment(
-          option && option.sentiment
-            ? option.sentiment
-            : inferGhostSentimentFromText(title, [summary].concat(outlineSteps).join("\n"))
+        const routePlans = createGhostRouteFromOption(
+          sourceNodeId,
+          source,
+          option,
+          index,
+          baseX + index * 230,
+          baseY + (index - 1) * 140
         );
-        const rootId = ghostIdWithSeed("root_" + index.toString());
-        const rootPlan = {
-          id: rootId,
-          source_id: sourceNodeId,
-          source_ghost_id: "",
-          chain_root_id: rootId,
-          chain_index: 0,
-          source_title: source.title,
-          title: title.slice(0, 200),
-          description: summary,
-          outline_steps: outlineSteps,
-          sentiment: sentiment,
-          storyline_id: source.storyline_id || "",
-          pos_x: baseX + index * 230,
-          pos_y: baseY + (index - 1) * 140,
-          created_at: new Date().toISOString()
-        };
-        created.push(rootPlan);
-        let parent = rootPlan;
-        const followUps = outlineSteps.slice(1, 3);
-        while (followUps.length < 2) {
-          followUps.push(t("web.ghost.chain_fallback", { index: followUps.length + 1 }));
-        }
-        followUps.forEach(function (stepText, stepIndex) {
-          const childId = ghostIdWithSeed("next_" + index.toString() + "_" + (stepIndex + 1).toString());
-          const childTitle = title + " · " + t("web.ghost.chain_step", { index: stepIndex + 1 });
-          const child = {
-            id: childId,
-            source_id: sourceNodeId,
-            source_ghost_id: parent.id,
-            chain_root_id: rootId,
-            chain_index: stepIndex + 1,
-            source_title: source.title,
-            title: childTitle.slice(0, 200),
-            description: String(stepText || "").trim() || "-",
-            outline_steps: [String(stepText || "").trim() || "-"],
-            sentiment: sentiment,
-            storyline_id: source.storyline_id || "",
-            pos_x: asNumber(parent.pos_x, 0) + 248,
-            pos_y: asNumber(parent.pos_y, 0),
-            created_at: new Date().toISOString()
-          };
-          created.push(child);
-          parent = child;
-        });
+        created.push.apply(created, routePlans);
       });
       return created;
     }
@@ -126,11 +308,12 @@
         source_title: String(plan.source_title || ""),
         title: String(plan.title || t("web.ghost.untitled")).slice(0, 200),
         description: String(plan.description || "").trim(),
-        outline_steps: normalizeGhostOutlineSteps(plan.outline_steps || plan.description, 3),
+        outline_steps: normalizeGhostOutlineSteps(plan.outline_steps || plan.description, 8),
         sentiment: normalizeGhostSentiment(plan.sentiment),
         storyline_id: String(plan.storyline_id || ""),
         pos_x: asNumber(plan.pos_x, 0),
         pos_y: asNumber(plan.pos_y, 0),
+        locked: Boolean(plan.locked),
         created_at: String(plan.created_at || new Date().toISOString())
       };
     }
@@ -175,7 +358,8 @@
       const restored = Object.assign({}, restoredPlan, {
         id: ghostIdWithSeed("restored"),
         created_at: new Date().toISOString(),
-        source_ghost_id: String(restoredPlan.source_ghost_id || "")
+        source_ghost_id: String(restoredPlan.source_ghost_id || ""),
+        locked: Boolean(restoredPlan.locked)
       });
       setGhostPlans(function (prev) {
         return prev.concat([restored]);
@@ -249,6 +433,177 @@
         }
         return next;
       });
+    }
+
+    function toggleGhostLock(ghostId) {
+      const targetId = String(ghostId || "").trim();
+      if (!targetId) {
+        return false;
+      }
+      const target = ghostPlans.find(function (item) {
+        return item.id === targetId;
+      });
+      if (!target) {
+        return false;
+      }
+      const nextLocked = !Boolean(target.locked);
+      setGhostPlans(function (prev) {
+        return prev.map(function (item) {
+          if (item.id !== targetId) {
+            return item;
+          }
+          return Object.assign({}, item, { locked: nextLocked });
+        });
+      });
+      pushToast("ok", nextLocked ? t("web.ghost.locked_toast") : t("web.ghost.unlocked_toast"));
+      return true;
+    }
+
+    function buildPlannerFeedbackMessage(sourceNodeId, rawMessage) {
+      const sourceId = String(sourceNodeId || "").trim();
+      const original = String(rawMessage || "").trim();
+      if (!sourceId || !original || !/(^|\s)@(?:plan|planner)\b/i.test(original)) {
+        return original;
+      }
+      const routes = collectSourceRoutes(ghostPlans, sourceId);
+      const archivedAvoid = ghostArchive
+        .filter(function (item) {
+          if (String(item && item.project_id ? item.project_id : "") !== String(projectId || "")) {
+            return false;
+          }
+          const payload = item && item.payload && typeof item.payload === "object" ? item.payload : null;
+          if (!payload) {
+            return false;
+          }
+          return String(payload.source_id || "") === sourceId;
+        })
+        .slice(0, GHOST_ARCHIVE_FEEDBACK_LIMIT);
+      if (routes.length === 0 && archivedAvoid.length === 0) {
+        if (original.length <= GHOST_MESSAGE_MAX_LEN) {
+          return original;
+        }
+        return original.slice(0, GHOST_MESSAGE_MAX_LEN);
+      }
+      const lines = [
+        "",
+        "[Planner Context]",
+        "source_node_id=" + sourceId,
+      ];
+      if (routes.length > 0) {
+        lines.push("[Current Rendered Ghost Routes]");
+        routes.forEach(function (route, index) {
+          const outlineText = compactLine(ghostOutlineText(route.root), 220);
+          const titleText = compactLine(route.root && route.root.title ? route.root.title : "-", 60);
+          lines.push(
+            (index + 1).toString() +
+              ". " +
+              (route.locked ? "[LOCKED] " : "[UNLOCKED] ") +
+              titleText +
+              " :: " +
+              outlineText
+          );
+        });
+      }
+      if (archivedAvoid.length > 0) {
+        lines.push("[Previously Rejected Routes: AVOID]");
+        archivedAvoid.forEach(function (item, index) {
+          const payload = item.payload && typeof item.payload === "object" ? item.payload : {};
+          const titleText = compactLine(payload.title || "-", 60);
+          const outlineText = compactLine(ghostOutlineText(payload), 220);
+          lines.push((index + 1).toString() + ". " + titleText + " :: " + outlineText);
+        });
+      }
+      lines.push("[Rules]");
+      lines.push("1) Keep LOCKED routes unchanged.");
+      lines.push("2) For UNLOCKED routes, revise in place and avoid repeated patterns from AVOID list.");
+      lines.push("3) Choose outline granularity by user intent: high-level outline or detailed scene beats.");
+      const suffix = "\n\n" + lines.join("\n");
+      if (original.length >= GHOST_MESSAGE_MAX_LEN) {
+        return original.slice(0, GHOST_MESSAGE_MAX_LEN);
+      }
+      const remain = GHOST_MESSAGE_MAX_LEN - original.length;
+      return original + suffix.slice(0, remain);
+    }
+
+    function refreshGhostPlansForSource(sourceNodeId, options, config) {
+      const sourceId = String(sourceNodeId || "").trim();
+      const source = nodesRef.current.find(function (item) {
+        return item.id === sourceId;
+      });
+      const pickedOptions = safeArray(options).filter(function (item) {
+        return item && typeof item === "object";
+      });
+      if (!source || !sourceId || pickedOptions.length === 0) {
+        return {
+          totalRoutes: 0,
+          updatedRoutes: 0,
+          createdRoutes: 0,
+          removedRoutes: 0,
+          preservedLockedRoutes: 0
+        };
+      }
+      const sourceRoutes = collectSourceRoutes(ghostPlans, sourceId);
+      const lockedRoutes = sourceRoutes.filter(function (route) {
+        return route.locked;
+      });
+      const mutableRoutes = sourceRoutes.filter(function (route) {
+        return !route.locked;
+      });
+      const feedbackLoop = Boolean(config && config.feedbackLoop);
+      if (feedbackLoop && mutableRoutes.length > 0) {
+        const stalePlans = [];
+        mutableRoutes.forEach(function (route) {
+          stalePlans.push.apply(stalePlans, route.plans);
+        });
+        archiveGhostPlans(projectId, stalePlans);
+      }
+      const sourceSize = nodeRenderSize(source);
+      const baseX = asNumber(source.pos_x, 0) + sourceSize.width + 170;
+      const baseY = asNumber(source.pos_y, 0);
+      const nextSourcePlans = [];
+      lockedRoutes.forEach(function (route) {
+        nextSourcePlans.push.apply(nextSourcePlans, route.plans);
+      });
+      let updatedRoutes = 0;
+      let createdRoutes = 0;
+      for (let index = 0; index < pickedOptions.length; index += 1) {
+        const option = pickedOptions[index];
+        if (index < mutableRoutes.length) {
+          const updatedRoutePlans = updateGhostRouteWithOption(mutableRoutes[index], sourceId, source, option, index);
+          nextSourcePlans.push.apply(nextSourcePlans, updatedRoutePlans);
+          updatedRoutes += 1;
+          continue;
+        }
+        const createdRoutePlans = createGhostRouteFromOption(
+          sourceId,
+          source,
+          option,
+          index,
+          baseX + index * 230,
+          baseY + (index - 1) * 140
+        );
+        nextSourcePlans.push.apply(nextSourcePlans, createdRoutePlans);
+        createdRoutes += 1;
+      }
+      const removedRoutes = Math.max(0, mutableRoutes.length - pickedOptions.length);
+      if (removedRoutes > 0 && !feedbackLoop) {
+        const removedPlans = [];
+        mutableRoutes.slice(pickedOptions.length).forEach(function (route) {
+          removedPlans.push.apply(removedPlans, route.plans);
+        });
+        archiveGhostPlans(projectId, removedPlans);
+      }
+      const nextPlans = ghostPlans.filter(function (item) {
+        return String(item.source_id || "") !== sourceId;
+      }).concat(nextSourcePlans);
+      setGhostPlans(nextPlans);
+      return {
+        totalRoutes: collectSourceRoutes(nextPlans, sourceId).length,
+        updatedRoutes: updatedRoutes,
+        createdRoutes: createdRoutes,
+        removedRoutes: removedRoutes,
+        preservedLockedRoutes: lockedRoutes.length
+      };
     }
     
     async function fuseSelectedGhostPlans() {
@@ -372,6 +727,8 @@
       const sourceNode = nodesRef.current.find(function (item) {
         return item.id === ghost.source_id;
       });
+      const outlineText = String(ghostOutlineText(ghost) || "").trim();
+      const summaryText = outlineText || String(ghost.description || "").trim();
       const createdNode = await runApi(
         function () {
           return apiRequest("/api/projects/" + projectId + "/nodes", {
@@ -384,8 +741,8 @@
               pos_x: ghost.pos_x,
               pos_y: ghost.pos_y,
               metadata: {
-                summary: ghost.description,
-                content: ghost.description,
+                summary: summaryText,
+                outline_markdown: outlineText,
                 ai_from_ghost_plan: true,
                 ai_from_ghost_source: ghost.source_id,
                 ai_from_ghost_adopted_at: new Date().toISOString()
@@ -617,6 +974,9 @@
       clearGhostArchiveForProject: clearGhostArchiveForProject,
       toggleGhostPreview: toggleGhostPreview,
       toggleGhostSelection: toggleGhostSelection,
+      toggleGhostLock: toggleGhostLock,
+      buildPlannerFeedbackMessage: buildPlannerFeedbackMessage,
+      refreshGhostPlansForSource: refreshGhostPlansForSource,
       fuseSelectedGhostPlans: fuseSelectedGhostPlans,
       adoptGhostPlan: adoptGhostPlan,
       previewGhostPlan: previewGhostPlan,

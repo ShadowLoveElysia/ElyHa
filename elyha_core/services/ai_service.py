@@ -306,6 +306,16 @@ class AIService:
         review_bypassed = node is not None and auto_review_passed and route == "writer"
 
         if node is None:
+            if route == "planner" and self._is_planner_scope_violation(cleaned_message):
+                return ChatAssistResult(
+                    project_id=project_id,
+                    node_id=None,
+                    route="planner",
+                    reply=tr("ai.chat.planner_scope_refusal"),
+                    review_bypassed=False,
+                    suggested_options=[],
+                    revision=self._project_revision(project_id),
+                )
             response = self._generate(
                 task_type="chat_global_" + route,
                 prompt=self._chat_global_prompt(project_id, cleaned_message, route=route),
@@ -329,6 +339,16 @@ class AIService:
         llm_route = self._resolve_node_llm_route(node)
 
         if route == "planner":
+            if self._is_planner_scope_violation(cleaned_message):
+                return ChatAssistResult(
+                    project_id=project_id,
+                    node_id=node.id,
+                    route="planner",
+                    reply=tr("ai.chat.planner_scope_refusal"),
+                    review_bypassed=False,
+                    suggested_options=[],
+                    revision=self._project_revision(project_id),
+                )
             response = self._generate(
                 task_type="chat_plan",
                 prompt=self._chat_planner_prompt(node.title, context, cleaned_message),
@@ -807,10 +827,12 @@ class AIService:
         metadata: dict[str, Any],
     ) -> str:
         current_content = str(metadata.get("content", "")).strip() or tr("ai.chat.empty_fallback")
+        current_outline = str(metadata.get("outline_markdown", "")).strip() or tr("ai.chat.empty_fallback")
         return tr(
             "ai.chat.writer_prompt",
             title=title,
             request=user_message,
+            current_outline=current_outline,
             current_content=current_content,
             context=context.to_prompt(),
         )
@@ -838,6 +860,97 @@ class AIService:
         cleaned = re.sub(r"(?<![A-Za-z0-9_])@([A-Za-z_]+)\b", _replace, text)
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         return cleaned, route
+
+    def _is_planner_scope_violation(self, message: str) -> bool:
+        lowered = str(message or "").strip().lower()
+        if not lowered:
+            return False
+        explicit_other_agent_calls = [
+            "@writer",
+            "@review",
+            "@reviewer",
+            "@synth",
+            "@synthesizer",
+            "@lore",
+            "@logic",
+        ]
+        if any(marker in lowered for marker in explicit_other_agent_calls):
+            return True
+
+        plan_markers = [
+            "@plan",
+            "@planner",
+            "plan",
+            "planner",
+            "outline",
+            "beat",
+            "branch",
+            "route",
+            "scene",
+            "plot",
+            "分支",
+            "路线",
+            "走向",
+            "大纲",
+            "细纲",
+            "节拍",
+            "场景",
+            "剧情",
+            "计划",
+            "规划",
+            "提纲",
+            "梗概",
+            "ビート",
+            "分岐",
+            "アウトライン",
+            "プロット",
+            "シーン",
+            "構成",
+        ]
+        writer_markers = [
+            "writer",
+            "rewrite",
+            "revise",
+            "draft",
+            "write full",
+            "expand into prose",
+            "continue writing",
+            "polish",
+            "copyedit",
+            "正文",
+            "改写",
+            "润色",
+            "扩写",
+            "续写",
+            "写成",
+            "本文",
+            "章节正文",
+            "ライター",
+            "改稿",
+            "本文を書",
+            "執筆",
+            "推敲",
+        ]
+        review_markers = [
+            "review",
+            "proofread",
+            "consistency check",
+            "lore review",
+            "logic review",
+            "审查",
+            "校对",
+            "逻辑审查",
+            "设定审查",
+            "レビュー",
+            "校閲",
+            "整合性チェック",
+        ]
+        asks_non_plan = any(marker in lowered for marker in writer_markers + review_markers)
+        if not asks_non_plan:
+            return False
+        if any(marker in lowered for marker in plan_markers):
+            return False
+        return True
 
     def _project_snapshot_prompt(self, project_id: str, *, max_nodes: int = 18, max_edges: int = 30) -> str:
         nodes = self.graph_service.list_nodes(project_id)
@@ -1268,7 +1381,7 @@ class AIService:
                     or item.get("beats")
                     or item.get("next_steps")
                     or item.get("future_steps"),
-                    limit=3,
+                    limit=8,
                 )
                 if not description and outline_steps:
                     description = " / ".join(outline_steps[:2])

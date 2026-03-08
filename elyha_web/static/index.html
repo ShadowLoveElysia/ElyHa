@@ -5,27 +5,33 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>ElyHa Studio</title>
     <link rel="stylesheet" href="/web/static/styles.css" />
+    <!-- 白色+粉色主题覆盖层 - 注释掉下面这行可恢复原主题 -->
+    <link rel="stylesheet" href="/web/static/styles-theme-override.css" />
   </head>
   <body>
     <div id="root"></div>
     <script src="/web/static/vendor/react.production.min.js"></script>
     <script src="/web/static/vendor/react-dom.production.min.js"></script>
-    <script src="/web/static/web/constants.js"></script>
-    <script src="/web/static/web/helpers.js"></script>
-    <script src="/web/static/web/components.js"></script>
-    <script src="/web/static/web/app-state-utils.js"></script>
-    <script src="/web/static/web/app-ghost-utils.js"></script>
-    <script src="/web/static/web/app-graph-utils.js"></script>
-    <script src="/web/static/web/app-text-utils.js"></script>
-    <script src="/web/static/web/app-diff-utils.js"></script>
-    <script src="/web/static/web/app-artifact-utils.js"></script>
-    <script src="/web/static/web/app-api-actions.js"></script>
-    <script src="/web/static/web/app-ai-actions.js"></script>
-    <script src="/web/static/web/app-config-actions.js"></script>
-    <script src="/web/static/web/app-project-actions.js"></script>
-    <script src="/web/static/web/app-node-actions.js"></script>
-    <script src="/web/static/web/app-ghost-actions.js"></script>
-    <script src="/web/static/web/app-workflow-actions.js"></script>
+    <script src="/web/static/web/core/constants.js"></script>
+    <script src="/web/static/web/core/helpers.js"></script>
+    <script src="/web/static/web/core/components.js"></script>
+    <script src="/web/static/web/utils/app-state-utils.js"></script>
+    <script src="/web/static/web/utils/app-ghost-utils.js"></script>
+    <script src="/web/static/web/utils/app-graph-utils.js"></script>
+    <script src="/web/static/web/utils/app-text-utils.js"></script>
+    <script src="/web/static/web/utils/app-diff-utils.js"></script>
+    <script src="/web/static/web/utils/app-artifact-utils.js"></script>
+    <script src="/web/static/web/utils/app-utils.js"></script>
+    <script src="/web/static/web/actions/app-api-actions.js"></script>
+    <script src="/web/static/web/actions/app-ai-actions.js"></script>
+    <script src="/web/static/web/actions/app-config-actions.js"></script>
+    <script src="/web/static/web/actions/app-project-actions.js"></script>
+    <script src="/web/static/web/actions/app-node-actions.js"></script>
+    <script src="/web/static/web/actions/app-ghost-actions.js"></script>
+    <script src="/web/static/web/actions/app-workflow-actions.js"></script>
+    <script src="/web/static/web/app/app-context.js"></script>
+    <script src="/web/static/web/app/modules/app-logic.js"></script>
+    <script src="/web/static/web/app/component.js"></script>
     <script src="/web/static/app.js"></script>
   </body>
 </html>

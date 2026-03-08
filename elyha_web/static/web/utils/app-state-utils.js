@@ -123,12 +123,14 @@
         const text = String(item && item.text ? item.text : "");
         const meta = String(item && item.meta ? item.meta : "");
         const at = String(item && item.at ? item.at : new Date().toISOString());
+        const contextNodeId = String(item && item.context_node_id ? item.context_node_id : "").trim();
         return {
           id: id,
           role: role === "user" ? "user" : "assistant",
           text: text.slice(0, 12000),
           meta: meta.slice(0, 200),
           at: at,
+          context_node_id: contextNodeId,
           diffSegments: normalizeChatDiffSegments(item && item.diffSegments)
         };
       })

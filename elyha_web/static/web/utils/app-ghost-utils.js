@@ -10,6 +10,7 @@
   const safeArray = stateUtils.safeArray || function (value) {
     return Array.isArray(value) ? value : [];
   };
+  const GHOST_OUTLINE_LIMIT = 8;
 
   function ghostIdWithSeed(seed) {
     const suffix = String(seed || "").replace(/[^a-zA-Z0-9_]/g, "").slice(0, 16);
@@ -117,9 +118,12 @@
 
   function pickGhostOutlineSteps(option, fallbackText) {
     if (!option || typeof option !== "object") {
-      return normalizeGhostOutlineSteps(fallbackText, 3);
+      return normalizeGhostOutlineSteps(fallbackText, GHOST_OUTLINE_LIMIT);
     }
-    let steps = normalizeGhostOutlineSteps(option.outline_steps || option.beats || option.next_steps || option.future_steps, 3);
+    let steps = normalizeGhostOutlineSteps(
+      option.outline_steps || option.beats || option.next_steps || option.future_steps,
+      GHOST_OUTLINE_LIMIT
+    );
     if (steps.length === 0) {
       const compact = [];
       ["next_1", "next_2", "next_3"].forEach(function (field) {
@@ -131,12 +135,12 @@
       steps = compact.slice(0, 3);
     }
     if (steps.length === 0) {
-      steps = normalizeGhostOutlineSteps(fallbackText, 3);
+      steps = normalizeGhostOutlineSteps(fallbackText, GHOST_OUTLINE_LIMIT);
     }
     if (steps.length === 0 && fallbackText) {
       steps = [String(fallbackText)];
     }
-    return steps.slice(0, 3);
+    return steps.slice(0, GHOST_OUTLINE_LIMIT);
   }
 
   function normalizePersistedGhostArchive(value) {
@@ -165,9 +169,10 @@
             description: description || "-",
             storyline_id: String(payload.storyline_id || ""),
             sentiment: normalizeGhostSentiment(payload.sentiment),
-            outline_steps: normalizeGhostOutlineSteps(payload.outline_steps || description, 3),
+            outline_steps: normalizeGhostOutlineSteps(payload.outline_steps || description, GHOST_OUTLINE_LIMIT),
             pos_x: asNumber(payload.pos_x, 0),
             pos_y: asNumber(payload.pos_y, 0),
+            locked: Boolean(payload.locked),
             created_at: String(payload.created_at || new Date().toISOString())
           }
         };
@@ -180,7 +185,7 @@
     if (!plan) {
       return "-";
     }
-    const steps = normalizeGhostOutlineSteps(plan.outline_steps || plan.description, 3);
+    const steps = normalizeGhostOutlineSteps(plan.outline_steps || plan.description, GHOST_OUTLINE_LIMIT);
     if (steps.length > 1) {
       return steps.map(function (step, index) {
         return (index + 1).toString() + ". " + step;

@@ -129,9 +129,13 @@
       "web.chat.placeholder": "Ask AI to modify/analyze... e.g. @writer make this scene more oppressive",
       "web.chat.sending": "Sending...",
       "web.chat.send": "Send",
+      "web.chat.clear_current_history": "Clear Current Node Chat",
       "web.chat.route_label": "Route: {route}",
       "web.chat.review_bypassed": "review bypassed",
       "web.chat.suggested_created": "Suggested nodes created: {count}",
+      "web.chat.suggested_updated": "Suggested routes updated: {count} (locked preserved: {locked})",
+      "web.chat.history_cleared": "Current node chat cleared",
+      "web.chat.history_empty": "No chat history in current node",
       "web.chat.error_reply": "Request failed: {message}",
       "web.chat.diff_title": "Writer Diff",
       "web.workflow.welcome": "Ready to start a new original story or sequel? Reply with \"original\" or \"sequel\" first.",
@@ -172,6 +176,11 @@
       "web.ghost.preview_body": "From: {source}\n\nOutline:\n{outline}\n\nAdopt this ghost node into the graph?",
       "web.ghost.preview_hide": "Hide",
       "web.ghost.preview_source": "From: {source}",
+      "web.ghost.lock": "Lock",
+      "web.ghost.unlock": "Unlock",
+      "web.ghost.locked_label": "Locked",
+      "web.ghost.locked_toast": "Ghost node locked",
+      "web.ghost.unlocked_toast": "Ghost node unlocked",
       "web.ghost.chain_step": "Next {index}",
       "web.ghost.chain_fallback": "Follow-up beat {index}",
       "web.ghost.select": "Select",
@@ -336,7 +345,11 @@
       "web.option.node_status.draft": "Draft",
       "web.option.node_status.generated": "Generated",
       "web.option.node_status.reviewed": "Reviewed",
-      "web.option.node_status.approved": "Approved"
+      "web.option.node_status.approved": "Approved",
+      "web.bind_node_modal.title": "绑定节点",
+      "web.bind_node_modal.body": "是否需要将节点「{node_title}」绑定到大节点「{group_title}」内？",
+      "web.bind_node_modal.confirm": "绑定",
+      "web.bind_node_modal.cancel": "取消"
     }
   };
 })();
