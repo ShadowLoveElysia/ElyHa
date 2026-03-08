@@ -517,6 +517,14 @@
       return error instanceof Error ? error.message : String(error);
     }
 
+    function isApiEndpointMissing(message) {
+      const text = String(message || "").trim().toLowerCase();
+      if (!text) {
+        return false;
+      }
+      return text === "not found" || text.includes("http 404") || text.includes("404 not found");
+    }
+
     async function runApiDetailed(task, successMessage) {
       try {
         const response = await task();
@@ -892,6 +900,114 @@
       return null;
     }
 
+    function normalizeOutlineMarkdownText(value) {
+      if (Array.isArray(value)) {
+        const rows = value
+          .map(function (item) { return String(item || "").trim(); })
+          .filter(Boolean)
+          .slice(0, 12);
+        if (rows.length === 0) {
+          return "";
+        }
+        return rows.map(function (item) {
+          return "- " + item;
+        }).join("\n");
+      }
+      const text = String(value || "").trim();
+      if (!text) {
+        return "";
+      }
+      if (text.indexOf("\n") >= 0) {
+        return text;
+      }
+      return text.startsWith("- ") || text.startsWith("* ") ? text : "- " + text;
+    }
+
+    function normalizeOutlineDetailNodeItem(raw, index) {
+      const item = raw && typeof raw === "object" ? raw : {};
+      const outline = normalizeOutlineMarkdownText(
+        item.outline_markdown || item.outline || item.detail_outline || item.outline_steps || item.steps || item.beats
+      );
+      if (!outline) {
+        return null;
+      }
+      const summary = String(item.summary || item.description || "").trim() || outline.replace(/\s+/g, " ").slice(0, 180);
+      const title = String(item.title || item.name || "").trim() || (t("web.outline.default_scene_prefix") + " " + String(index + 1));
+      return {
+        title: title,
+        outline_markdown: outline,
+        summary: summary
+      };
+    }
+
+    function normalizeOutlineDetailNodesPayload(payload, limit) {
+      const source = payload && typeof payload === "object" ? payload : {};
+      const maxCount = Math.max(1, Math.floor(asNumber(limit, 8)));
+      const nodesRaw = Array.isArray(source.nodes)
+        ? source.nodes
+        : Array.isArray(source.node_outlines)
+          ? source.node_outlines
+          : Array.isArray(source.items)
+            ? source.items
+            : Array.isArray(source.options)
+              ? source.options
+              : [];
+      return nodesRaw
+        .map(function (item, index) {
+          return normalizeOutlineDetailNodeItem(item, index);
+        })
+        .filter(function (item) {
+          return Boolean(item && item.outline_markdown);
+        })
+        .slice(0, maxCount);
+    }
+
+    function buildOutlineDetailNodesFromPlannerOptions(options, limit) {
+      const maxCount = Math.max(1, Math.floor(asNumber(limit, 8)));
+      const sourceOptions = Array.isArray(options) ? options : [];
+      if (sourceOptions.length === 0) {
+        return [];
+      }
+      const first = sourceOptions[0] && typeof sourceOptions[0] === "object" ? sourceOptions[0] : {};
+      const titlePrefix = String(first.title || t("web.outline.default_scene_prefix")).trim() || t("web.outline.default_scene_prefix");
+      const beats = pickGhostOutlineSteps(first, String(first.description || "")).slice(0, maxCount);
+      return beats
+        .map(function (beat, index) {
+          const text = String(beat || "").trim();
+          if (!text) {
+            return null;
+          }
+          return {
+            title: titlePrefix + " · " + String(index + 1),
+            outline_markdown: "- " + text,
+            summary: text.slice(0, 180)
+          };
+        })
+        .filter(Boolean);
+    }
+
+    function buildOutlineDetailNodesFallbackFromSeed(outlineText, chapterBeats, limit) {
+      const maxCount = Math.max(1, Math.floor(asNumber(limit, 8)));
+      const beatLines = Array.isArray(chapterBeats)
+        ? chapterBeats.map(function (item) { return String(item || "").trim(); }).filter(Boolean)
+        : [];
+      const sourceBeats = beatLines.length > 0 ? beatLines : normalizeGhostOutlineSteps(String(outlineText || ""), maxCount);
+      return sourceBeats
+        .slice(0, maxCount)
+        .map(function (beat, index) {
+          const text = String(beat || "").trim();
+          if (!text) {
+            return null;
+          }
+          return {
+            title: t("web.outline.default_scene_prefix") + " " + String(index + 1),
+            outline_markdown: "- " + text,
+            summary: text.slice(0, 180)
+          };
+        })
+        .filter(Boolean);
+    }
+
     function normalizeOutlineNodePlanIntent(rawReply) {
       const parsed = parseLooseJsonObject(rawReply);
       if (!parsed) {
@@ -1060,11 +1176,84 @@
       };
     }
 
+    function buildOutlineDetailNodesFallbackPrompt(seedNode, outlineText, chapterBeats, userRequest, mode) {
+      const beatsBlock = Array.isArray(chapterBeats) && chapterBeats.length > 0
+        ? chapterBeats.map(function (item) {
+            return "- " + String(item || "").trim();
+          }).join("\n")
+        : "-";
+      const wrapped = [
+        "@plan",
+        "You are generating detailed-outline nodes from the current outline seed.",
+        "Output strict JSON only:",
+        "{\"nodes\":[{\"title\":\"...\",\"outline_markdown\":\"...\",\"summary\":\"...\"}]}",
+        "Rules:",
+        "1) Generate 3-8 nodes in sequence for the next segment only.",
+        "2) Each node must include outline_markdown (markdown bullet beats).",
+        "3) Do not output full prose/content.",
+        "4) Keep progression local; do not jump to ending.",
+        "",
+        "[Mode]",
+        String(mode || "-"),
+        "",
+        "[User Request]",
+        String(userRequest || "-"),
+        "",
+        "[Seed Node]",
+        "id=" + String(seedNode && seedNode.id ? seedNode.id : "-") + ", title=" + String(seedNode && seedNode.title ? seedNode.title : "-"),
+        "",
+        "[Seed Outline]",
+        String(outlineText || "-"),
+        "",
+        "[Chapter Beats]",
+        beatsBlock
+      ].join("\n");
+      return wrapped.slice(0, CHAT_MESSAGE_MAX_LEN);
+    }
+
+    async function requestOutlineDetailNodesViaChatFallback(seedNode, outlineText, chapterBeats, userRequest, mode) {
+      const prompt = buildOutlineDetailNodesFallbackPrompt(seedNode, outlineText, chapterBeats, userRequest, mode);
+      const outcome = await runApiDetailed(
+        function () {
+          return apiRequest("/api/ai/chat", {
+            method: "POST",
+            timeout_ms: aiRequestTimeoutMs(),
+            body: {
+              project_id: projectId,
+              node_id: seedNode ? seedNode.id : null,
+              message: prompt,
+              token_budget: Math.max(1200, Math.floor(asNumber(aiConfig.token_budget, 2200)))
+            }
+          });
+        },
+        null
+      );
+      if (!outcome.ok || !outcome.data) {
+        return [];
+      }
+      const payload = outcome.data;
+      const fromPayload = normalizeOutlineDetailNodesPayload(payload, 8);
+      if (fromPayload.length > 0) {
+        return fromPayload;
+      }
+      const parsed = parseLooseJsonObject(String(payload.reply || ""));
+      const fromReply = normalizeOutlineDetailNodesPayload(parsed, 8);
+      if (fromReply.length > 0) {
+        return fromReply;
+      }
+      const fromOptions = buildOutlineDetailNodesFromPlannerOptions(payload.suggested_options, 8);
+      if (fromOptions.length > 0) {
+        return fromOptions;
+      }
+      return [];
+    }
+
     async function createOutlineDetailNodesFromSeed(seedNode, userRequest) {
       if (!seedNode || !projectId) {
         return {
           ok: false,
-          count: 0
+          count: 0,
+          endpoint_missing: false
         };
       }
       const metadata = seedNode.metadata && typeof seedNode.metadata === "object" ? seedNode.metadata : {};
@@ -1075,58 +1264,83 @@
       if (!outlineText) {
         return {
           ok: false,
-          count: 0
+          count: 0,
+          endpoint_missing: false
         };
       }
-      const detailOutcome = await runApiDetailed(
-        function () {
-          return apiRequest("/api/ai/outline/detail_nodes", {
+      const requestBody = {
+        project_id: projectId,
+        outline_markdown: outlineText,
+        chapter_beats: chapterBeats,
+        user_request: String(userRequest || ""),
+        mode: String(metadata.outline_mode || ""),
+        token_budget: Math.max(1200, Math.floor(asNumber(aiConfig.token_budget, 2200))),
+        max_nodes: 8
+      };
+      const endpointCandidates = [
+        "/api/ai/outline/detail_nodes",
+        "/api/ai/outline/detail-nodes",
+        "/api/ai/outline/detailNodes"
+      ];
+      let detailPayload = null;
+      let endpointMissing = false;
+      let lastErrorMessage = "";
+      for (let endpointIndex = 0; endpointIndex < endpointCandidates.length; endpointIndex += 1) {
+        const endpoint = endpointCandidates[endpointIndex];
+        try {
+          detailPayload = await apiRequest(endpoint, {
             method: "POST",
             timeout_ms: aiRequestTimeoutMs(),
-            body: {
-              project_id: projectId,
-              outline_markdown: outlineText,
-              chapter_beats: chapterBeats,
-              user_request: String(userRequest || ""),
-              mode: String(metadata.outline_mode || ""),
-              token_budget: Math.max(1200, Math.floor(asNumber(aiConfig.token_budget, 2200))),
-              max_nodes: 8
-            }
+            body: requestBody
           });
-        },
-        null
-      );
-      if (!detailOutcome.ok || !detailOutcome.data) {
-        return {
-          ok: false,
-          count: 0
-        };
+          endpointMissing = false;
+          break;
+        } catch (error) {
+          const message = resolveErrorMessage(error);
+          lastErrorMessage = message;
+          endpointMissing = isApiEndpointMissing(message);
+          const hasNextCandidate = endpointMissing && endpointIndex + 1 < endpointCandidates.length;
+          if (hasNextCandidate) {
+            continue;
+          }
+          if (endpointMissing) {
+            break;
+          }
+          pushToast("error", t("web.toast.api_error", { message: message }));
+          addActivity("error", "outline detail nodes request failed: " + message + " @ " + endpoint);
+          return {
+            ok: false,
+            count: 0,
+            endpoint_missing: endpointMissing
+          };
+        }
       }
-      const detailNodes = Array.isArray(detailOutcome.data.nodes)
-        ? detailOutcome.data.nodes
-            .map(function (item) {
-              const raw = item && typeof item === "object" ? item : {};
-              const title = String(raw.title || "").trim();
-              const outline = String(raw.outline_markdown || "").trim();
-              const summary = String(raw.summary || "").trim();
-              if (!outline) {
-                return null;
-              }
-              return {
-                title: title,
-                outline_markdown: outline,
-                summary: summary || outline.replace(/\s+/g, " ").slice(0, 180)
-              };
-            })
-            .filter(function (item) {
-              return Boolean(item && item.outline_markdown);
-            })
-            .slice(0, 8)
-        : [];
+      let detailNodes = normalizeOutlineDetailNodesPayload(detailPayload, 8);
+      if (detailNodes.length === 0 && endpointMissing) {
+        const chatFallback = await requestOutlineDetailNodesViaChatFallback(
+          seedNode,
+          outlineText,
+          chapterBeats,
+          String(userRequest || ""),
+          String(metadata.outline_mode || "")
+        );
+        if (chatFallback.length > 0) {
+          detailNodes = chatFallback;
+          endpointMissing = false;
+          addActivity("warn", "outline detail endpoint missing, used chat fallback generation");
+        }
+      }
       if (detailNodes.length === 0) {
+        detailNodes = buildOutlineDetailNodesFallbackFromSeed(outlineText, chapterBeats, 8);
+      }
+      if (detailNodes.length === 0) {
+        if (!detailPayload && lastErrorMessage && !endpointMissing) {
+          pushToast("error", t("web.toast.api_error", { message: lastErrorMessage }));
+        }
         return {
           ok: false,
-          count: 0
+          count: 0,
+          endpoint_missing: endpointMissing
         };
       }
       const created = [];
@@ -1198,6 +1412,10 @@
       }
       await refreshProjectData(projectId, true);
       await validateGraph();
+      setMainView("story");
+      if (storylineFilter !== STORYLINE_ALL) {
+        setStorylineFilter(STORYLINE_ALL);
+      }
       if (created.length > 0) {
         setSelectedNodeId(created[0].id);
         setSidebarTab("node");
@@ -1207,7 +1425,8 @@
       }
       return {
         ok: true,
-        count: created.length
+        count: created.length,
+        endpoint_missing: false
       };
     }
 
@@ -1256,13 +1475,16 @@
         const creation = await createOutlineDetailNodesFromSeed(seedNode, String(pending.request || userText || ""));
         ref.current = null;
         if (!creation.ok || creation.count <= 0) {
+          const failedText = creation.endpoint_missing
+            ? t("web.chat.outline_plan_endpoint_missing")
+            : t("web.chat.outline_plan_failed");
           appendChatMessage(
             "assistant",
-            t("web.chat.outline_plan_failed"),
+            failedText,
             t("web.chat.route_label", { route: "outline_plan" }),
             { contextNodeId: contextNodeId }
           );
-          pushToast("warn", t("web.chat.outline_plan_failed"));
+          pushToast("warn", failedText);
           return true;
         }
         appendChatMessage(

@@ -866,6 +866,8 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         }
 
     @api.post("/api/ai/outline/detail_nodes")
+    @api.post("/api/ai/outline/detail-nodes")
+    @api.post("/api/ai/outline/detailNodes")
     def ai_outline_detail_nodes(payload: OutlineDetailNodesRequest) -> dict[str, Any]:
         try:
             result = services.ai_service.guide_outline_detail_nodes(

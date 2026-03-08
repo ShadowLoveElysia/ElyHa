@@ -154,6 +154,7 @@
       "web.chat.outline_plan_modal_body": "Create a batch of detailed-outline nodes from \"{node_title}\" and auto-connect their order.\n\nRequest: {request}\n\nThis will write to the graph after you confirm. Continue?",
       "web.chat.outline_plan_cancelled": "Detailed-outline node creation cancelled.",
       "web.chat.outline_plan_failed": "Failed to create detailed-outline nodes. Please retry.",
+      "web.chat.outline_plan_endpoint_missing": "Detailed-outline endpoint is unavailable (backend may be outdated or not restarted). Restart Web service and retry.",
       "web.chat.outline_plan_created": "Created {count} detailed-outline nodes and linked them in order. Please review.",
       "web.workflow.welcome": "You can chat with the LLM directly first. To start the 7-step workflow, reply \"original\" or \"sequel\".",
       "web.workflow.need_mode": "Please reply mode first: \"original\" or \"sequel\".",

@@ -424,6 +424,7 @@
   "web.chat.outline_plan_modal_body": "ノード「{node_title}」の大綱を基に、細綱ノードを一括作成し順序を自動接続します。\\n\\n依頼: {request}\\n\\n確認後にグラフへ書き込みます。続行しますか？",
   "web.chat.outline_plan_cancelled": "細綱ノード作成をキャンセルしました。",
   "web.chat.outline_plan_failed": "細綱ノード作成に失敗しました。時間を置いて再試行してください。",
+  "web.chat.outline_plan_endpoint_missing": "細綱 API が利用できません（バックエンド未更新または未再起動の可能性）。Web サービスを再起動して再試行してください。",
   "web.chat.outline_plan_created": "{count} 件の細綱ノードを作成し、順序を自動接続しました。内容を確認してください。",
   "web.workflow.welcome": "まず LLM と直接対話して情報を集めても構いません。7 段階フローを開始する場合は「original」または「sequel」を返信してください。口頭確認後、LLM は要点を出力し、表入力を提案できます。",
   "web.workflow.need_mode": "先に正確なモードが必要です。「original」または「sequel」のみ返信してください。",

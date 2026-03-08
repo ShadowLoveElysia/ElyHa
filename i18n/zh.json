@@ -424,6 +424,7 @@
   "web.chat.outline_plan_modal_body": "将基于节点「{node_title}」的大纲创建一批细纲节点，并自动连接顺序。\\n\\n请求：{request}\\n\\n确认后才会真正写入图谱，是否继续？",
   "web.chat.outline_plan_cancelled": "已取消本次细纲节点创建。",
   "web.chat.outline_plan_failed": "细纲节点创建失败，请稍后重试。",
+  "web.chat.outline_plan_endpoint_missing": "细纲接口不可用（可能后端未更新或未重启）。请重启 Web 服务后重试。",
   "web.chat.outline_plan_created": "已创建 {count} 个细纲节点并自动连线，请审核。",
   "web.workflow.welcome": "你可以先直接和 LLM 对话收集信息。若要走七步流程，请回复“原创”或“续写”；在你口头确认后，LLM 会输出关键信息并可弹窗填入表单。",
   "web.workflow.need_mode": "请先给出准确模式：仅回复“原创”或“续写”。",
