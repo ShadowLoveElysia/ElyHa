@@ -46,6 +46,33 @@ body {
   border: 1px solid #e2e8f0 !important;
 }
 
+/* === 3.1 首用流程引导卡片 === */
+.outline-guide-card {
+  background: #fff7fb !important;
+  border: 1px solid #fbcfe8 !important;
+}
+
+.outline-guide-card h3 {
+  color: #be185d !important;
+}
+
+.outline-guide-tip {
+  color: #9d174d !important;
+}
+
+.outline-guide-list {
+  background: #ffffff !important;
+  border: 1px dashed #f9a8d4 !important;
+}
+
+.outline-guide-list strong {
+  color: #be185d !important;
+}
+
+.outline-guide-list ol {
+  color: #475569 !important;
+}
+
 /* === 4. 节点卡片核心 === */
 .node-card {
   background: #ffffff !important;
@@ -96,6 +123,17 @@ body {
 .node-card.highlight-node {
   border-color: #f59e0b !important;
   box-shadow: 0 0 0 3px #fef3c7, 0 4px 12px rgba(245, 158, 11, 0.25) !important;
+}
+
+/* === 5.1 节点执行状态 === */
+.node-card.flow-active::after {
+  border-color: rgba(236, 72, 153, 0.72) !important;
+}
+
+.flow-chip {
+  border-color: rgba(236, 72, 153, 0.72) !important;
+  color: #be185d !important;
+  background: rgba(253, 242, 248, 0.95) !important;
 }
 
 /* === 6. 连接线 === */
@@ -376,6 +414,24 @@ input[type="checkbox"] {
 .node-card.ghost-node {
   background: #f5f3ff !important;
   border-color: #a5b4fc !important;
+  color: #1f2937 !important;
+}
+
+.node-card.ghost-node .node-head {
+  background: linear-gradient(180deg, #ede9fe, #f5f3ff) !important;
+  border-bottom: 1px solid #c4b5fd !important;
+}
+
+.node-card.ghost-node .node-title {
+  color: #1f2937 !important;
+}
+
+.node-card.ghost-node .node-body {
+  color: #334155 !important;
+}
+
+.node-card.ghost-node .muted {
+  color: #64748b !important;
 }
 
 .ghost-pill {
@@ -386,6 +442,101 @@ input[type="checkbox"] {
 
 .ghost-outline {
   color: #475569 !important;
+}
+
+.node-card.ghost-node .ghost-preview-inline {
+  background: #eef2ff !important;
+  border-color: #c7d2fe !important;
+}
+
+.node-card.ghost-node .ghost-preview-title {
+  color: #4f46e5 !important;
+}
+
+.node-card.ghost-node .ghost-preview-body {
+  color: #334155 !important;
+}
+
+.ghost-mode-label {
+  color: #7c3aed !important;
+  border-color: #c4b5fd !important;
+  background: #f5f3ff !important;
+}
+
+.ghost-mode-label.outline_decompose {
+  color: #0f766e !important;
+  border-color: #5eead4 !important;
+  background: #ccfbf1 !important;
+}
+
+.ghost-mode-label.story_extend {
+  color: #1d4ed8 !important;
+  border-color: #93c5fd !important;
+  background: #dbeafe !important;
+}
+
+.node-card.ghost-node .ghost-sentiment-label {
+  color: #1e293b !important;
+}
+
+.node-card.ghost-node .ghost-sentiment-label.conflict {
+  color: #991b1b !important;
+  border-color: #fca5a5 !important;
+  background: #fee2e2 !important;
+}
+
+.node-card.ghost-node .ghost-sentiment-label.calm {
+  color: #075985 !important;
+  border-color: #7dd3fc !important;
+  background: #e0f2fe !important;
+}
+
+.node-card.ghost-node .ghost-sentiment-label.suspense {
+  color: #6b21a8 !important;
+  border-color: #d8b4fe !important;
+  background: #f3e8ff !important;
+}
+
+.node-card.ghost-node .ghost-sentiment-label.twist {
+  color: #92400e !important;
+  border-color: #fcd34d !important;
+  background: #fef3c7 !important;
+}
+
+.node-card.ghost-node .ghost-sentiment-label.neutral {
+  color: #1e40af !important;
+  border-color: #93c5fd !important;
+  background: #dbeafe !important;
+}
+
+.node-card.ghost-node .ghost-lock-label {
+  color: #1e3a8a !important;
+  border-color: #93c5fd !important;
+  background: #e0e7ff !important;
+}
+
+.node-card.ghost-node .ghost-node-btn {
+  color: #1e3a8a !important;
+  border-color: #93c5fd !important;
+  background: #eff6ff !important;
+}
+
+.node-card.ghost-node .ghost-node-btn.lock {
+  color: #0f766e !important;
+  border-color: #5eead4 !important;
+  background: #ccfbf1 !important;
+}
+
+.node-card.ghost-node .ghost-node-btn.adopt {
+  color: #166534 !important;
+  border-color: #86efac !important;
+  background: #dcfce7 !important;
+}
+
+.node-card.ghost-node .ghost-node-btn.delete {
+  color: #991b1b !important;
+  border-color: #fca5a5 !important;
+  background: #fee2e2 !important;
 }
 
 /* === 19. 分组框架 === */

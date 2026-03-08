@@ -136,6 +136,16 @@ class OutlineGuideRequest(BaseModel):
     token_budget: int = Field(default=2200, ge=1)
 
 
+class OutlineDetailNodesRequest(BaseModel):
+    project_id: str
+    outline_markdown: str = ""
+    chapter_beats: list[str] = Field(default_factory=list)
+    user_request: str = ""
+    mode: str = ""
+    token_budget: int = Field(default=1800, ge=1)
+    max_nodes: int = Field(default=8, ge=3, le=12)
+
+
 class WorkflowClarifyRequest(BaseModel):
     project_id: str
     goal: str = Field(min_length=1, max_length=4000)
@@ -389,17 +399,28 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     i18n_root = Path(__file__).resolve().parent.parent / "i18n"
     if web_root.exists():
         api.mount(
+            "/static",
+            StaticFiles(directory=str(web_root)),
+            name="elyha-static",
+        )
+        api.mount(
             "/web/static",
             StaticFiles(directory=str(web_root)),
             name="elyha-web-static",
         )
         if i18n_root.exists():
             api.mount(
+                "/i18n",
+                StaticFiles(directory=str(i18n_root)),
+                name="elyha-i18n",
+            )
+            api.mount(
                 "/web/i18n",
                 StaticFiles(directory=str(i18n_root)),
                 name="elyha-web-i18n",
             )
 
+        @api.get("/", include_in_schema=False)
         @api.get("/web", include_in_schema=False)
         @api.get("/web/", include_in_schema=False)
         def web_index() -> FileResponse:
@@ -839,6 +860,37 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             "outline_markdown": result.outline_markdown,
             "chapter_beats": result.chapter_beats,
             "next_steps": result.next_steps,
+            "provider": result.provider,
+            "prompt_tokens": result.prompt_tokens,
+            "completion_tokens": result.completion_tokens,
+        }
+
+    @api.post("/api/ai/outline/detail_nodes")
+    def ai_outline_detail_nodes(payload: OutlineDetailNodesRequest) -> dict[str, Any]:
+        try:
+            result = services.ai_service.guide_outline_detail_nodes(
+                payload.project_id,
+                outline_markdown=payload.outline_markdown,
+                chapter_beats=payload.chapter_beats,
+                user_request=payload.user_request,
+                mode=payload.mode,
+                token_budget=payload.token_budget,
+                max_nodes=payload.max_nodes,
+            )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return {
+            "project_id": result.project_id,
+            "nodes": [
+                {
+                    "title": item.title,
+                    "outline_markdown": item.outline_markdown,
+                    "summary": item.summary,
+                }
+                for item in result.nodes
+            ],
             "provider": result.provider,
             "prompt_tokens": result.prompt_tokens,
             "completion_tokens": result.completion_tokens,

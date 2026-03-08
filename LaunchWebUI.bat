@@ -44,7 +44,7 @@ if "%UV_ENV_FROM_USER%"=="0" (
 )
 
 echo [ElyHa] Launching Web GUI with db: %DB_PATH%
-echo [ElyHa] Open: http://%HOST%:%PORT%/web
+echo [ElyHa] Open: http://%HOST%:%PORT%/
 echo [ElyHa] Active config profile: %ACTIVE_PROFILE%
 
 where uv >nul 2>nul

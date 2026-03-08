@@ -66,7 +66,7 @@ async function loadLocaleCatalog(nextLocale) {
       const picked = SUPPORTED_LOCALES.includes(nextLocale) ? nextLocale : DEFAULT_LOCALE;
       const result = await runApi(
         function () {
-          return apiRequest("/web/i18n/" + picked + ".json");
+          return apiRequest("/i18n/" + picked + ".json");
         },
         null
       );
@@ -451,6 +451,8 @@ async function loadLocaleCatalog(nextLocale) {
               metadata: {
                 project_outline: true,
                 outline_kind: "project_outline",
+                ai_outline_seed: true,
+                ai_outline_seed_marker: "workflow_outline_seed_v1",
                 outline_goal: String(outlineGuideForm.goal || ""),
                 outline_sync_context: String(outlineGuideForm.sync_context || ""),
                 outline_specify: String(outlineGuideForm.specify || ""),
@@ -463,7 +465,7 @@ async function loadLocaleCatalog(nextLocale) {
                   ? outlineGuideForm.chapter_beats
                   : [],
                 outline_next_steps: Array.isArray(outlineGuideForm.next_steps) ? outlineGuideForm.next_steps : [],
-                content: outlineText,
+                outline_markdown: outlineText,
                 summary: outlineText.slice(0, 200)
               }
             }

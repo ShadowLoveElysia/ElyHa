@@ -30,7 +30,7 @@ if [[ -z "${PORT}" ]]; then
 fi
 
 echo "[ElyHa] Launching Web GUI with db: ${DB_PATH}"
-echo "[ElyHa] Open: http://${HOST}:${PORT}/web"
+echo "[ElyHa] Open: http://${HOST}:${PORT}/"
 echo "[ElyHa] Active config profile: ${ACTIVE_PROFILE}"
 
 if command -v uv >/dev/null 2>&1; then

@@ -28,7 +28,7 @@ LaunchGUI.bat
 ./LaunchGUI.sh
 ```
 
-浏览器打开 `http://127.0.0.1:8765/web`（默认端口，您可以在Web中修改）
+浏览器打开 `http://127.0.0.1:8765/`（默认端口，您可以在Web中修改）
 
 ### 启动 TUI（命令行）
 
@@ -100,7 +100,7 @@ UV_CACHE_DIR=.uv-cache uv run python scripts/migrate.py --db ./data/dev.db
 
 # 启动 Web GUI（React）
 UV_CACHE_DIR=.uv-cache uv run uvicorn elyha_api.app:app --reload
-# 浏览器打开 http://127.0.0.1:8000/web
+# 浏览器打开 http://127.0.0.1:8000/
 
 # TUI 冒烟
 UV_CACHE_DIR=.uv-cache uv run python -m elyha_tui.main --smoke

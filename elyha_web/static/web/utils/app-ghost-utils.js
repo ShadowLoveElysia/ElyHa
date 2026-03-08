@@ -60,6 +60,14 @@
     return aliasMap[raw] || "neutral";
   }
 
+  function normalizeGhostPlanMode(value) {
+    const raw = String(value || "").trim().toLowerCase().replace(/[-\s]+/g, "_");
+    if (raw === "outline_decompose") {
+      return "outline_decompose";
+    }
+    return "story_extend";
+  }
+
   function inferGhostSentimentFromText(title, description) {
     const text = (String(title || "") + "\n" + String(description || "")).toLowerCase();
     const groups = [
@@ -169,6 +177,7 @@
             description: description || "-",
             storyline_id: String(payload.storyline_id || ""),
             sentiment: normalizeGhostSentiment(payload.sentiment),
+            plan_mode: normalizeGhostPlanMode(payload.plan_mode),
             outline_steps: normalizeGhostOutlineSteps(payload.outline_steps || description, GHOST_OUTLINE_LIMIT),
             pos_x: asNumber(payload.pos_x, 0),
             pos_y: asNumber(payload.pos_y, 0),
@@ -231,6 +240,7 @@
   window.ElyhaWebGhostUtils = {
     ghostIdWithSeed: ghostIdWithSeed,
     normalizeGhostSentiment: normalizeGhostSentiment,
+    normalizeGhostPlanMode: normalizeGhostPlanMode,
     inferGhostSentimentFromText: inferGhostSentimentFromText,
     normalizeGhostOutlineSteps: normalizeGhostOutlineSteps,
     pickGhostOutlineSteps: pickGhostOutlineSteps,

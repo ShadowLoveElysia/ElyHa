@@ -164,7 +164,7 @@
     !createProjectActionHandlersValue ||
     !createNodeActionHandlersValue
   ) {
-    throw new Error("Web runtime modules failed to load. Please check /web/static/web/*.js");
+    throw new Error("Web runtime modules failed to load. Please check /static/web/*.js");
   }
 
 n  window.ElyhaWebAppImports = {

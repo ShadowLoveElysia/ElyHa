@@ -44,7 +44,7 @@ UV_CACHE_DIR=.uv-cache uv run python -m elyha_tui.main --db ./data/dev.db --auto
 UV_CACHE_DIR=.uv-cache uv run uvicorn elyha_api.app:app --reload
 
 # 打开
-# http://127.0.0.1:8000/web
+# http://127.0.0.1:8000/
 ```
 
 Web GUI 约束：

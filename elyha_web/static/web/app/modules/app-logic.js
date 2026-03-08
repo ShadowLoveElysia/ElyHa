@@ -182,6 +182,7 @@
       setModal,
       chatOpen,
       setChatOpen,
+      chatViewScale,
       artifactOpen,
       setArtifactOpen,
       chatContextNodeId,
@@ -229,10 +230,12 @@
       viewportRef,
       contextMenuSuppressUntilRef,
       ghostClickSuppressUntilRef,
-      chatLogRef
+      chatLogRef,
+      chatOutlineNodePlanRef
     } = deps;
 
     const outlineRequired = Boolean(projectId) && nodes.length === 0 && !hasProjectOutline(nodes);
+    const workflowWelcomeText = t("web.workflow.welcome");
 
     function t(key, variables) {
       const text = catalog[key] || FALLBACK_TEXT[key] || key;
@@ -591,6 +594,719 @@
       });
     }
 
+    const CHAT_MESSAGE_MAX_LEN = 3900;
+
+    function compactChatLine(value, maxLen) {
+      const source = String(value || "").replace(/\s+/g, " ").trim();
+      const limit = Math.max(12, Math.floor(asNumber(maxLen, 160)));
+      if (!source) {
+        return "";
+      }
+      return source.length <= limit ? source : source.slice(0, Math.max(0, limit - 1)) + "…";
+    }
+
+    function buildOutlineChatMessageWithHistory(rawMessage) {
+      const original = String(rawMessage || "").trim();
+      if (!outlineRequired) {
+        return original.slice(0, CHAT_MESSAGE_MAX_LEN);
+      }
+      const history = chatMessages.filter(function (item) {
+        const contextId = String(item && item.context_node_id ? item.context_node_id : "").trim();
+        const role = String(item && item.role ? item.role : "").trim().toLowerCase();
+        const meta = String(item && item.meta ? item.meta : "");
+        return !contextId && (role === "user" || role === "assistant") && !meta.includes("workflow_init");
+      }).slice(-16);
+      if (history.length === 0) {
+        return original.slice(0, CHAT_MESSAGE_MAX_LEN);
+      }
+      const lines = history.map(function (item, index) {
+        const role = String(item && item.role ? item.role : "user").toLowerCase() === "assistant" ? "assistant" : "user";
+        return (
+          String(index + 1) +
+          ". [" +
+          role +
+          "] " +
+          compactChatLine(item && item.text ? item.text : "", 220)
+        );
+      });
+      const wrapped = [
+        "[Conversation History]",
+        lines.join("\n"),
+        "",
+        "[Current User Message]",
+        original,
+        "",
+        "[Instructions]",
+        "Continue this conversation and keep continuity with the history.",
+        "Only when information is sufficient AND the user explicitly confirms form filling, append exactly one machine block:",
+        "[OUTLINE_FORM_PREFILL]{\"ready\":true,\"goal\":\"...\",\"sync_context\":\"...\",\"specify\":\"...\",\"clarify_answers\":\"...\",\"plan_notes\":\"...\",\"constraints\":\"...\",\"tone\":\"...\"}[/OUTLINE_FORM_PREFILL]",
+        "If either condition is not met, do not output this block."
+      ].join("\n");
+      return wrapped.slice(0, CHAT_MESSAGE_MAX_LEN);
+    }
+
+    function normalizeOutlinePrefillField(payload, keys) {
+      for (let index = 0; index < keys.length; index += 1) {
+        const key = keys[index];
+        const value = payload && Object.prototype.hasOwnProperty.call(payload, key) ? payload[key] : "";
+        if (Array.isArray(value)) {
+          const merged = value
+            .map(function (item) {
+              return compactChatLine(item, 240);
+            })
+            .filter(Boolean)
+            .slice(0, 10)
+            .join("\n");
+          if (merged) {
+            return merged;
+          }
+          continue;
+        }
+        const text = String(value == null ? "" : value).trim();
+        if (text) {
+          return text;
+        }
+      }
+      return "";
+    }
+
+    function parseOutlineFormPrefill(rawReply) {
+      const text = String(rawReply || "");
+      const matched = text.match(/\[OUTLINE_FORM_PREFILL\]\s*([\s\S]*?)\s*\[\/OUTLINE_FORM_PREFILL\]/i);
+      if (!matched) {
+        return {
+          cleanText: text,
+          payload: null
+        };
+      }
+      const block = String(matched[1] || "").trim();
+      const candidates = [block];
+      const braceMatched = block.match(/\{[\s\S]*\}/);
+      if (braceMatched) {
+        candidates.push(String(braceMatched[0] || "").trim());
+      }
+      let parsed = null;
+      for (let index = 0; index < candidates.length; index += 1) {
+        try {
+          parsed = JSON.parse(candidates[index]);
+          if (parsed && typeof parsed === "object") {
+            break;
+          }
+        } catch (error) {
+          parsed = null;
+        }
+      }
+      if (!parsed || typeof parsed !== "object") {
+        const stripped = text.replace(matched[0], "").trim();
+        return {
+          cleanText: stripped || t("web.outline.prefill_detected"),
+          payload: null
+        };
+      }
+      const payload = {
+        ready: asBoolean(parsed.ready, false),
+        goal: normalizeOutlinePrefillField(parsed, ["goal", "story_goal", "target"]),
+        sync_context: normalizeOutlinePrefillField(parsed, ["sync_context", "background", "facts"]),
+        specify: normalizeOutlinePrefillField(parsed, ["specify", "scope", "requirements"]),
+        clarify_answers: normalizeOutlinePrefillField(parsed, ["clarify_answers", "qa", "answers"]),
+        plan_notes: normalizeOutlinePrefillField(parsed, ["plan_notes", "plan", "notes"]),
+        constraints: normalizeOutlinePrefillField(parsed, ["constraints", "hard_constraints", "must_keep"]),
+        tone: normalizeOutlinePrefillField(parsed, ["tone", "style", "voice"])
+      };
+      const hasContent = Boolean(
+        payload.goal ||
+          payload.sync_context ||
+          payload.specify ||
+          payload.clarify_answers ||
+          payload.plan_notes ||
+          payload.constraints ||
+          payload.tone
+      );
+      const stripped = text.replace(matched[0], "").trim();
+      return {
+        cleanText: stripped || t("web.outline.prefill_detected"),
+        payload: hasContent ? payload : null
+      };
+    }
+
+    function isJsonPayload(text) {
+      const source = String(text || "").trim();
+      if (!source) {
+        return false;
+      }
+      const first = source[0];
+      const last = source[source.length - 1];
+      if (!((first === "{" && last === "}") || (first === "[" && last === "]"))) {
+        return false;
+      }
+      try {
+        const parsed = JSON.parse(source);
+        return Boolean(parsed && typeof parsed === "object");
+      } catch (error) {
+        return false;
+      }
+    }
+
+    function filterStructuredAssistantText(rawText) {
+      let text = String(rawText || "");
+      if (!text.trim()) {
+        return text;
+      }
+      text = text.replace(
+        /\[[A-Z][A-Z0-9_:-]{2,}\][\s\S]*?\[\/[A-Z][A-Z0-9_:-]{2,}\]/g,
+        "\n"
+      );
+      text = text.replace(/```([^\n`]*)\n?([\s\S]*?)```/g, function (match, lang, body) {
+        const language = String(lang || "").trim().toLowerCase();
+        const payload = String(body || "").trim();
+        const structuredLang = language === "json" || language === "yaml" || language === "yml" || language === "xml";
+        const structuredBody = isJsonPayload(payload) || /^<\?xml\b|^<\w+[\s>]/i.test(payload);
+        return structuredLang || structuredBody ? "\n" : match;
+      });
+      if (isJsonPayload(text)) {
+        return t("web.chat.structured_hidden");
+      }
+      const lines = text.split(/\r?\n/);
+      const filteredLines = lines.filter(function (line) {
+        const trimmed = String(line || "").trim();
+        if (!trimmed) {
+          return true;
+        }
+        if (/^[{}\[\],]+$/.test(trimmed)) {
+          return false;
+        }
+        if (/^"[^"]+"\s*:\s*/.test(trimmed) || /^'[^']+'\s*:\s*/.test(trimmed)) {
+          return false;
+        }
+        if (/^<\/?[A-Za-z][^>]*>$/.test(trimmed)) {
+          return false;
+        }
+        if (/^(?:decision|goal|assistant_reply|options|outline_steps|metadata|content|summary)\s*:/i.test(trimmed)) {
+          return false;
+        }
+        return true;
+      });
+      const cleaned = filteredLines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+      return cleaned || t("web.chat.structured_hidden");
+    }
+
+    function hasOutlineFormFillConsent(rawMessage) {
+      const source = String(rawMessage || "");
+      const lowered = source.toLowerCase();
+      const englishMarkers = [
+        "confirm",
+        "go ahead",
+        "apply",
+        "fill the form",
+        "use this to fill",
+        "write to form"
+      ];
+      const cjkMarkers = ["确认", "同意", "可以填", "填入表单", "写入表单", "确认填充", "埋めて", "確認して入力"];
+      if (englishMarkers.some(function (item) { return lowered.includes(item); })) {
+        return true;
+      }
+      return cjkMarkers.some(function (item) { return source.includes(item); });
+    }
+
+    function applyOutlineFormPrefill(payload) {
+      const normalized = payload && typeof payload === "object" ? payload : {};
+      setOutlineGuideForm(function (prev) {
+        const next = Object.assign({}, prev);
+        let changed = false;
+        function assignIfPresent(key) {
+          const value = compactChatLine(normalized[key], 2000);
+          if (!value) {
+            return;
+          }
+          if (String(next[key] || "").trim() === value) {
+            return;
+          }
+          next[key] = value;
+          changed = true;
+        }
+        assignIfPresent("goal");
+        assignIfPresent("sync_context");
+        assignIfPresent("specify");
+        assignIfPresent("clarify_answers");
+        assignIfPresent("plan_notes");
+        assignIfPresent("constraints");
+        assignIfPresent("tone");
+        return changed ? next : prev;
+      });
+    }
+
+    function outlinePrefillSummary(payload) {
+      const picked = payload && typeof payload === "object" ? payload : {};
+      const rows = [];
+      if (picked.goal) {
+        rows.push(t("web.outline.goal") + ": " + compactChatLine(picked.goal, 90));
+      }
+      if (picked.sync_context) {
+        rows.push(t("web.outline.sync_context") + ": " + compactChatLine(picked.sync_context, 90));
+      }
+      if (picked.specify) {
+        rows.push(t("web.outline.specify") + ": " + compactChatLine(picked.specify, 90));
+      }
+      if (picked.constraints) {
+        rows.push(t("web.outline.constraints") + ": " + compactChatLine(picked.constraints, 90));
+      }
+      if (picked.tone) {
+        rows.push(t("web.outline.tone") + ": " + compactChatLine(picked.tone, 90));
+      }
+      return rows.join("\n") || "-";
+    }
+
+    const OUTLINE_NODE_PLAN_MARKER = "workflow_outline_seed_v1";
+
+    function parseLooseJsonObject(rawReply) {
+      const raw = String(rawReply || "").trim();
+      if (!raw) {
+        return null;
+      }
+      const candidates = [];
+      const fenced = raw.match(/```(?:json)?\s*[\s\S]*?```/gi) || [];
+      fenced.forEach(function (block) {
+        const cleaned = String(block)
+          .replace(/^```(?:json)?\s*/i, "")
+          .replace(/```$/i, "")
+          .trim();
+        if (cleaned) {
+          candidates.push(cleaned);
+        }
+      });
+      candidates.push(raw);
+      const braceMatched = raw.match(/\{[\s\S]*\}/);
+      if (braceMatched && String(braceMatched[0] || "").trim()) {
+        candidates.push(String(braceMatched[0]).trim());
+      }
+      for (let index = 0; index < candidates.length; index += 1) {
+        try {
+          const parsed = JSON.parse(candidates[index]);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            return parsed;
+          }
+        } catch (error) {
+          continue;
+        }
+      }
+      return null;
+    }
+
+    function normalizeOutlineNodePlanIntent(rawReply) {
+      const parsed = parseLooseJsonObject(rawReply);
+      if (!parsed) {
+        return {
+          decision: "normal",
+          assistantReply: ""
+        };
+      }
+      const decisionRaw = String(parsed.decision || parsed.intent || parsed.action || "").trim().toLowerCase();
+      const decision = decisionRaw === "need_confirm" || decisionRaw === "confirm_required" || decisionRaw === "create_outline_nodes"
+        ? "need_confirm"
+        : "normal";
+      return {
+        decision: decision,
+        assistantReply: String(parsed.assistant_reply || parsed.reply || parsed.message || "").trim()
+      };
+    }
+
+    function normalizeOutlineNodePlanConfirm(rawReply) {
+      const parsed = parseLooseJsonObject(rawReply);
+      if (!parsed) {
+        return {
+          confirmed: false,
+          assistantReply: ""
+        };
+      }
+      const rawConfirmed = parsed.confirmed;
+      const confirmed =
+        rawConfirmed === true ||
+        String(rawConfirmed || "").trim().toLowerCase() === "true" ||
+        String(rawConfirmed || "").trim().toLowerCase() === "yes" ||
+        String(rawConfirmed || "").trim().toLowerCase() === "confirm";
+      return {
+        confirmed: confirmed,
+        assistantReply: String(parsed.assistant_reply || parsed.reply || parsed.message || "").trim()
+      };
+    }
+
+    function resolveOutlineSeedNode(contextNodeId) {
+      const nodeList = Array.isArray(nodesRef.current) ? nodesRef.current : [];
+      const ordered = [];
+      const seen = {};
+
+      function addById(nodeId) {
+        const id = String(nodeId || "").trim();
+        if (!id || seen[id]) {
+          return;
+        }
+        const hit = nodeList.find(function (item) {
+          return item.id === id;
+        });
+        if (!hit) {
+          return;
+        }
+        seen[id] = true;
+        ordered.push(hit);
+      }
+
+      addById(contextNodeId);
+      addById(selectedNodeId);
+      nodeList.forEach(function (item) {
+        const metadata = item && item.metadata && typeof item.metadata === "object" ? item.metadata : {};
+        if (metadata.ai_outline_seed || metadata.project_outline || String(metadata.outline_kind || "") === "project_outline") {
+          addById(item.id);
+        }
+      });
+      for (let index = 0; index < ordered.length; index += 1) {
+        const item = ordered[index];
+        const metadata = item && item.metadata && typeof item.metadata === "object" ? item.metadata : {};
+        const outlineText = String(metadata.outline_markdown || "").trim();
+        if (outlineText) {
+          return item;
+        }
+      }
+      return null;
+    }
+
+    function buildOutlineNodePlanIntentPrompt(userText, seedNode, contextNodeId) {
+      const seedMeta = seedNode && seedNode.metadata && typeof seedNode.metadata === "object" ? seedNode.metadata : {};
+      const outlineText = String(seedMeta.outline_markdown || "").trim();
+      const scopedHistory = chatMessages
+        .filter(function (item) {
+          return String(item && item.context_node_id ? item.context_node_id : "").trim() === String(contextNodeId || "").trim();
+        })
+        .slice(-12)
+        .map(function (item, index) {
+          const role = String(item && item.role ? item.role : "").toLowerCase() === "assistant" ? "assistant" : "user";
+          return String(index + 1) + ". [" + role + "] " + compactChatLine(item && item.text ? item.text : "", 220);
+        });
+      const wrapped = [
+        "You are an intent judge for creating detailed-outline nodes in a novel graph.",
+        "Decide whether the user's latest message should enter the detailed-outline node creation flow.",
+        "Return strict JSON only:",
+        "{\"decision\":\"need_confirm|normal\",\"assistant_reply\":\"...\"}",
+        "Rules:",
+        "1) need_confirm only when user intent is to continue from outline and create a sequence of next-outline nodes.",
+        "2) If uncertain, choose normal.",
+        "3) assistant_reply should be natural language. If need_confirm, ask for explicit confirmation first.",
+        "",
+        "[Seed Node]",
+        "id=" + String(seedNode && seedNode.id ? seedNode.id : "-") + ", title=" + String(seedNode && seedNode.title ? seedNode.title : "-"),
+        "",
+        "[Seed Outline]",
+        outlineText || "-",
+        "",
+        "[Context Chat History]",
+        scopedHistory.join("\n") || "-",
+        "",
+        "[Current User Message]",
+        String(userText || "")
+      ].join("\n");
+      return wrapped.slice(0, CHAT_MESSAGE_MAX_LEN);
+    }
+
+    function buildOutlineNodePlanConfirmPrompt(userText, pendingPayload, seedNode) {
+      const seedMeta = seedNode && seedNode.metadata && typeof seedNode.metadata === "object" ? seedNode.metadata : {};
+      const outlineText = String(seedMeta.outline_markdown || "").trim();
+      const wrapped = [
+        "You are a confirmation judge for detailed-outline node creation.",
+        "Return strict JSON only:",
+        "{\"confirmed\":true|false,\"assistant_reply\":\"...\"}",
+        "Rules:",
+        "1) confirmed=true only when current message clearly indicates user confirmation to proceed.",
+        "2) If ambiguous, confirmed=false and ask for clear confirmation.",
+        "",
+        "[Pending Request]",
+        String(pendingPayload && pendingPayload.request ? pendingPayload.request : "-"),
+        "",
+        "[Seed Node]",
+        "id=" + String(seedNode && seedNode.id ? seedNode.id : "-") + ", title=" + String(seedNode && seedNode.title ? seedNode.title : "-"),
+        "",
+        "[Seed Outline]",
+        outlineText || "-",
+        "",
+        "[Current User Message]",
+        String(userText || "")
+      ].join("\n");
+      return wrapped.slice(0, CHAT_MESSAGE_MAX_LEN);
+    }
+
+    async function runOutlineNodePlanJudge(promptText) {
+      const outcome = await runApiDetailed(
+        function () {
+          return apiRequest("/api/ai/chat", {
+            method: "POST",
+            timeout_ms: aiRequestTimeoutMs(),
+            body: {
+              project_id: projectId,
+              node_id: null,
+              message: String(promptText || ""),
+              token_budget: Math.max(700, Math.floor(asNumber(aiConfig.token_budget, 2200) / 3))
+            }
+          });
+        },
+        null
+      );
+      if (!outcome.ok || !outcome.data) {
+        return {
+          ok: false,
+          reply: ""
+        };
+      }
+      return {
+        ok: true,
+        reply: String(outcome.data.reply || "")
+      };
+    }
+
+    async function createOutlineDetailNodesFromSeed(seedNode, userRequest) {
+      if (!seedNode || !projectId) {
+        return {
+          ok: false,
+          count: 0
+        };
+      }
+      const metadata = seedNode.metadata && typeof seedNode.metadata === "object" ? seedNode.metadata : {};
+      const outlineText = String(metadata.outline_markdown || "").trim();
+      const chapterBeats = Array.isArray(metadata.outline_chapter_beats)
+        ? metadata.outline_chapter_beats.map(String).slice(0, 20)
+        : [];
+      if (!outlineText) {
+        return {
+          ok: false,
+          count: 0
+        };
+      }
+      const detailOutcome = await runApiDetailed(
+        function () {
+          return apiRequest("/api/ai/outline/detail_nodes", {
+            method: "POST",
+            timeout_ms: aiRequestTimeoutMs(),
+            body: {
+              project_id: projectId,
+              outline_markdown: outlineText,
+              chapter_beats: chapterBeats,
+              user_request: String(userRequest || ""),
+              mode: String(metadata.outline_mode || ""),
+              token_budget: Math.max(1200, Math.floor(asNumber(aiConfig.token_budget, 2200))),
+              max_nodes: 8
+            }
+          });
+        },
+        null
+      );
+      if (!detailOutcome.ok || !detailOutcome.data) {
+        return {
+          ok: false,
+          count: 0
+        };
+      }
+      const detailNodes = Array.isArray(detailOutcome.data.nodes)
+        ? detailOutcome.data.nodes
+            .map(function (item) {
+              const raw = item && typeof item === "object" ? item : {};
+              const title = String(raw.title || "").trim();
+              const outline = String(raw.outline_markdown || "").trim();
+              const summary = String(raw.summary || "").trim();
+              if (!outline) {
+                return null;
+              }
+              return {
+                title: title,
+                outline_markdown: outline,
+                summary: summary || outline.replace(/\s+/g, " ").slice(0, 180)
+              };
+            })
+            .filter(function (item) {
+              return Boolean(item && item.outline_markdown);
+            })
+            .slice(0, 8)
+        : [];
+      if (detailNodes.length === 0) {
+        return {
+          ok: false,
+          count: 0
+        };
+      }
+      const created = [];
+      const sourceX = asNumber(seedNode.pos_x, 120);
+      const sourceY = asNumber(seedNode.pos_y, 120);
+      for (let index = 0; index < detailNodes.length; index += 1) {
+        const detail = detailNodes[index];
+        const createdNode = await runApi(
+          function () {
+            return apiRequest("/api/projects/" + projectId + "/nodes", {
+              method: "POST",
+              body: {
+                title: detail.title || t("web.outline.default_scene_prefix") + " " + String(index + 1),
+                type: "chapter",
+                status: "draft",
+                storyline_id: seedNode.storyline_id || null,
+                pos_x: sourceX + 260 + index * 230,
+                pos_y: sourceY + 96,
+                metadata: {
+                  outline_markdown: String(detail.outline_markdown || ""),
+                  summary: String(detail.summary || "").slice(0, 180),
+                  ai_from_outline_seed: true,
+                  ai_outline_seed_source: seedNode.id,
+                  ai_outline_seed_marker: OUTLINE_NODE_PLAN_MARKER,
+                  narrative_index: index + 1
+                }
+              }
+            });
+          },
+          null
+        );
+        if (!createdNode) {
+          return {
+            ok: false,
+            count: created.length
+          };
+        }
+        created.push(createdNode);
+      }
+      if (created.length > 0) {
+        await runApi(
+          function () {
+            return apiRequest("/api/projects/" + projectId + "/edges", {
+              method: "POST",
+              body: {
+                source_id: seedNode.id,
+                target_id: created[0].id,
+                label: "next"
+              }
+            });
+          },
+          null
+        );
+      }
+      for (let index = 1; index < created.length; index += 1) {
+        await runApi(
+          function () {
+            return apiRequest("/api/projects/" + projectId + "/edges", {
+              method: "POST",
+              body: {
+                source_id: created[index - 1].id,
+                target_id: created[index].id,
+                label: "next"
+              }
+            });
+          },
+          null
+        );
+      }
+      await refreshProjectData(projectId, true);
+      await validateGraph();
+      if (created.length > 0) {
+        setSelectedNodeId(created[0].id);
+        setSidebarTab("node");
+        setChatContextNodeId(created[0].id);
+        setChatOpen(true);
+        setArtifactOpen(false);
+      }
+      return {
+        ok: true,
+        count: created.length
+      };
+    }
+
+    async function handleOutlineNodePlanChat(userText, contextNodeId) {
+      if (!projectId || outlineRequired) {
+        return false;
+      }
+      const ref = chatOutlineNodePlanRef && typeof chatOutlineNodePlanRef === "object" ? chatOutlineNodePlanRef : null;
+      const pending = ref && ref.current && typeof ref.current === "object" ? ref.current : null;
+      if (pending && String(pending.project_id || "") === String(projectId || "")) {
+        const seedNode = resolveOutlineSeedNode(pending.source_node_id || contextNodeId);
+        if (!seedNode) {
+          ref.current = null;
+          return false;
+        }
+        const confirmJudge = await runOutlineNodePlanJudge(
+          buildOutlineNodePlanConfirmPrompt(userText, pending, seedNode)
+        );
+        const confirmResult = normalizeOutlineNodePlanConfirm(confirmJudge.reply);
+        if (!confirmResult.confirmed) {
+          appendChatMessage(
+            "assistant",
+            confirmResult.assistantReply || t("web.chat.outline_plan_waiting_confirm"),
+            t("web.chat.route_label", { route: "outline_plan" }),
+            { contextNodeId: contextNodeId }
+          );
+          return true;
+        }
+        const modalApproved = await showConfirm(
+          t("web.chat.outline_plan_modal_title"),
+          t("web.chat.outline_plan_modal_body", {
+            node_title: String(seedNode.title || seedNode.id || "-"),
+            request: String(pending.request || userText || "-")
+          })
+        );
+        if (!modalApproved) {
+          ref.current = null;
+          appendChatMessage(
+            "assistant",
+            t("web.chat.outline_plan_cancelled"),
+            t("web.chat.route_label", { route: "outline_plan" }),
+            { contextNodeId: contextNodeId }
+          );
+          return true;
+        }
+        const creation = await createOutlineDetailNodesFromSeed(seedNode, String(pending.request || userText || ""));
+        ref.current = null;
+        if (!creation.ok || creation.count <= 0) {
+          appendChatMessage(
+            "assistant",
+            t("web.chat.outline_plan_failed"),
+            t("web.chat.route_label", { route: "outline_plan" }),
+            { contextNodeId: contextNodeId }
+          );
+          pushToast("warn", t("web.chat.outline_plan_failed"));
+          return true;
+        }
+        appendChatMessage(
+          "assistant",
+          t("web.chat.outline_plan_created", { count: String(creation.count) }),
+          t("web.chat.route_label", { route: "outline_plan" }),
+          { contextNodeId: contextNodeId }
+        );
+        pushToast("ok", t("web.chat.outline_plan_created", { count: String(creation.count) }));
+        addActivity("success", "outline detail nodes created from chat request");
+        return true;
+      }
+
+      const seedNode = resolveOutlineSeedNode(contextNodeId);
+      if (!seedNode) {
+        return false;
+      }
+      const intentJudge = await runOutlineNodePlanJudge(
+        buildOutlineNodePlanIntentPrompt(userText, seedNode, contextNodeId)
+      );
+      if (!intentJudge.ok) {
+        return false;
+      }
+      const intent = normalizeOutlineNodePlanIntent(intentJudge.reply);
+      if (intent.decision !== "need_confirm") {
+        return false;
+      }
+      if (ref) {
+        ref.current = {
+          project_id: projectId,
+          source_node_id: seedNode.id,
+          request: String(userText || ""),
+          marker: OUTLINE_NODE_PLAN_MARKER
+        };
+      }
+      appendChatMessage(
+        "assistant",
+        intent.assistantReply || t("web.chat.outline_plan_need_confirm"),
+        t("web.chat.route_label", { route: "outline_plan" }),
+        { contextNodeId: contextNodeId }
+      );
+      return true;
+    }
+
     async function sendChatMessage() {
       if (!projectId) {
         pushToast("warn", t("web.toast.project_required"));
@@ -602,8 +1318,12 @@
       }
       const contextNodeId = resolveActiveChatContext(chatContextNodeId, artifactContextNodeId);
       const plannerRequested = /(^|\s)@(?:plan|planner)\b/i.test(text);
-      const messageForPlanner =
-        plannerRequested && contextNodeId ? buildPlannerFeedbackMessage(contextNodeId, text) : text;
+      let messageForRequest = text;
+      if (plannerRequested && contextNodeId) {
+        messageForRequest = buildPlannerFeedbackMessage(contextNodeId, text);
+      } else if (!contextNodeId && outlineRequired) {
+        messageForRequest = buildOutlineChatMessageWithHistory(text);
+      }
       appendChatMessage(
         "user",
         text,
@@ -614,6 +1334,11 @@
       setChatBusy(true);
       const consumedByWorkflow = await handleWorkflowChat(text);
       if (consumedByWorkflow) {
+        setChatBusy(false);
+        return;
+      }
+      const consumedByOutlinePlan = await handleOutlineNodePlanChat(text, contextNodeId);
+      if (consumedByOutlinePlan) {
         setChatBusy(false);
         return;
       }
@@ -638,7 +1363,7 @@
             body: {
               project_id: projectId,
               node_id: contextNodeId || null,
-              message: messageForPlanner,
+              message: messageForRequest,
               token_budget: Math.max(1, Math.floor(asNumber(aiConfig.token_budget, 2200)))
             }
           });
@@ -671,7 +1396,12 @@
       if (bypassed) {
         meta += " · " + t("web.chat.review_bypassed");
       }
-      const replyText = String(payload.reply || "");
+      const replyTextRaw = String(payload.reply || "");
+      const prefillParsed = !contextNodeId && outlineRequired
+        ? parseOutlineFormPrefill(replyTextRaw)
+        : { cleanText: replyTextRaw, payload: null };
+      const replyText = String(prefillParsed.cleanText || "");
+      const displayReplyText = filterStructuredAssistantText(replyText);
       let diffSegments = [];
       if (route === "writer" && contextNodeId) {
         diffSegments = buildDiffSegments(beforeContent, replyText);
@@ -679,7 +1409,7 @@
       }
       setArtifactDiffNodeId(nextArtifactDiffNodeId(route, contextNodeId));
       setArtifactDiffSegments(diffSegments);
-      appendChatMessage("assistant", replyText, meta, {
+      appendChatMessage("assistant", displayReplyText, meta, {
         diffSegments: diffSegments,
         contextNodeId: contextNodeId
       });
@@ -696,6 +1426,23 @@
               locked: result.preservedLockedRoutes
             })
           );
+        }
+      }
+      if (!contextNodeId && outlineRequired && prefillParsed.payload) {
+        const payloadReady = Boolean(prefillParsed.payload.ready);
+        const consented = payloadReady || hasOutlineFormFillConsent(text);
+        if (consented) {
+          const approved = await showConfirm(
+            t("web.outline.prefill_apply_title"),
+            t("web.outline.prefill_apply_body", {
+              summary: outlinePrefillSummary(prefillParsed.payload)
+            })
+          );
+          if (approved) {
+            applyOutlineFormPrefill(prefillParsed.payload);
+            pushToast("ok", t("web.outline.prefill_applied"));
+            addActivity("success", "outline guide form prefilled from confirmed chat");
+          }
         }
       }
       addActivity("info", "ai chat route=" + route + ", node=" + (contextNodeId || "global"));
@@ -815,7 +1562,8 @@
       appendChatMessage: appendChatMessage,
       outlineRequired: outlineRequired,
       chatContextNodeId: chatContextNodeId,
-      chatWorkflow: chatWorkflow
+      chatWorkflow: chatWorkflow,
+      chatMessages: chatMessages
     });
     const materializeWorkflowGraphPlan = workflowActionHandlers.materializeWorkflowGraphPlan;
     const saveWorkflowOutlineNode = workflowActionHandlers.saveWorkflowOutlineNode;
@@ -1977,6 +2725,7 @@
           edge_mode: Boolean(edgeMode),
           auto_bind_on_drop: Boolean(autoBindOnDrop),
           chat_open: Boolean(chatOpen),
+          chat_view_scale: Math.max(0.8, Math.min(2.2, asNumber(chatViewScale, 1))),
           artifact_open: Boolean(artifactOpen),
           chat_context_node_id: String(chatContextNodeId || ""),
           artifact_context_node_id: String(artifactContextNodeId || ""),
@@ -2004,6 +2753,7 @@
         edgeMode,
         autoBindOnDrop,
         chatOpen,
+        chatViewScale,
         artifactOpen,
         chatContextNodeId,
         artifactContextNodeId,
@@ -2183,7 +2933,7 @@
           const hello = {
             id: "chat_" + Date.now().toString(36) + "_workflow_init",
             role: "assistant",
-            text: t("web.workflow.welcome"),
+            text: workflowWelcomeText,
             meta: "workflow_init",
             at: new Date().toISOString(),
             diffSegments: []
@@ -2192,6 +2942,28 @@
         });
       },
       [projectId, outlineRequired, chatOpen, chatContextNodeId]
+    );
+
+    useEffect(
+      function () {
+        setChatMessages(function (prev) {
+          let changed = false;
+          const next = prev.map(function (item) {
+            if (!String(item && item.meta ? item.meta : "").includes("workflow_init")) {
+              return item;
+            }
+            if (String(item && item.text ? item.text : "") === workflowWelcomeText) {
+              return item;
+            }
+            changed = true;
+            return Object.assign({}, item, {
+              text: workflowWelcomeText
+            });
+          });
+          return changed ? next : prev;
+        });
+      },
+      [workflowWelcomeText, locale]
     );
 
     useEffect(function () {

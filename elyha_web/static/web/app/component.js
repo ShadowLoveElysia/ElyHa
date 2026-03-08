@@ -158,7 +158,7 @@
     !createProjectActionHandlersValue ||
     !createNodeActionHandlersValue
   ) {
-    throw new Error("Web runtime modules failed to load. Please check /web/static/web/**/*.js");
+    throw new Error("Web runtime modules failed to load. Please check /static/web/**/*.js");
   }
 
   function App() {
@@ -168,6 +168,9 @@
     const shouldShowArtifactDiff = shouldShowArtifactDiffValue;
     const normalizeDiffKind = normalizeDiffKindValue;
     const diffPrefix = diffPrefixValue;
+    const CHAT_PANEL_MARGIN = 12;
+    const CHAT_PANEL_MIN_WIDTH = 360;
+    const CHAT_PANEL_MIN_HEIGHT = 280;
     const [locale, setLocale] = useState(function () {
       const cached = window.localStorage.getItem("elyha_web_locale") || DEFAULT_LOCALE;
       return SUPPORTED_LOCALES.includes(cached) ? cached : DEFAULT_LOCALE;
@@ -315,6 +318,33 @@
     const [modal, setModal] = useState(null);
     const [chatOpen, setChatOpen] = useState(persistedChatOpen);
     const [artifactOpen, setArtifactOpen] = useState(persistedArtifactOpen);
+    const [chatViewScale, setChatViewScale] = useState(function () {
+      const raw = asNumber(persistedWebState.chat_view_scale, 1);
+      if (!Number.isFinite(raw)) {
+        return 1;
+      }
+      return Math.max(0.8, Math.min(2.2, raw));
+    });
+    const [chatPanelRect, setChatPanelRect] = useState(function () {
+      const raw = persistedWebState.chat_panel_rect && typeof persistedWebState.chat_panel_rect === "object"
+        ? persistedWebState.chat_panel_rect
+        : {};
+      const winWidth = Math.max(960, Math.floor(asNumber(window && window.innerWidth, 1440)));
+      const winHeight = Math.max(680, Math.floor(asNumber(window && window.innerHeight, 900)));
+      const width = Math.max(CHAT_PANEL_MIN_WIDTH, Math.min(980, Math.floor(asNumber(raw.width, winWidth * 0.46))));
+      const height = Math.max(CHAT_PANEL_MIN_HEIGHT, Math.min(920, Math.floor(asNumber(raw.height, winHeight - 110))));
+      const left = Math.max(
+        CHAT_PANEL_MARGIN,
+        Math.floor(asNumber(raw.left, winWidth - width - CHAT_PANEL_MARGIN - 12))
+      );
+      const top = Math.max(CHAT_PANEL_MARGIN, Math.floor(asNumber(raw.top, CHAT_PANEL_MARGIN)));
+      return {
+        left: left,
+        top: top,
+        width: width,
+        height: height
+      };
+    });
     const [chatContextNodeId, setChatContextNodeId] = useState(function () {
       return typeof persistedWebState.chat_context_node_id === "string"
         ? persistedWebState.chat_context_node_id
@@ -361,9 +391,12 @@
     const modalResolverRef = useRef(null);
     const nodesRef = useRef(nodes);
     const viewportRef = useRef(null);
+    const canvasAreaRef = useRef(null);
     const contextMenuSuppressUntilRef = useRef(0);
     const ghostClickSuppressUntilRef = useRef(0);
     const chatLogRef = useRef(null);
+    const chatOutlineNodePlanRef = useRef(null);
+    const chatPanelDragRef = useRef(null);
     useEffect(
       function () {
         nodesRef.current = nodes;
@@ -413,7 +446,7 @@
     const appModules = window.ElyhaWebAppModules || {};
     const createAppLogic = appModules.createAppLogic;
     if (typeof createAppLogic !== "function") {
-      throw new Error("Web app logic module is unavailable. Please check /web/static/web/app/modules/app-logic.js");
+      throw new Error("Web app logic module is unavailable. Please check /static/web/app/modules/app-logic.js");
     }
     const appLogic = createAppLogic({
       h,
@@ -605,6 +638,7 @@
       setChatMessages,
       chatBusy,
       setChatBusy,
+      chatViewScale,
       chatWorkflow,
       setChatWorkflow,
       artifactDiffSegments,
@@ -640,7 +674,8 @@
       viewportRef,
       contextMenuSuppressUntilRef,
       ghostClickSuppressUntilRef,
-      chatLogRef
+      chatLogRef,
+      chatOutlineNodePlanRef
     });
     const {
       t,
@@ -1072,6 +1107,9 @@
       const selectedForFusion = Boolean(selectedGhostIds[plan.id]);
       const retiring = Boolean(retiringGhostIds[plan.id]);
       const locked = Boolean(plan.locked);
+      const planMode = String(plan.plan_mode || "").trim().toLowerCase() === "outline_decompose"
+        ? "outline_decompose"
+        : "story_extend";
       const classes = ["node-card", "ghost-node"];
       if (tone) {
         classes.push("storyline-tagged");
@@ -1122,6 +1160,7 @@
         h(
           "div",
           { className: "node-body" },
+          h("span", { className: "ghost-mode-label " + planMode }, t("web.ghost.mode." + planMode)),
           h("span", { className: "ghost-sentiment-label " + sentiment }, t("web.ghost.sentiment." + sentiment)),
           locked ? h("span", { className: "ghost-lock-label" }, t("web.ghost.locked_label")) : null,
           storyline ? h("span", { className: "muted" }, t("web.node.storyline", { storyline: storyline })) : null,
@@ -1263,12 +1302,16 @@
     const chatMessageViews = scopedChatMessages.length > 0
       ? scopedChatMessages.map(function (item) {
           const roleClass = item.role === "assistant" ? "assistant" : "user";
+          const isAssistant = item.role === "assistant";
+          const chatBody = isAssistant
+            ? renderMarkdownPreview(item.text || "")
+            : h("div", { className: "chat-msg-plain" }, item.text || "-");
           return h(
             "div",
             { key: item.id, className: "chat-msg " + roleClass },
             h("div", { className: "chat-msg-head" }, (item.role === "assistant" ? "AI" : "You") + " · " + shortIso(item.at)),
             item.meta ? h("div", { className: "chat-msg-meta" }, item.meta) : null,
-            h("div", { className: "chat-msg-body" }, item.text || "-"),
+            h("div", { className: "chat-msg-body" }, chatBody),
             item.role === "assistant" &&
               Array.isArray(item.diffSegments) &&
               item.diffSegments.length > 0
@@ -1963,6 +2006,24 @@
                     h("h3", null, t("web.outline.required_title")),
                     h("div", { className: "muted" }, t("web.outline.required_desc")),
                     h("div", { className: "muted outline-guide-tip" }, t("web.outline.flow_tip")),
+                    h("div", { className: "muted outline-guide-tip" }, t("web.outline.chat_recommend")),
+                    h("div", { className: "muted outline-guide-tip" }, t("web.outline.model_recommend")),
+                    h(
+                      "div",
+                      { className: "row compact" },
+                      h(
+                        "button",
+                        {
+                          className: "btn ghost",
+                          onClick: function () {
+                            setChatOpen(true);
+                            setArtifactOpen(false);
+                            setChatContextNodeId("");
+                          }
+                        },
+                        t("web.outline.open_chat")
+                      )
+                    ),
                     h(
                       "div",
                       { className: "form-grid" },
@@ -3148,7 +3209,25 @@
                   ),
                   h(
                     "aside",
-                    { className: "chat-drawer" + (chatOpen ? " open" : ""), key: "story-chat" },
+                    {
+                      className: "chat-drawer chat-zoomable" + (chatOpen ? " open" : ""),
+                      key: "story-chat",
+                      style: {
+                        "--chat-view-scale": String(chatViewScale)
+                      },
+                      onWheel: function (event) {
+                        if (!event.altKey) {
+                          return;
+                        }
+                        event.preventDefault();
+                        event.stopPropagation();
+                        setChatViewScale(function (prev) {
+                          const delta = event.deltaY < 0 ? 0.08 : -0.08;
+                          const next = prev + delta;
+                          return Math.max(0.8, Math.min(2.2, Math.round(next * 100) / 100));
+                        });
+                      }
+                    },
                     h(
                       "div",
                       { className: "chat-head" },
@@ -3157,6 +3236,11 @@
                         { className: "chat-head-main" },
                         h("strong", null, t("web.chat.title")),
                         h("span", { className: "muted" }, chatContextNodeId ? t("web.chat.context_node", { node_id: chatContextNodeId }) : t("web.chat.context_global"))
+                      ),
+                      h(
+                        "span",
+                        { className: "muted chat-zoom-indicator", title: t("web.chat.zoom_tip") },
+                        Math.round(chatViewScale * 100).toString() + "%"
                       ),
                       h(
                         "button",
@@ -3245,6 +3329,7 @@
                             h("div", { className: "ghost-archive-list" }, ghostArchiveViews)
                           ),
                           h("div", { className: "muted chat-hint" }, t("web.chat.hint")),
+                          h("div", { className: "muted chat-hint" }, t("web.chat.history_token_hint")),
                           chatWorkflow.enabled && !chatContextNodeId
                             ? h(
                                 "div",

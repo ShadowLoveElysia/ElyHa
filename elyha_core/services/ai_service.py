@@ -33,6 +33,7 @@ class BranchOption:
     description: str
     outline_steps: list[str] = field(default_factory=list)
     sentiment: str = "neutral"
+    plan_mode: str = "story_extend"
 
 
 @dataclass(slots=True)
@@ -109,6 +110,22 @@ class WorkflowSyncResult:
     completion_tokens: int = 0
 
 
+@dataclass(slots=True)
+class OutlineDetailNode:
+    title: str
+    outline_markdown: str
+    summary: str = ""
+
+
+@dataclass(slots=True)
+class OutlineDetailNodesResult:
+    project_id: str
+    nodes: list[OutlineDetailNode] = field(default_factory=list)
+    provider: str = "unknown"
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+
 class WorkflowState(TypedDict, total=False):
     task_type: str
     project_id: str
@@ -173,6 +190,11 @@ class AIService:
         task = self._create_task(project_id, node_id, task_type="generate_chapter")
         self._set_task_running(task)
         try:
+            self._ensure_project_valid(project_id)
+            target_node = self.graph_service.get_node(project_id, node_id)
+            target_metadata = target_node.metadata if isinstance(target_node.metadata, dict) else {}
+            if not str(target_metadata.get("outline_markdown", "")).strip():
+                raise ValueError(tr("ai.chat.writer_outline_required"))
             flow_state = self._run_workflow(
                 task_type="generate_chapter",
                 project_id=project_id,
@@ -306,16 +328,6 @@ class AIService:
         review_bypassed = node is not None and auto_review_passed and route == "writer"
 
         if node is None:
-            if route == "planner" and self._is_planner_scope_violation(cleaned_message):
-                return ChatAssistResult(
-                    project_id=project_id,
-                    node_id=None,
-                    route="planner",
-                    reply=tr("ai.chat.planner_scope_refusal"),
-                    review_bypassed=False,
-                    suggested_options=[],
-                    revision=self._project_revision(project_id),
-                )
             response = self._generate(
                 task_type="chat_global_" + route,
                 prompt=self._chat_global_prompt(project_id, cleaned_message, route=route),
@@ -339,16 +351,6 @@ class AIService:
         llm_route = self._resolve_node_llm_route(node)
 
         if route == "planner":
-            if self._is_planner_scope_violation(cleaned_message):
-                return ChatAssistResult(
-                    project_id=project_id,
-                    node_id=node.id,
-                    route="planner",
-                    reply=tr("ai.chat.planner_scope_refusal"),
-                    review_bypassed=False,
-                    suggested_options=[],
-                    revision=self._project_revision(project_id),
-                )
             response = self._generate(
                 task_type="chat_plan",
                 prompt=self._chat_planner_prompt(node.title, context, cleaned_message),
@@ -375,11 +377,24 @@ class AIService:
                         "next_1": option.outline_steps[0] if len(option.outline_steps) > 0 else "",
                         "next_2": option.outline_steps[1] if len(option.outline_steps) > 1 else "",
                         "sentiment": option.sentiment,
+                        "plan_mode": option.plan_mode,
                     }
                     for option in options
                 ],
                 revision=self._project_revision(project_id),
             )
+
+        if route == "writer":
+            current_outline = str(node_metadata.get("outline_markdown", "")).strip()
+            if not current_outline:
+                return ChatAssistResult(
+                    project_id=project_id,
+                    node_id=node.id,
+                    route="guard",
+                    reply=tr("ai.chat.writer_outline_required"),
+                    review_bypassed=False,
+                    revision=self._project_revision(project_id),
+                )
 
         response = self._generate(
             task_type="chat_writer",
@@ -461,6 +476,51 @@ class AIService:
             outline_markdown=outline_markdown,
             chapter_beats=chapter_beats,
             next_steps=next_steps,
+            provider=response.provider,
+            prompt_tokens=response.prompt_tokens,
+            completion_tokens=response.completion_tokens,
+        )
+
+    def guide_outline_detail_nodes(
+        self,
+        project_id: str,
+        *,
+        outline_markdown: str = "",
+        chapter_beats: list[str] | None = None,
+        user_request: str = "",
+        mode: str = "",
+        token_budget: int = 1800,
+        max_nodes: int = 8,
+    ) -> OutlineDetailNodesResult:
+        if self.repository.get_project(project_id) is None:
+            self._raise_project_missing(project_id)
+        clean_outline = str(outline_markdown or "").strip()
+        safe_max_nodes = max(3, min(12, int(max_nodes)))
+        normalized_beats = self._normalize_outline_list(chapter_beats or [], limit=safe_max_nodes)
+        if not clean_outline and not normalized_beats:
+            raise ValueError(tr("ai.chat.writer_outline_required"))
+        response = self._generate(
+            task_type="outline_detail_nodes",
+            prompt=self._outline_detail_nodes_prompt(
+                project_id,
+                outline_markdown=clean_outline,
+                chapter_beats=normalized_beats,
+                user_request=str(user_request or "").strip(),
+                mode=str(mode or "").strip(),
+                max_nodes=safe_max_nodes,
+            ),
+            platform_config={"token_budget": max(900, token_budget)},
+        )
+        parsed_nodes = self._parse_outline_detail_nodes_payload(response.content, limit=safe_max_nodes)
+        if not parsed_nodes:
+            fallback_lines = normalized_beats or self._normalize_outline_list(clean_outline, limit=safe_max_nodes)
+            parsed_nodes = self._build_outline_detail_nodes_from_lines(fallback_lines, limit=safe_max_nodes)
+        if not parsed_nodes:
+            fallback_lines = normalized_beats or self._normalize_outline_list(clean_outline, limit=3)
+            parsed_nodes = self._build_outline_detail_nodes_from_lines(fallback_lines, limit=max(1, min(3, safe_max_nodes)))
+        return OutlineDetailNodesResult(
+            project_id=project_id,
+            nodes=parsed_nodes[:safe_max_nodes],
             provider=response.provider,
             prompt_tokens=response.prompt_tokens,
             completion_tokens=response.completion_tokens,
@@ -819,6 +879,31 @@ class AIService:
             snapshot=snapshot,
         )
 
+    def _outline_detail_nodes_prompt(
+        self,
+        project_id: str,
+        *,
+        outline_markdown: str,
+        chapter_beats: list[str],
+        user_request: str,
+        mode: str,
+        max_nodes: int,
+    ) -> str:
+        project = self.repository.get_project(project_id)
+        project_title = project.title if project is not None else project_id
+        snapshot = self._project_snapshot_prompt(project_id)
+        beats_block = "\n".join(f"- {item}" for item in chapter_beats) if chapter_beats else "-"
+        return tr(
+            "ai.outline.detail_nodes_prompt",
+            project_title=project_title,
+            mode=mode or "-",
+            outline_markdown=outline_markdown or "-",
+            chapter_beats=beats_block,
+            user_request=user_request or "-",
+            max_nodes=max_nodes,
+            snapshot=snapshot,
+        )
+
     def _chat_writer_prompt(
         self,
         title: str,
@@ -836,6 +921,89 @@ class AIService:
             current_content=current_content,
             context=context.to_prompt(),
         )
+
+    def _build_outline_detail_nodes_from_lines(
+        self,
+        lines: list[str],
+        *,
+        limit: int,
+    ) -> list[OutlineDetailNode]:
+        result: list[OutlineDetailNode] = []
+        for index, line in enumerate(lines[:limit], start=1):
+            cleaned = str(line).strip()
+            if not cleaned:
+                continue
+            title = tr("ai.outline.detail_nodes_default_title", index=index)
+            outline_text = cleaned if "\n" in cleaned else f"- {cleaned}"
+            result.append(
+                OutlineDetailNode(
+                    title=title,
+                    outline_markdown=outline_text,
+                    summary=cleaned[:140],
+                )
+            )
+        return result
+
+    def _normalize_outline_markdown_text(self, value: Any) -> str:
+        if isinstance(value, list):
+            rows = [str(item).strip() for item in value if str(item).strip()]
+            if not rows:
+                return ""
+            return "\n".join(f"- {item}" for item in rows)
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if "\n" in text:
+            return text
+        return f"- {text}"
+
+    def _parse_outline_detail_nodes_payload(
+        self,
+        text: str,
+        *,
+        limit: int,
+    ) -> list[OutlineDetailNode]:
+        parsed = self._parse_outline_guide_payload(text)
+        candidates: list[dict[str, Any]] = []
+        if isinstance(parsed, dict):
+            raw_nodes = (
+                parsed.get("nodes")
+                or parsed.get("node_outlines")
+                or parsed.get("items")
+                or parsed.get("options")
+            )
+            if isinstance(raw_nodes, list):
+                candidates = [item for item in raw_nodes if isinstance(item, dict)]
+        elif isinstance(parsed, list):
+            candidates = [item for item in parsed if isinstance(item, dict)]
+        result: list[OutlineDetailNode] = []
+        for item in candidates[:limit]:
+            outline = self._normalize_outline_markdown_text(
+                item.get("outline_markdown")
+                or item.get("outline")
+                or item.get("detail_outline")
+                or item.get("outline_steps")
+                or item.get("steps")
+                or item.get("beats")
+            )
+            if not outline:
+                continue
+            summary = str(item.get("summary") or item.get("description") or "").strip()
+            title = str(item.get("title") or item.get("name") or "").strip()
+            if not title:
+                title = (summary or outline.replace("\n", " ").strip("- ").strip())[:32]
+            if not title:
+                title = tr("ai.outline.detail_nodes_default_title", index=len(result) + 1)
+            if not summary:
+                summary = outline.replace("\n", " ").strip("- ").strip()[:140]
+            result.append(
+                OutlineDetailNode(
+                    title=title,
+                    outline_markdown=outline,
+                    summary=summary,
+                )
+            )
+        return result
 
     def _extract_chat_route(self, message: str) -> tuple[str, str]:
         text = str(message or "").strip()
@@ -860,97 +1028,6 @@ class AIService:
         cleaned = re.sub(r"(?<![A-Za-z0-9_])@([A-Za-z_]+)\b", _replace, text)
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         return cleaned, route
-
-    def _is_planner_scope_violation(self, message: str) -> bool:
-        lowered = str(message or "").strip().lower()
-        if not lowered:
-            return False
-        explicit_other_agent_calls = [
-            "@writer",
-            "@review",
-            "@reviewer",
-            "@synth",
-            "@synthesizer",
-            "@lore",
-            "@logic",
-        ]
-        if any(marker in lowered for marker in explicit_other_agent_calls):
-            return True
-
-        plan_markers = [
-            "@plan",
-            "@planner",
-            "plan",
-            "planner",
-            "outline",
-            "beat",
-            "branch",
-            "route",
-            "scene",
-            "plot",
-            "分支",
-            "路线",
-            "走向",
-            "大纲",
-            "细纲",
-            "节拍",
-            "场景",
-            "剧情",
-            "计划",
-            "规划",
-            "提纲",
-            "梗概",
-            "ビート",
-            "分岐",
-            "アウトライン",
-            "プロット",
-            "シーン",
-            "構成",
-        ]
-        writer_markers = [
-            "writer",
-            "rewrite",
-            "revise",
-            "draft",
-            "write full",
-            "expand into prose",
-            "continue writing",
-            "polish",
-            "copyedit",
-            "正文",
-            "改写",
-            "润色",
-            "扩写",
-            "续写",
-            "写成",
-            "本文",
-            "章节正文",
-            "ライター",
-            "改稿",
-            "本文を書",
-            "執筆",
-            "推敲",
-        ]
-        review_markers = [
-            "review",
-            "proofread",
-            "consistency check",
-            "lore review",
-            "logic review",
-            "审查",
-            "校对",
-            "逻辑审查",
-            "设定审查",
-            "レビュー",
-            "校閲",
-            "整合性チェック",
-        ]
-        asks_non_plan = any(marker in lowered for marker in writer_markers + review_markers)
-        if not asks_non_plan:
-            return False
-        if any(marker in lowered for marker in plan_markers):
-            return False
-        return True
 
     def _project_snapshot_prompt(self, project_id: str, *, max_nodes: int = 18, max_edges: int = 30) -> str:
         nodes = self.graph_service.list_nodes(project_id)
@@ -1366,10 +1443,12 @@ class AIService:
         return f"{compact[: max_len - 3]}..."
 
     def _parse_branch_options(self, content: str, *, count: int) -> list[BranchOption]:
-        parsed_payload = self._parse_branch_options_payload(content)
+        parsed_payload, parsed_mode = self._parse_branch_options_payload(content)
         if parsed_payload:
             parsed_options: list[BranchOption] = []
-            for item in parsed_payload[:count]:
+            top_level_mode = self._normalize_plan_mode(parsed_mode or parsed_payload[0].get("plan_mode"))
+            option_limit = 1 if top_level_mode == "outline_decompose" else max(1, count)
+            for item in parsed_payload[:option_limit]:
                 title = str(item.get("title", "")).strip() or f"Branch {len(parsed_options) + 1}"
                 description = str(
                     item.get("description", "")
@@ -1387,15 +1466,18 @@ class AIService:
                     description = " / ".join(outline_steps[:2])
                 if not description:
                     description = tr("ai.branch.option_fallback", index=len(parsed_options) + 1)
+                option_mode = self._normalize_plan_mode(item.get("plan_mode") or top_level_mode)
                 parsed_options.append(
                     BranchOption(
                         title=title,
                         description=description,
                         outline_steps=outline_steps,
                         sentiment=self._normalize_sentiment(item.get("sentiment")),
+                        plan_mode=option_mode,
                     )
                 )
-            while len(parsed_options) < count:
+            min_options = 1 if top_level_mode == "outline_decompose" else max(1, count)
+            while len(parsed_options) < min_options:
                 index = len(parsed_options) + 1
                 parsed_options.append(
                     BranchOption(
@@ -1403,6 +1485,7 @@ class AIService:
                         description=tr("ai.branch.option_fallback", index=index),
                         outline_steps=[],
                         sentiment="neutral",
+                        plan_mode=top_level_mode,
                     )
                 )
             return parsed_options
@@ -1421,7 +1504,15 @@ class AIService:
             else:
                 title = f"Branch {len(options) + 1}"
                 desc = text
-            options.append(BranchOption(title=title, description=desc, outline_steps=[], sentiment="neutral"))
+            options.append(
+                BranchOption(
+                    title=title,
+                    description=desc,
+                    outline_steps=[],
+                    sentiment="neutral",
+                    plan_mode="story_extend",
+                )
+            )
             if len(options) >= count:
                 break
         while len(options) < count:
@@ -1432,14 +1523,15 @@ class AIService:
                     description=tr("ai.branch.option_fallback", index=index),
                     outline_steps=[],
                     sentiment="neutral",
+                    plan_mode="story_extend",
                 )
             )
         return options
 
-    def _parse_branch_options_payload(self, content: str) -> list[dict[str, Any]]:
+    def _parse_branch_options_payload(self, content: str) -> tuple[list[dict[str, Any]], str]:
         raw = str(content or "").strip()
         if not raw:
-            return []
+            return [], "story_extend"
         candidates = [raw]
         bracket_match = re.search(r"\[[\s\S]*\]", raw)
         if bracket_match:
@@ -1453,12 +1545,24 @@ class AIService:
             except Exception:
                 continue
             if isinstance(payload, list):
-                return [item for item in payload if isinstance(item, dict)]
+                return [item for item in payload if isinstance(item, dict)], "story_extend"
             if isinstance(payload, dict):
+                top_level_mode = self._normalize_plan_mode(payload.get("plan_mode"))
                 options = payload.get("options")
                 if isinstance(options, list):
-                    return [item for item in options if isinstance(item, dict)]
-        return []
+                    return [item for item in options if isinstance(item, dict)], top_level_mode
+                option = payload.get("option")
+                if isinstance(option, dict):
+                    return [option], top_level_mode
+        return [], "story_extend"
+
+    def _normalize_plan_mode(self, value: Any) -> str:
+        raw = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if raw == "outline_decompose":
+            return "outline_decompose"
+        if raw == "story_extend":
+            return "story_extend"
+        return "story_extend"
 
     def _normalize_sentiment(self, value: Any) -> str:
         raw = str(value or "").strip().lower()

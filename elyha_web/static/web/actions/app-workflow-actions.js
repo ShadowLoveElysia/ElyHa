@@ -1,6 +1,8 @@
 (function () {
   "use strict";
 
+  const WORKFLOW_OUTLINE_SEED_MARKER = "workflow_outline_seed_v1";
+
   function buildDefaultWorkflowState() {
     return {
       enabled: false,
@@ -54,6 +56,7 @@
     const outlineRequired = context.outlineRequired;
     const chatContextNodeId = context.chatContextNodeId;
     const chatWorkflow = context.chatWorkflow;
+    const chatMessages = context.chatMessages;
 
     const parseWorkflowMode = parseWorkflowModeValue;
     const isWorkflowBackgroundConfirmed = isWorkflowBackgroundConfirmedValue;
@@ -65,14 +68,174 @@
       });
     };
 
+    function compactWorkflowLine(value, maxLen) {
+      const source = String(value || "").replace(/\s+/g, " ").trim();
+      const limit = Math.max(16, Math.floor(asNumber(maxLen, 200)));
+      if (!source) {
+        return "";
+      }
+      return source.length <= limit ? source : source.slice(0, Math.max(0, limit - 1)) + "…";
+    }
+
+    function buildGoalDecisionMessage(message, flowState) {
+      const history = Array.isArray(chatMessages) ? chatMessages : [];
+      const scoped = history
+        .filter(function (item) {
+          const contextId = String(item && item.context_node_id ? item.context_node_id : "").trim();
+          const role = String(item && item.role ? item.role : "").trim().toLowerCase();
+          const meta = String(item && item.meta ? item.meta : "");
+          return !contextId && (role === "user" || role === "assistant") && !meta.includes("workflow_init");
+        })
+        .slice(-16);
+      const lines = scoped.map(function (item, index) {
+        const role = String(item && item.role ? item.role : "user").toLowerCase() === "assistant" ? "assistant" : "user";
+        return String(index + 1) + ". [" + role + "] " + compactWorkflowLine(item && item.text ? item.text : "", 220);
+      });
+      const mode = String(flowState && flowState.mode ? flowState.mode : "");
+      const goalSeed = String(outlineGuideForm.goal || "").trim();
+      const wrapped = [
+        "You are the workflow goal-stage judge for a novel project.",
+        "Decide if the user's latest message already provides a concrete writing goal.",
+        "Output strict JSON only with this schema:",
+        "{\"decision\":\"goal_ready|collect_more\",\"goal\":\"...\",\"assistant_reply\":\"...\"}",
+        "Rules:",
+        "1) decision=goal_ready only if goal is concrete, actionable, and sufficient to enter /sync.",
+        "2) If collect_more: ask focused follow-up and optionally provide candidate goal options.",
+        "3) If goal_ready: goal must be one concise sentence in user's language.",
+        "4) assistant_reply must be user-facing natural text in user's language (no markdown code fence).",
+        "",
+        "[Workflow Mode]",
+        mode || "-",
+        "",
+        "[Current Goal Draft]",
+        goalSeed || "-",
+        "",
+        "[Conversation History]",
+        lines.join("\n") || "-",
+        "",
+        "[Current User Message]",
+        String(message || "")
+      ].join("\n");
+      return wrapped.slice(0, 3900);
+    }
+
+    function parseGoalDecisionReply(rawReply) {
+      const raw = String(rawReply || "").trim();
+      const candidates = [];
+      const fencedMatches = raw.match(/```(?:json)?\s*[\s\S]*?```/gi) || [];
+      fencedMatches.forEach(function (block) {
+        const cleaned = String(block)
+          .replace(/^```(?:json)?\s*/i, "")
+          .replace(/```$/i, "")
+          .trim();
+        if (cleaned) {
+          candidates.push(cleaned);
+        }
+      });
+      if (raw) {
+        candidates.push(raw);
+      }
+      const braceMatched = raw.match(/\{[\s\S]*\}/);
+      if (braceMatched && String(braceMatched[0] || "").trim()) {
+        candidates.push(String(braceMatched[0]).trim());
+      }
+      let parsed = null;
+      for (let index = 0; index < candidates.length; index += 1) {
+        try {
+          const data = JSON.parse(candidates[index]);
+          if (data && typeof data === "object") {
+            parsed = data;
+            break;
+          }
+        } catch (error) {
+          parsed = null;
+        }
+      }
+      if (!parsed) {
+        return {
+          decision: "collect_more",
+          goal: "",
+          assistantReply: raw || t("web.workflow.need_goal")
+        };
+      }
+      const decisionRaw = String(parsed.decision || parsed.next || parsed.state || "").trim().toLowerCase();
+      const decision = decisionRaw === "goal_ready" || decisionRaw === "ready" || decisionRaw === "confirm_goal"
+        ? "goal_ready"
+        : "collect_more";
+      const goal = compactWorkflowLine(parsed.goal || parsed.normalized_goal || parsed.goal_summary || "", 320);
+      const assistantReply = String(parsed.assistant_reply || parsed.reply || parsed.message || "").trim();
+      return {
+        decision: decision,
+        goal: goal,
+        assistantReply: assistantReply || raw || t("web.workflow.need_goal")
+      };
+    }
+
     async function materializeWorkflowGraphPlan(flow) {
       if (!projectId) {
         return false;
       }
-      const beats = parseBeatList(flow.chapter_beats, 12);
-      if (beats.length === 0) {
+      const fallbackBeats = parseBeatList(flow.chapter_beats, 8);
+      const outlineText = String(flow.outline_markdown || "").trim();
+      if (!outlineText && fallbackBeats.length === 0) {
         return false;
       }
+      const detailOutcome = await runApiDetailed(
+        function () {
+          return apiRequest("/api/ai/outline/detail_nodes", {
+            method: "POST",
+            timeout_ms: aiRequestTimeoutMs(),
+            body: {
+              project_id: projectId,
+              outline_markdown: outlineText,
+              chapter_beats: fallbackBeats,
+              user_request: String(flow.goal || flow.specify || flow.plan_notes || ""),
+              mode: String(flow.mode || ""),
+              token_budget: Math.max(1200, Math.floor(asNumber(aiConfig.token_budget, 2200))),
+              max_nodes: 8
+            }
+          });
+        },
+        null
+      );
+      const detailNodesRaw =
+        detailOutcome.ok && detailOutcome.data && Array.isArray(detailOutcome.data.nodes)
+          ? detailOutcome.data.nodes
+          : [];
+      const detailNodes = detailNodesRaw
+        .map(function (item, index) {
+          const raw = item && typeof item === "object" ? item : {};
+          const title = String(raw.title || "").trim();
+          const outline = String(raw.outline_markdown || raw.outline || "").trim();
+          const summary = String(raw.summary || "").trim();
+          if (!outline) {
+            return null;
+          }
+          return {
+            title: title || beatTitle(summary || outline, index),
+            outline_markdown: outline,
+            summary: summary || outline.replace(/\s+/g, " ").slice(0, 180)
+          };
+        })
+        .filter(function (item) {
+          return Boolean(item && item.outline_markdown);
+        })
+        .slice(0, 8);
+      const fallbackDetailNodes = fallbackBeats.map(function (beat, index) {
+        const text = String(beat || "").trim();
+        return {
+          title: beatTitle(text, index),
+          outline_markdown: text ? "- " + text : "",
+          summary: text.slice(0, 180)
+        };
+      }).filter(function (item) {
+        return Boolean(item.outline_markdown);
+      }).slice(0, 8);
+      const detailList = detailNodes.length > 0 ? detailNodes : fallbackDetailNodes;
+      if (detailList.length === 0) {
+        return false;
+      }
+      const groupWidth = Math.max(920, 340 + detailList.length * 230);
       const groupNode = await runApi(
         function () {
           return apiRequest("/api/projects/" + projectId + "/nodes", {
@@ -86,7 +249,7 @@
               pos_y: 120,
               metadata: {
                 group_kind: "chapter",
-                group_width: 920,
+                group_width: groupWidth,
                 group_height: 520,
                 ai_from_workflow: true,
                 ai_workflow_mode: flow.mode || "original"
@@ -100,14 +263,14 @@
         return false;
       }
       const created = [];
-      for (let index = 0; index < beats.length; index += 1) {
-        const beat = beats[index];
+      for (let index = 0; index < detailList.length; index += 1) {
+        const detail = detailList[index];
         const node = await runApi(
           function () {
             return apiRequest("/api/projects/" + projectId + "/nodes", {
               method: "POST",
               body: {
-                title: beatTitle(beat, index),
+                title: detail.title,
                 type: "chapter",
                 status: "draft",
                 storyline_id: null,
@@ -117,8 +280,9 @@
                   group_parent_id: groupNode.id,
                   group_binding: "bound",
                   ai_from_workflow: true,
-                  content: String(beat || ""),
-                  summary: String(beat || "").slice(0, 180),
+                  ai_outline_seed_marker: WORKFLOW_OUTLINE_SEED_MARKER,
+                  outline_markdown: String(detail.outline_markdown || ""),
+                  summary: String(detail.summary || "").slice(0, 180),
                   narrative_index: index + 1
                 }
               }
@@ -173,6 +337,8 @@
               metadata: {
                 project_outline: true,
                 outline_kind: "project_outline",
+                ai_outline_seed: true,
+                ai_outline_seed_marker: WORKFLOW_OUTLINE_SEED_MARKER,
                 outline_mode: flow.mode || "",
                 outline_sync_context: String(flow.sync_context || ""),
                 outline_sync_background: String(flow.sync_background_markdown || ""),
@@ -186,7 +352,7 @@
                 outline_tone: String(flow.tone || ""),
                 outline_chapter_beats: parseBeatList(flow.chapter_beats, 20),
                 outline_next_steps: parseBeatList(flow.next_steps, 12),
-                content: outlineText,
+                outline_markdown: outlineText,
                 summary: outlineText.slice(0, 200)
               }
             }
@@ -195,7 +361,7 @@
         null
       );
       if (!node) {
-        return false;
+        return "";
       }
       await refreshProjectData(projectId, true);
       setSelectedNodeId(node.id);
@@ -204,7 +370,7 @@
       setChatOpen(true);
       setArtifactOpen(false);
       pushToast("ok", t("web.outline.saved"));
-      return true;
+      return String(node.id || "");
     }
 
     async function handleWorkflowChat(text) {
@@ -223,8 +389,7 @@
       if (step === "start") {
         const mode = parseWorkflowMode(message);
         if (!mode) {
-          appendChatMessage("assistant", t("web.workflow.need_mode"), t("web.chat.route_label", { route: "workflow" }));
-          return true;
+          return false;
         }
         setChatWorkflow(function (prev) {
           return Object.assign({}, prev, { mode: mode, step: "goal" });
@@ -233,15 +398,49 @@
         return true;
       }
       if (step === "goal") {
-        if (message.length < 6) {
-          appendChatMessage("assistant", t("web.workflow.need_goal"), t("web.chat.route_label", { route: "workflow" }));
+        const goalDecisionOutcome = await runApiDetailed(
+          function () {
+            return apiRequest("/api/ai/chat", {
+              method: "POST",
+              timeout_ms: aiRequestTimeoutMs(),
+              body: {
+                project_id: projectId,
+                node_id: null,
+                message: buildGoalDecisionMessage(message, current),
+                token_budget: Math.max(900, Math.floor(asNumber(aiConfig.token_budget, 2200) / 2))
+              }
+            });
+          },
+          null
+        );
+        if (!goalDecisionOutcome.ok || !goalDecisionOutcome.data) {
+          appendChatMessage(
+            "assistant",
+            t("web.chat.error_reply", { message: goalDecisionOutcome.error || t("web.workflow.need_goal") }),
+            t("web.chat.route_label", { route: "workflow" })
+          );
+          return true;
+        }
+        const judged = parseGoalDecisionReply(goalDecisionOutcome.data.reply);
+        const resolvedGoal = String(judged.goal || message || "").trim();
+        if (judged.decision !== "goal_ready" || resolvedGoal.length < 6) {
+          appendChatMessage(
+            "assistant",
+            String(judged.assistantReply || t("web.workflow.need_goal")),
+            t("web.chat.route_label", { route: "workflow" })
+          );
           return true;
         }
         setChatWorkflow(function (prev) {
           return Object.assign({}, prev, { step: "sync" });
         });
-        setOutlineGuideField("goal", message);
-        appendChatMessage("assistant", t("web.workflow.ask_sync"), t("web.chat.route_label", { route: "workflow" }));
+        setOutlineGuideField("goal", resolvedGoal);
+        const ack = String(judged.assistantReply || "").trim();
+        appendChatMessage(
+          "assistant",
+          (ack ? ack + "\n\n" : "") + t("web.workflow.ask_sync"),
+          t("web.chat.route_label", { route: "workflow" })
+        );
         return true;
       }
       if (step === "sync") {
@@ -513,8 +712,8 @@
           return true;
         }
         const flow = chatWorkflow;
-        const saved = await saveWorkflowOutlineNode(flow);
-        if (!saved) {
+        const savedNodeId = await saveWorkflowOutlineNode(flow);
+        if (!savedNodeId) {
           appendChatMessage("assistant", t("web.workflow.save_outline_failed"), t("web.chat.route_label", { route: "workflow" }));
           return true;
         }
