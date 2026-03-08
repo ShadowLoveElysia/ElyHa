@@ -326,7 +326,7 @@
   "tui.status.running": "running",
   "tui.status.cancelled": "cancelled",
   "web.app.title": "ElyHa Studio",
-  "web.app.subtitle": "Web グラフエディタ（Tauri 再利用対応）",
+  "web.app.subtitle": "Web グラフエディタ",
   "web.top.refresh_graph": "更新",
   "web.top.validate": "検証",
   "web.top.export": "エクスポート",

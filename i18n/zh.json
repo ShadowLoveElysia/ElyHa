@@ -326,7 +326,7 @@
   "tui.status.running": "运行中",
   "tui.status.cancelled": "已取消",
   "web.app.title": "ElyHa Studio",
-  "web.app.subtitle": "Web 图编辑器（Tauri 可复用）",
+  "web.app.subtitle": "Web 图编辑器",
   "web.top.refresh_graph": "刷新",
   "web.top.validate": "校验",
   "web.top.export": "导出",

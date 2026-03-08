@@ -10,7 +10,7 @@
     NODE_STATUSES: ["draft", "generated", "reviewed", "approved"],
     FALLBACK_TEXT: {
       "web.app.title": "ElyHa Studio",
-      "web.app.subtitle": "Web Graph Editor (Tauri-ready)",
+      "web.app.subtitle": "Web Graph Editor",
       "web.top.refresh_graph": "Refresh",
       "web.top.validate": "Validate",
       "web.top.export": "Export",
