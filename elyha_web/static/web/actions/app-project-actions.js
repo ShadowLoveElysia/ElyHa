@@ -550,7 +550,10 @@ async function loadLocaleCatalog(nextLocale) {
           return apiActions.saveProjectSettingsAction(projectId, {
             allow_cycles: project.settings.allow_cycles,
             auto_snapshot_minutes: minutes,
-            auto_snapshot_operations: operations
+            auto_snapshot_operations: operations,
+            system_prompt_style: String(projectSettingsForm.system_prompt_style || ""),
+            system_prompt_forbidden: String(projectSettingsForm.system_prompt_forbidden || ""),
+            system_prompt_notes: String(projectSettingsForm.system_prompt_notes || "")
           });
         },
         t("web.toast.saved")
@@ -566,7 +569,10 @@ async function loadLocaleCatalog(nextLocale) {
       });
       setProjectSettingsForm({
         auto_snapshot_minutes: String(updated.settings.auto_snapshot_minutes),
-        auto_snapshot_operations: String(updated.settings.auto_snapshot_operations)
+        auto_snapshot_operations: String(updated.settings.auto_snapshot_operations),
+        system_prompt_style: String(updated.settings.system_prompt_style || ""),
+        system_prompt_forbidden: String(updated.settings.system_prompt_forbidden || ""),
+        system_prompt_notes: String(updated.settings.system_prompt_notes || "")
       });
       addActivity(
         "success",

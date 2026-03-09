@@ -3217,7 +3217,10 @@
         }
         setProjectSettingsForm({
           auto_snapshot_minutes: String(project.settings.auto_snapshot_minutes),
-          auto_snapshot_operations: String(project.settings.auto_snapshot_operations)
+          auto_snapshot_operations: String(project.settings.auto_snapshot_operations),
+          system_prompt_style: String(project.settings.system_prompt_style || ""),
+          system_prompt_forbidden: String(project.settings.system_prompt_forbidden || ""),
+          system_prompt_notes: String(project.settings.system_prompt_notes || "")
         });
       },
       [project ? project.id : "", project ? project.updated_at : ""]

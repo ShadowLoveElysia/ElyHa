@@ -19,6 +19,9 @@ class ProjectSettingsPatch:
     allow_cycles: bool | None = None
     auto_snapshot_minutes: int | None = None
     auto_snapshot_operations: int | None = None
+    system_prompt_style: str | None = None
+    system_prompt_forbidden: str | None = None
+    system_prompt_notes: str | None = None
 
 
 class ProjectService:
@@ -105,6 +108,21 @@ class ProjectService:
                 if patch.auto_snapshot_operations is None
                 else patch.auto_snapshot_operations
             ),
+            system_prompt_style=(
+                current.system_prompt_style
+                if patch.system_prompt_style is None
+                else patch.system_prompt_style
+            ),
+            system_prompt_forbidden=(
+                current.system_prompt_forbidden
+                if patch.system_prompt_forbidden is None
+                else patch.system_prompt_forbidden
+            ),
+            system_prompt_notes=(
+                current.system_prompt_notes
+                if patch.system_prompt_notes is None
+                else patch.system_prompt_notes
+            ),
         )
         project.settings = updated
         self._record_project_operation(
@@ -114,6 +132,9 @@ class ProjectService:
                 "allow_cycles": updated.allow_cycles,
                 "auto_snapshot_minutes": updated.auto_snapshot_minutes,
                 "auto_snapshot_operations": updated.auto_snapshot_operations,
+                "system_prompt_style": updated.system_prompt_style,
+                "system_prompt_forbidden": updated.system_prompt_forbidden,
+                "system_prompt_notes": updated.system_prompt_notes,
             },
         )
         return self.load_project(project_id)

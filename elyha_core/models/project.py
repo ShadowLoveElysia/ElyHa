@@ -9,6 +9,15 @@ from elyha_core.i18n import tr
 from elyha_core.utils.clock import utc_now
 from elyha_core.utils.ids import ensure_valid_id
 
+SYSTEM_PROMPT_TEXT_MAX_CHARS = 4000
+
+
+def _normalize_prompt_text(value: object, *, limit: int = SYSTEM_PROMPT_TEXT_MAX_CHARS) -> str:
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if len(text) > limit:
+        return text[:limit]
+    return text
+
 
 @dataclass(slots=True)
 class ProjectSettings:
@@ -17,12 +26,18 @@ class ProjectSettings:
     allow_cycles: bool = False
     auto_snapshot_minutes: int = 5
     auto_snapshot_operations: int = 50
+    system_prompt_style: str = ""
+    system_prompt_forbidden: str = ""
+    system_prompt_notes: str = ""
 
     def __post_init__(self) -> None:
         if self.auto_snapshot_minutes <= 0:
             raise ValueError(tr("err.auto_snapshot_minutes_positive"))
         if self.auto_snapshot_operations <= 0:
             raise ValueError(tr("err.auto_snapshot_operations_positive"))
+        self.system_prompt_style = _normalize_prompt_text(self.system_prompt_style)
+        self.system_prompt_forbidden = _normalize_prompt_text(self.system_prompt_forbidden)
+        self.system_prompt_notes = _normalize_prompt_text(self.system_prompt_notes)
 
 
 @dataclass(slots=True)

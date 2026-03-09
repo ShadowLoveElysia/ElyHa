@@ -208,6 +208,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-cycles")
     parser.add_argument("--auto-snapshot-minutes", type=int)
     parser.add_argument("--auto-snapshot-operations", type=int)
+    parser.add_argument("--system-prompt-style")
+    parser.add_argument("--system-prompt-forbidden")
+    parser.add_argument("--system-prompt-notes")
     return parser
 
 
@@ -418,6 +421,18 @@ def _build_prompt_fields(command: str, state: SessionState) -> list[PromptField]
             PromptField(
                 "auto_snapshot_operations",
                 tr("tui.wizard.field.auto_snapshot_operations"),
+            ),
+            PromptField(
+                "system_prompt_style",
+                tr("tui.wizard.field.system_prompt_style"),
+            ),
+            PromptField(
+                "system_prompt_forbidden",
+                tr("tui.wizard.field.system_prompt_forbidden"),
+            ),
+            PromptField(
+                "system_prompt_notes",
+                tr("tui.wizard.field.system_prompt_notes"),
             ),
         ]
     if command == "project-delete":
@@ -656,10 +671,16 @@ def execute_command(
         allow_cycles = _bool_from_text(params.get("allow_cycles"))
         auto_snapshot_minutes = params.get("auto_snapshot_minutes")
         auto_snapshot_operations = params.get("auto_snapshot_operations")
+        system_prompt_style = params.get("system_prompt_style")
+        system_prompt_forbidden = params.get("system_prompt_forbidden")
+        system_prompt_notes = params.get("system_prompt_notes")
         if (
             allow_cycles is None
             and auto_snapshot_minutes is None
             and auto_snapshot_operations is None
+            and system_prompt_style is None
+            and system_prompt_forbidden is None
+            and system_prompt_notes is None
         ):
             raise ValueError(tr("tui.error.project_settings_requires_one"))
         payload = project_update_settings(
@@ -674,6 +695,21 @@ def execute_command(
             auto_snapshot_operations=(
                 int(auto_snapshot_operations)
                 if auto_snapshot_operations is not None
+                else None
+            ),
+            system_prompt_style=(
+                str(system_prompt_style)
+                if system_prompt_style is not None
+                else None
+            ),
+            system_prompt_forbidden=(
+                str(system_prompt_forbidden)
+                if system_prompt_forbidden is not None
+                else None
+            ),
+            system_prompt_notes=(
+                str(system_prompt_notes)
+                if system_prompt_notes is not None
                 else None
             ),
         )
@@ -1507,6 +1543,9 @@ def run_automation(args: argparse.Namespace, runtime: Runtime) -> int:
         "allow_cycles": args.allow_cycles,
         "auto_snapshot_minutes": args.auto_snapshot_minutes,
         "auto_snapshot_operations": args.auto_snapshot_operations,
+        "system_prompt_style": args.system_prompt_style,
+        "system_prompt_forbidden": args.system_prompt_forbidden,
+        "system_prompt_notes": args.system_prompt_notes,
     }
     try:
         payload = _normalize_output_payload(

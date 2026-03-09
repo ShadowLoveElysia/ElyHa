@@ -17,6 +17,9 @@ def project_payload(project: Project) -> dict[str, object]:
             "allow_cycles": project.settings.allow_cycles,
             "auto_snapshot_minutes": project.settings.auto_snapshot_minutes,
             "auto_snapshot_operations": project.settings.auto_snapshot_operations,
+            "system_prompt_style": project.settings.system_prompt_style,
+            "system_prompt_forbidden": project.settings.system_prompt_forbidden,
+            "system_prompt_notes": project.settings.system_prompt_notes,
         },
     }
 
@@ -50,11 +53,17 @@ def project_update_settings(
     allow_cycles: bool | None = None,
     auto_snapshot_minutes: int | None = None,
     auto_snapshot_operations: int | None = None,
+    system_prompt_style: str | None = None,
+    system_prompt_forbidden: str | None = None,
+    system_prompt_notes: str | None = None,
 ) -> dict[str, object]:
     patch = ProjectSettingsPatch(
         allow_cycles=allow_cycles,
         auto_snapshot_minutes=auto_snapshot_minutes,
         auto_snapshot_operations=auto_snapshot_operations,
+        system_prompt_style=system_prompt_style,
+        system_prompt_forbidden=system_prompt_forbidden,
+        system_prompt_notes=system_prompt_notes,
     )
     return project_payload(service.update_project_settings(project_id, patch))
 

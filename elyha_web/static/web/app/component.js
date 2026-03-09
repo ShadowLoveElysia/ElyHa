@@ -219,7 +219,10 @@
     });
     const [projectSettingsForm, setProjectSettingsForm] = useState({
       auto_snapshot_minutes: "5",
-      auto_snapshot_operations: "50"
+      auto_snapshot_operations: "50",
+      system_prompt_style: "",
+      system_prompt_forbidden: "",
+      system_prompt_notes: ""
     });
     const [outlineGuideForm, setOutlineGuideForm] = useState(function () {
       const defaults = {
@@ -2233,6 +2236,45 @@
                         value: projectSettingsForm.auto_snapshot_operations,
                         onChange: function (event) {
                           setProjectSettingsField("auto_snapshot_operations", event.target.value);
+                        }
+                      })
+                    ),
+                    h(
+                      "div",
+                      { className: "meta-item" },
+                      h("strong", null, t("web.project.meta.system_prompt_style")),
+                      h("textarea", {
+                        rows: 3,
+                        placeholder: t("web.project.meta.system_prompt_style_hint"),
+                        value: projectSettingsForm.system_prompt_style,
+                        onChange: function (event) {
+                          setProjectSettingsField("system_prompt_style", event.target.value);
+                        }
+                      })
+                    ),
+                    h(
+                      "div",
+                      { className: "meta-item" },
+                      h("strong", null, t("web.project.meta.system_prompt_forbidden")),
+                      h("textarea", {
+                        rows: 3,
+                        placeholder: t("web.project.meta.system_prompt_forbidden_hint"),
+                        value: projectSettingsForm.system_prompt_forbidden,
+                        onChange: function (event) {
+                          setProjectSettingsField("system_prompt_forbidden", event.target.value);
+                        }
+                      })
+                    ),
+                    h(
+                      "div",
+                      { className: "meta-item" },
+                      h("strong", null, t("web.project.meta.system_prompt_notes")),
+                      h("textarea", {
+                        rows: 3,
+                        placeholder: t("web.project.meta.system_prompt_notes_hint"),
+                        value: projectSettingsForm.system_prompt_notes,
+                        onChange: function (event) {
+                          setProjectSettingsField("system_prompt_notes", event.target.value);
                         }
                       })
                     ),

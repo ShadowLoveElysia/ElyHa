@@ -332,6 +332,7 @@ class AIService:
                 task_type="chat_global_" + route,
                 prompt=self._chat_global_prompt(project_id, cleaned_message, route=route),
                 platform_config={"token_budget": token_budget},
+                project_id=project_id,
             )
             content = response.content.strip() or tr("ai.chat.empty_fallback")
             return ChatAssistResult(
@@ -356,6 +357,7 @@ class AIService:
                 prompt=self._chat_planner_prompt(node.title, context, cleaned_message),
                 platform_config={"token_budget": max(600, token_budget // 2), "branch_count": 3},
                 llm_route=llm_route,
+                project_id=project_id,
             )
             options = self._parse_branch_options(response.content, count=3)
             reply = tr(
@@ -401,6 +403,7 @@ class AIService:
             prompt=self._chat_writer_prompt(node.title, context, cleaned_message, node_metadata),
             platform_config={"token_budget": token_budget},
             llm_route=llm_route,
+            project_id=project_id,
         )
         content = response.content.strip()
         if not content:
@@ -462,6 +465,7 @@ class AIService:
                 tone=str(tone or "").strip(),
             ),
             platform_config={"token_budget": max(800, token_budget)},
+            project_id=project_id,
         )
         parsed = self._parse_outline_guide_payload(response.content)
         questions = self._normalize_outline_list(parsed.get("questions"), limit=8)
@@ -510,6 +514,7 @@ class AIService:
                 max_nodes=safe_max_nodes,
             ),
             platform_config={"token_budget": max(900, token_budget)},
+            project_id=project_id,
         )
         parsed_nodes = self._parse_outline_detail_nodes_payload(response.content, limit=safe_max_nodes)
         if not parsed_nodes:
@@ -553,6 +558,7 @@ class AIService:
                 tone=str(tone or "").strip(),
             ),
             platform_config={"token_budget": max(600, token_budget)},
+            project_id=project_id,
         )
         questions = self._parse_question_lines(response.content, limit=6)
         if not questions:
@@ -600,6 +606,7 @@ class AIService:
                 "token_budget": max(800, token_budget),
                 "web_search_enabled": search_requested,
             },
+            project_id=project_id,
         )
         parsed = self._parse_workflow_sync_payload(response.content)
         background_markdown = str(parsed.get("background_markdown", "")).strip()
@@ -1156,6 +1163,7 @@ class AIService:
         prompt: str,
         platform_config: dict[str, Any],
         llm_route: dict[str, Any] | None = None,
+        project_id: str | None = None,
     ) -> LLMResponse:
         merged_platform_config = self._default_platform_config.copy()
         adapter = self.llm_adapter
@@ -1169,7 +1177,7 @@ class AIService:
         merged_platform_config.update(platform_config)
         request = LLMRequest(
             task_type=task_type,
-            system_prompt=tr("ai.system_prompt"),
+            system_prompt=self._build_system_prompt(project_id),
             messages=[LLMMessage(role="user", content=prompt)],
             platform_config=merged_platform_config,
         )
@@ -1179,6 +1187,33 @@ class AIService:
             detail = response.error_message or tr("ai.error.llm_request_failed")
             raise RuntimeError(tr("ai.error.llm_request_failed_with_code", code=code, detail=detail))
         return response
+
+    def _build_system_prompt(self, project_id: str | None = None) -> str:
+        base_prompt = tr("ai.system_prompt").strip()
+        if not project_id:
+            return base_prompt
+        project = self.repository.get_project(project_id)
+        if project is None:
+            return base_prompt
+        settings = project.settings
+        style = str(getattr(settings, "system_prompt_style", "")).strip()
+        forbidden = str(getattr(settings, "system_prompt_forbidden", "")).strip()
+        notes = str(getattr(settings, "system_prompt_notes", "")).strip()
+        sections: list[str] = []
+        if style:
+            sections.append(f"[User Writing Style]\n{style}")
+        if forbidden:
+            sections.append(f"[Forbidden Content]\n{forbidden}")
+        if notes:
+            sections.append(f"[Additional Notes To Explain]\n{notes}")
+        if not sections:
+            return base_prompt
+        return (
+            f"{base_prompt}\n\n"
+            "[User Constraints]\n"
+            "The following constraints are from current project settings and should be followed.\n\n"
+            + "\n\n".join(sections)
+        )
 
     def _build_single_workflow(self):
         graph = StateGraph(WorkflowState)
@@ -1291,6 +1326,7 @@ class AIService:
             prompt=prompt,
             platform_config=platform_config,
             llm_route=cast(dict[str, Any] | None, state.get("llm_route")),
+            project_id=str(state.get("project_id", "")) or None,
         )
         return {"llm_response": response}
 
@@ -1311,6 +1347,7 @@ class AIService:
             prompt=state["planner_prompt"],
             platform_config={"token_budget": max(400, token_budget // 2)},
             llm_route=cast(dict[str, Any] | None, state.get("llm_route")),
+            project_id=str(state.get("project_id", "")) or None,
         )
         return {
             "planner_response": response,
@@ -1331,6 +1368,7 @@ class AIService:
             prompt=state["writer_prompt"],
             platform_config={"token_budget": token_budget},
             llm_route=cast(dict[str, Any] | None, state.get("llm_route")),
+            project_id=str(state.get("project_id", "")) or None,
         )
         return {
             "writer_response": response,
@@ -1355,6 +1393,7 @@ class AIService:
             prompt=state["reviewer_prompt"],
             platform_config={"token_budget": max(400, token_budget // 2)},
             llm_route=cast(dict[str, Any] | None, state.get("llm_route")),
+            project_id=str(state.get("project_id", "")) or None,
         )
         return {
             "reviewer_response": response,
@@ -1379,6 +1418,7 @@ class AIService:
             prompt=state["synthesizer_prompt"],
             platform_config={"token_budget": token_budget},
             llm_route=cast(dict[str, Any] | None, state.get("llm_route")),
+            project_id=str(state.get("project_id", "")) or None,
         )
         return {
             "llm_response": response,

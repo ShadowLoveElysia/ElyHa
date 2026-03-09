@@ -54,6 +54,9 @@ class UpdateSettingsRequest(BaseModel):
     allow_cycles: bool | None = None
     auto_snapshot_minutes: int | None = Field(default=None, ge=1)
     auto_snapshot_operations: int | None = Field(default=None, ge=1)
+    system_prompt_style: str | None = Field(default=None, max_length=4000)
+    system_prompt_forbidden: str | None = Field(default=None, max_length=4000)
+    system_prompt_notes: str | None = Field(default=None, max_length=4000)
 
 
 class CreateNodeRequest(BaseModel):
@@ -213,6 +216,9 @@ def _to_project_payload(project) -> dict[str, Any]:
             "allow_cycles": project.settings.allow_cycles,
             "auto_snapshot_minutes": project.settings.auto_snapshot_minutes,
             "auto_snapshot_operations": project.settings.auto_snapshot_operations,
+            "system_prompt_style": project.settings.system_prompt_style,
+            "system_prompt_forbidden": project.settings.system_prompt_forbidden,
+            "system_prompt_notes": project.settings.system_prompt_notes,
         },
     }
 
@@ -592,6 +598,9 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             allow_cycles=payload.allow_cycles,
             auto_snapshot_minutes=payload.auto_snapshot_minutes,
             auto_snapshot_operations=payload.auto_snapshot_operations,
+            system_prompt_style=payload.system_prompt_style,
+            system_prompt_forbidden=payload.system_prompt_forbidden,
+            system_prompt_notes=payload.system_prompt_notes,
         )
         try:
             project = services.project_service.update_project_settings(project_id, patch)
