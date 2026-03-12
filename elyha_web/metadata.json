@@ -1,0 +1,5 @@
+{
+  "name": "ElyHa Studio",
+  "description": "A node-flow tool for assisting in writing novels/scripts using an LLM API.",
+  "requestFramePermissions": []
+}

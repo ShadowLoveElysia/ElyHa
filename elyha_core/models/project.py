@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 
 from elyha_core.i18n import tr
 from elyha_core.utils.clock import utc_now
@@ -17,6 +18,34 @@ def _normalize_prompt_text(value: object, *, limit: int = SYSTEM_PROMPT_TEXT_MAX
     if len(text) > limit:
         return text[:limit]
     return text
+
+
+def _coerce_bool(value: object, fallback: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+    return fallback
+
+
+def _coerce_positive_int(value: object, fallback: int) -> int:
+    try:
+        parsed = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed > 0 else fallback
+
+
+def _coerce_text(value: object, fallback: str = "") -> str:
+    if value is None:
+        return fallback
+    return str(value)
 
 
 @dataclass(slots=True)
@@ -38,6 +67,43 @@ class ProjectSettings:
         self.system_prompt_style = _normalize_prompt_text(self.system_prompt_style)
         self.system_prompt_forbidden = _normalize_prompt_text(self.system_prompt_forbidden)
         self.system_prompt_notes = _normalize_prompt_text(self.system_prompt_notes)
+
+
+def project_settings_from_payload(raw: Any) -> ProjectSettings:
+    """Decode project settings from storage payload with legacy key compatibility."""
+    payload = raw if isinstance(raw, dict) else {}
+
+    system_prompt_style = _coerce_text(payload.get("system_prompt_style"), "")
+    system_prompt_forbidden = _coerce_text(payload.get("system_prompt_forbidden"), "")
+    system_prompt_notes = _coerce_text(payload.get("system_prompt_notes"), "")
+
+    # Legacy keys from older workflow-doc based schemas.
+    legacy_constitution = _coerce_text(payload.get("constitution_markdown"), "")
+    legacy_clarify = _coerce_text(payload.get("clarify_markdown"), "")
+    legacy_specification = _coerce_text(payload.get("specification_markdown"), "")
+    legacy_plan = _coerce_text(payload.get("plan_markdown"), "")
+
+    if not system_prompt_style and legacy_constitution:
+        system_prompt_style = legacy_constitution
+    if not system_prompt_forbidden and legacy_clarify:
+        system_prompt_forbidden = legacy_clarify
+    if not system_prompt_notes:
+        legacy_notes_parts: list[str] = []
+        if legacy_specification.strip():
+            legacy_notes_parts.append("[Specification]\n" + legacy_specification.strip())
+        if legacy_plan.strip():
+            legacy_notes_parts.append("[Plan]\n" + legacy_plan.strip())
+        if legacy_notes_parts:
+            system_prompt_notes = "\n\n".join(legacy_notes_parts)
+
+    return ProjectSettings(
+        allow_cycles=_coerce_bool(payload.get("allow_cycles"), False),
+        auto_snapshot_minutes=_coerce_positive_int(payload.get("auto_snapshot_minutes"), 5),
+        auto_snapshot_operations=_coerce_positive_int(payload.get("auto_snapshot_operations"), 50),
+        system_prompt_style=system_prompt_style,
+        system_prompt_forbidden=system_prompt_forbidden,
+        system_prompt_notes=system_prompt_notes,
+    )
 
 
 @dataclass(slots=True)

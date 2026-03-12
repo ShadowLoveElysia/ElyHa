@@ -11,7 +11,7 @@ from typing import Any
 from elyha_core.i18n import tr
 from elyha_core.models.edge import Edge
 from elyha_core.models.node import Node, NodeStatus, NodeType
-from elyha_core.models.project import Project, ProjectSettings
+from elyha_core.models.project import Project, ProjectSettings, project_settings_from_payload
 from elyha_core.models.snapshot import Snapshot
 from elyha_core.storage.repository import SQLiteRepository
 from elyha_core.utils.clock import utc_now
@@ -233,7 +233,7 @@ class SnapshotService:
             created_at=self._load_time(payload["created_at"]),
             updated_at=self._load_time(payload["updated_at"]),
             active_revision=int(payload["active_revision"]),
-            settings=ProjectSettings(**payload["settings"]),
+            settings=project_settings_from_payload(payload.get("settings")),
         )
 
     def _deserialize_node(self, payload: dict[str, Any]) -> Node:

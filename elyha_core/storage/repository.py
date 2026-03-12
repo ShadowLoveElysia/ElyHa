@@ -12,7 +12,7 @@ from elyha_core.i18n import tr
 from elyha_core.models.edge import Edge
 from elyha_core.models.node import Node, NodeStatus, NodeType
 from elyha_core.models.operation import Operation
-from elyha_core.models.project import Project, ProjectSettings
+from elyha_core.models.project import Project, project_settings_from_payload
 from elyha_core.models.snapshot import Snapshot
 from elyha_core.models.task import Task, TaskStatus
 from elyha_core.storage.sqlite_store import SQLiteStore
@@ -34,8 +34,11 @@ class SQLiteRepository:
         self.store.initialize()
 
     def _decode_project(self, row: sqlite3.Row) -> Project:
-        settings_raw = json.loads(row["settings_json"])
-        settings = ProjectSettings(**settings_raw)
+        try:
+            settings_raw = json.loads(row["settings_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            settings_raw = {}
+        settings = project_settings_from_payload(settings_raw)
         return Project(
             id=row["id"],
             title=row["title"],

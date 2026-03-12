@@ -204,3 +204,4 @@ elyha_web/static/web/MIGRATION_PROGRESS.md
 !/data/core_configs/core.json
 /elyha_web/原WebUI备份
 /exports
+/elyha_web/static
