@@ -17,7 +17,9 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from elyha_core.core_config import CoreConfigManager, CoreRuntimeConfig
 from elyha_core.i18n import available_locales, current_locale, tr
+from elyha_core.llm_presets import load_llm_presets
 from elyha_core.models.task import TaskStatus
 from elyha_core.services.ai_service import AIService
 from elyha_core.services.context_service import ContextService
@@ -147,6 +149,7 @@ class Runtime:
     ai_service: AIService
     export_service: ExportService
     snapshot_service: SnapshotService
+    default_workflow_mode: str = "multi_agent"
 
 
 @dataclass(slots=True)
@@ -203,7 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n", type=int, default=3)
     parser.add_argument("--token-budget", type=int, default=2200)
     parser.add_argument("--style-hint", default="")
-    parser.add_argument("--workflow-mode", default="multi_agent")
+    parser.add_argument("--workflow-mode")
     parser.add_argument("--locale", help=tr("tui.arg.locale"))
     parser.add_argument("--allow-cycles")
     parser.add_argument("--auto-snapshot-minutes", type=int)
@@ -219,17 +222,47 @@ def run_smoke() -> int:
     return 0
 
 
+def _to_llm_platform_config(config: CoreRuntimeConfig) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "auto_complete": bool(config.auto_complete),
+        "think_switch": bool(config.think_switch),
+        "think_depth": str(config.think_depth),
+        "thinking_budget": int(config.thinking_budget),
+        "web_search_enabled": bool(config.web_search_enabled),
+        "web_search_context_size": str(config.web_search_context_size),
+        "web_search_max_results": int(config.web_search_max_results),
+        "request_timeout": int(config.llm_request_timeout),
+    }
+    if config.api_url:
+        payload["api_url"] = config.api_url
+    if config.api_key:
+        payload["api_key"] = config.api_key
+    if config.model_name:
+        payload["model_name"] = config.model_name
+    return payload
+
+
 def _build_runtime(db_path: str | Path) -> Runtime:
-    repository = SQLiteRepository(SQLiteStore(db_path))
+    db_file = Path(db_path)
+    repository = SQLiteRepository(SQLiteStore(db_file))
     project_service = ProjectService(repository)
     graph_service = GraphService(repository)
     validation_service = ValidationService(repository)
     context_service = ContextService(repository)
+    config_root = Path(os.getenv("ELYHA_CORE_CONFIG_DIR", db_file.parent / "core_configs"))
+    core_config_manager = CoreConfigManager(config_root)
+    preset_path = Path(os.getenv("ELYHA_PRESET_PATH", Path(__file__).resolve().parent.parent / "preset.json"))
+    llm_presets = load_llm_presets(preset_path)
+    _, runtime_config = core_config_manager.load_active()
+    os.environ["ELYHA_LOCALE"] = runtime_config.locale
     ai_service = AIService(
         repository,
         graph_service,
         context_service,
         validation_service,
+        llm_provider=runtime_config.llm_provider,
+        llm_platform_config=_to_llm_platform_config(runtime_config),
+        llm_presets=llm_presets,
     )
     export_service = ExportService(repository, validation_service)
     snapshot_service = SnapshotService(repository)
@@ -242,6 +275,7 @@ def _build_runtime(db_path: str | Path) -> Runtime:
         ai_service=ai_service,
         export_service=export_service,
         snapshot_service=snapshot_service,
+        default_workflow_mode=runtime_config.default_workflow_mode,
     )
 
 
@@ -402,7 +436,12 @@ def _project_prompt_field(state: SessionState) -> PromptField:
     )
 
 
-def _build_prompt_fields(command: str, state: SessionState) -> list[PromptField]:
+def _build_prompt_fields(
+    command: str,
+    state: SessionState,
+    *,
+    default_workflow_mode: str,
+) -> list[PromptField]:
     project = _project_prompt_field(state)
     if command == "project-create":
         return [PromptField("title", tr("tui.wizard.field.title"), required=True)]
@@ -509,7 +548,7 @@ def _build_prompt_fields(command: str, state: SessionState) -> list[PromptField]
             PromptField(
                 "workflow_mode",
                 tr("tui.wizard.field.workflow_mode"),
-                default="multi_agent",
+                default=default_workflow_mode,
             ),
         ]
     if command == "generate-branches":
@@ -608,8 +647,19 @@ def _prompt_with_fields(command: str, fields: list[PromptField]) -> dict[str, An
     return params
 
 
-def _prompt_for_params(command: str, state: SessionState) -> dict[str, Any] | None:
-    return _prompt_with_fields(command, _build_prompt_fields(command, state))
+def _prompt_for_params(
+    command: str,
+    state: SessionState,
+    runtime: Runtime,
+) -> dict[str, Any] | None:
+    return _prompt_with_fields(
+        command,
+        _build_prompt_fields(
+            command,
+            state,
+            default_workflow_mode=runtime.default_workflow_mode,
+        ),
+    )
 
 
 def _prompt_for_graph_params(command: str) -> dict[str, Any] | None:
@@ -849,7 +899,9 @@ def execute_command(
             node_id=_require_text(params, "node_id"),
             token_budget=int(params.get("token_budget", 2200)),
             style_hint=str(params.get("style_hint", "")),
-            workflow_mode=str(params.get("workflow_mode", "multi_agent")),
+            workflow_mode=str(
+                params.get("workflow_mode") or runtime.default_workflow_mode
+            ),
         )
         state.current_project_id = project_id
         return payload
@@ -1447,7 +1499,7 @@ def run_tui(runtime: Runtime, *, db_path: str) -> int:
             params: dict[str, Any]
             if line.isdigit() and line in MENU_INDEX:
                 command = MENU_INDEX[line]
-                prompted = _prompt_for_params(command, state)
+                prompted = _prompt_for_params(command, state, runtime)
                 if prompted is None:
                     continue
                 params = prompted
@@ -1529,7 +1581,7 @@ def run_automation(args: argparse.Namespace, runtime: Runtime) -> int:
         "n": args.n,
         "token_budget": args.token_budget,
         "style_hint": args.style_hint,
-        "workflow_mode": args.workflow_mode,
+        "workflow_mode": args.workflow_mode or runtime.default_workflow_mode,
         "locale": args.locale,
         "storyline_id": args.storyline_id,
         "pos_x": args.pos_x,

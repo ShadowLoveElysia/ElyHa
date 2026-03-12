@@ -127,6 +127,7 @@ class OutlineDetailNodesResult:
 
 
 class WorkflowState(TypedDict, total=False):
+    task_id: str
     task_type: str
     project_id: str
     node_id: str
@@ -202,7 +203,11 @@ class AIService:
                 token_budget=token_budget,
                 style_hint=style_hint,
                 workflow_mode=normalized_mode,
+                task_id=task.id,
             )
+            if self._is_task_cancelled(task.id):
+                self._set_task_cancelled(task, message="task cancelled")
+                raise RuntimeError("task cancelled")
             node = cast(Any, flow_state["node"])
             response = cast(LLMResponse, flow_state["llm_response"])
             agent_trace = cast(dict[str, str], flow_state.get("agent_trace", {}))
@@ -242,7 +247,10 @@ class AIService:
                 agent_trace=agent_trace,
             )
         except Exception as exc:
-            self._set_task_failed(task, exc)
+            if self._is_task_cancelled(task.id):
+                self._set_task_cancelled(task, message="task cancelled")
+            else:
+                self._set_task_failed(task, exc)
             raise
 
     def generate_branches(
@@ -265,13 +273,20 @@ class AIService:
                 token_budget=token_budget,
                 branch_count=n,
                 workflow_mode="single",
+                task_id=task.id,
             )
+            if self._is_task_cancelled(task.id):
+                self._set_task_cancelled(task, message="task cancelled")
+                raise RuntimeError("task cancelled")
             response = cast(LLMResponse, flow_state["llm_response"])
             options = self._parse_branch_options(response.content, count=n)
             self._set_task_success(task, revision=self._project_revision(project_id))
             return options
         except Exception as exc:
-            self._set_task_failed(task, exc)
+            if self._is_task_cancelled(task.id):
+                self._set_task_cancelled(task, message="task cancelled")
+            else:
+                self._set_task_failed(task, exc)
             raise
 
     def review_lore(
@@ -360,6 +375,12 @@ class AIService:
                 project_id=project_id,
             )
             options = self._parse_branch_options(response.content, count=3)
+            self._clear_suggested_nodes_for_source(project_id, source_node_id=node.id)
+            suggested_node_ids = self._create_suggested_nodes(
+                project_id,
+                source_node=node,
+                options=options,
+            )
             reply = tr(
                 "ai.chat.planner_reply",
                 raw=response.content.strip() or tr("ai.chat.empty_fallback"),
@@ -371,17 +392,23 @@ class AIService:
                 route="planner",
                 reply=reply,
                 review_bypassed=False,
+                suggested_node_ids=suggested_node_ids,
                 suggested_options=[
                     {
                         "title": option.title,
                         "description": option.description,
                         "outline_steps": "\n".join(option.outline_steps),
+                        "suggested_node_id": (
+                            suggested_node_ids[index]
+                            if index < len(suggested_node_ids)
+                            else ""
+                        ),
                         "next_1": option.outline_steps[0] if len(option.outline_steps) > 0 else "",
                         "next_2": option.outline_steps[1] if len(option.outline_steps) > 1 else "",
                         "sentiment": option.sentiment,
                         "plan_mode": option.plan_mode,
                     }
-                    for option in options
+                    for index, option in enumerate(options)
                 ],
                 revision=self._project_revision(project_id),
             )
@@ -644,6 +671,20 @@ class AIService:
             self.graph_service.delete_node(project_id, node_id)
         return len(suggested_ids)
 
+    def _clear_suggested_nodes_for_source(self, project_id: str, *, source_node_id: str) -> int:
+        nodes = self.graph_service.list_nodes(project_id)
+        suggested_ids: list[str] = []
+        for node in nodes:
+            metadata = node.metadata if isinstance(node.metadata, dict) else {}
+            if not metadata.get("ai_suggested"):
+                continue
+            if str(metadata.get("ai_suggested_from", "")).strip() != source_node_id:
+                continue
+            suggested_ids.append(node.id)
+        for node_id in suggested_ids:
+            self.graph_service.delete_node(project_id, node_id)
+        return len(suggested_ids)
+
     def get_task(self, task_id: str) -> Task:
         task = self.repository.get_task(task_id)
         if task is None:
@@ -665,9 +706,7 @@ class AIService:
         task = self.get_task(task_id)
         if task.status in {TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.CANCELLED}:
             return task
-        task.status = TaskStatus.CANCELLED
-        task.finished_at = utc_now()
-        self.repository.update_task(task)
+        self._set_task_cancelled(task, message="task cancelled")
         return self.get_task(task_id)
 
     def _review(
@@ -687,7 +726,11 @@ class AIService:
                 node_id=node_id,
                 token_budget=token_budget,
                 workflow_mode="single",
+                task_id=task.id,
             )
+            if self._is_task_cancelled(task.id):
+                self._set_task_cancelled(task, message="task cancelled")
+                raise RuntimeError("task cancelled")
             response = cast(LLMResponse, flow_state["llm_response"])
             summary, score, issues = self._parse_review_output(response.content)
             revision = self._project_revision(project_id)
@@ -703,7 +746,10 @@ class AIService:
                 revision=revision,
             )
         except Exception as exc:
-            self._set_task_failed(task, exc)
+            if self._is_task_cancelled(task.id):
+                self._set_task_cancelled(task, message="task cancelled")
+            else:
+                self._set_task_failed(task, exc)
             raise
 
     def _chapter_prompt(self, title: str, context: ContextPack, *, style_hint: str) -> str:
@@ -1134,6 +1180,11 @@ class AIService:
                 "ai_suggested_at": now_iso,
                 "summary": option.description,
                 "content": option.description,
+                "outline_markdown": "\n".join(f"- {step}" for step in option.outline_steps)
+                if option.outline_steps
+                else "",
+                "ai_suggested_sentiment": option.sentiment,
+                "ai_suggested_plan_mode": option.plan_mode,
             }
             node = self.graph_service.add_node(
                 project_id,
@@ -1259,8 +1310,10 @@ class AIService:
         style_hint: str = "",
         branch_count: int = 3,
         workflow_mode: str = "single",
+        task_id: str | None = None,
     ) -> WorkflowState:
         payload: WorkflowState = {
+            "task_id": task_id or "",
             "task_type": task_type,
             "project_id": project_id,
             "node_id": node_id,
@@ -1276,6 +1329,7 @@ class AIService:
         return cast(WorkflowState, result)
 
     def _wf_context_node(self, state: WorkflowState) -> WorkflowState:
+        self._ensure_task_not_cancelled(state)
         project_id = state["project_id"]
         node_id = state["node_id"]
         token_budget = int(state.get("token_budget", 2200))
@@ -1293,6 +1347,7 @@ class AIService:
         }
 
     def _wf_prompt_node(self, state: WorkflowState) -> WorkflowState:
+        self._ensure_task_not_cancelled(state)
         task_type = state["task_type"]
         node = state["node"]
         context = state["context_pack"]
@@ -1315,6 +1370,7 @@ class AIService:
         return {"prompt": prompt}
 
     def _wf_llm_node(self, state: WorkflowState) -> WorkflowState:
+        self._ensure_task_not_cancelled(state)
         task_type = state["task_type"]
         prompt = state["prompt"]
         token_budget = int(state.get("token_budget", 2200))
@@ -1331,6 +1387,7 @@ class AIService:
         return {"llm_response": response}
 
     def _wf_planner_prompt_node(self, state: WorkflowState) -> WorkflowState:
+        self._ensure_task_not_cancelled(state)
         node = state["node"]
         context = state["context_pack"]
         prompt = self._planner_prompt(
@@ -1341,6 +1398,7 @@ class AIService:
         return {"planner_prompt": prompt}
 
     def _wf_planner_llm_node(self, state: WorkflowState) -> WorkflowState:
+        self._ensure_task_not_cancelled(state)
         token_budget = int(state.get("token_budget", 2200))
         response = self._generate(
             task_type="chapter_plan",
@@ -1355,6 +1413,7 @@ class AIService:
         }
 
     def _wf_writer_prompt_node(self, state: WorkflowState) -> WorkflowState:
+        self._ensure_task_not_cancelled(state)
         node = state["node"]
         context = state["context_pack"]
         planner_response = cast(LLMResponse, state["planner_response"])
@@ -1362,6 +1421,7 @@ class AIService:
         return {"writer_prompt": prompt}
 
     def _wf_writer_llm_node(self, state: WorkflowState) -> WorkflowState:
+        self._ensure_task_not_cancelled(state)
         token_budget = int(state.get("token_budget", 2200))
         response = self._generate(
             task_type="chapter_write",
@@ -1376,6 +1436,7 @@ class AIService:
         }
 
     def _wf_reviewer_prompt_node(self, state: WorkflowState) -> WorkflowState:
+        self._ensure_task_not_cancelled(state)
         node = state["node"]
         context = state["context_pack"]
         writer_response = cast(LLMResponse, state["writer_response"])
@@ -1387,6 +1448,7 @@ class AIService:
         return {"reviewer_prompt": prompt}
 
     def _wf_reviewer_llm_node(self, state: WorkflowState) -> WorkflowState:
+        self._ensure_task_not_cancelled(state)
         token_budget = int(state.get("token_budget", 2200))
         response = self._generate(
             task_type="chapter_review",
@@ -1401,6 +1463,7 @@ class AIService:
         }
 
     def _wf_synthesizer_prompt_node(self, state: WorkflowState) -> WorkflowState:
+        self._ensure_task_not_cancelled(state)
         node = state["node"]
         writer_response = cast(LLMResponse, state["writer_response"])
         reviewer_response = cast(LLMResponse, state["reviewer_response"])
@@ -1412,6 +1475,7 @@ class AIService:
         return {"synthesizer_prompt": prompt}
 
     def _wf_synthesizer_llm_node(self, state: WorkflowState) -> WorkflowState:
+        self._ensure_task_not_cancelled(state)
         token_budget = int(state.get("token_budget", 2200))
         response = self._generate(
             task_type="chapter_synthesize",
@@ -1682,6 +1746,16 @@ class AIService:
         task.revision = revision
         self.repository.update_task(task)
 
+    def _set_task_cancelled(self, task: Task, *, message: str = "task cancelled") -> None:
+        task.status = TaskStatus.CANCELLED
+        task.error_code = "cancelled"
+        task.error_message = message
+        if task.started_at is None:
+            task.started_at = utc_now()
+        task.finished_at = utc_now()
+        task.revision = self._project_revision(task.project_id)
+        self.repository.update_task(task)
+
     def _set_task_failed(self, task: Task, exc: Exception) -> None:
         message = str(exc).strip() or exc.__class__.__name__
         code = self._extract_error_code(message)
@@ -1694,6 +1768,8 @@ class AIService:
 
     def _extract_error_code(self, message: str) -> str:
         text = message.lower()
+        if "cancelled" in text or "canceled" in text:
+            return "cancelled"
         if "[auth]" in text or "unauthorized" in text:
             return "auth"
         if "rate_limit" in text or "429" in text:
@@ -1714,6 +1790,17 @@ class AIService:
             self._raise_project_missing(project_id)
         assert project is not None
         return project.active_revision
+
+    def _ensure_task_not_cancelled(self, state: WorkflowState) -> None:
+        task_id = str(state.get("task_id", "")).strip()
+        if not task_id:
+            return
+        if self._is_task_cancelled(task_id):
+            raise RuntimeError("task cancelled")
+
+    def _is_task_cancelled(self, task_id: str) -> bool:
+        task = self.repository.get_task(task_id)
+        return task is not None and task.status == TaskStatus.CANCELLED
 
     def _ensure_project_valid(self, project_id: str) -> None:
         report = self.validation_service.validate_project(project_id)

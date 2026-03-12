@@ -11,7 +11,7 @@ from typing import Any
 from elyha_core.i18n import tr
 from elyha_core.models.edge import Edge
 from elyha_core.models.node import Node, NodeStatus, NodeType
-from elyha_core.models.project import Project, ProjectSettings, project_settings_from_payload
+from elyha_core.models.project import Project, project_settings_from_payload
 from elyha_core.models.snapshot import Snapshot
 from elyha_core.storage.repository import SQLiteRepository
 from elyha_core.utils.clock import utc_now
@@ -136,21 +136,11 @@ class SnapshotService:
                 if isinstance(new_title, str) and new_title.strip():
                     project.title = new_title.strip()
             elif operation.op_type == "project_update_settings":
-                project.settings = ProjectSettings(
-                    allow_cycles=bool(payload.get("allow_cycles", project.settings.allow_cycles)),
-                    auto_snapshot_minutes=int(
-                        payload.get(
-                            "auto_snapshot_minutes",
-                            project.settings.auto_snapshot_minutes,
-                        )
-                    ),
-                    auto_snapshot_operations=int(
-                        payload.get(
-                            "auto_snapshot_operations",
-                            project.settings.auto_snapshot_operations,
-                        )
-                    ),
-                )
+                current = asdict(project.settings)
+                for key in current:
+                    if key in payload:
+                        current[key] = payload[key]
+                project.settings = project_settings_from_payload(current)
             elif operation.op_type in {"graph_add_node", "graph_update_node"}:
                 node_raw = payload.get("node")
                 if isinstance(node_raw, dict):
@@ -175,6 +165,41 @@ class SnapshotService:
                 edge_id = payload.get("edge_id")
                 if isinstance(edge_id, str):
                     edge_map.pop(edge_id, None)
+            elif operation.op_type == "graph_reorder_edges":
+                source_id = payload.get("source_id")
+                raw_order = payload.get("edge_ids")
+                if not isinstance(source_id, str) or not isinstance(raw_order, list):
+                    continue
+                source_edges = [
+                    edge
+                    for edge in edge_map.values()
+                    if edge.source_id == source_id
+                ]
+                if not source_edges:
+                    continue
+                source_edges.sort(
+                    key=lambda item: (
+                        item.narrative_order if item.narrative_order is not None else 10**9,
+                        item.created_at,
+                        item.id,
+                    )
+                )
+                seen: set[str] = set()
+                ordered_ids: list[str] = []
+                for edge_id in raw_order:
+                    if not isinstance(edge_id, str) or edge_id in seen:
+                        continue
+                    edge = edge_map.get(edge_id)
+                    if edge is None or edge.source_id != source_id:
+                        continue
+                    ordered_ids.append(edge_id)
+                    seen.add(edge_id)
+                ordered_ids.extend([edge.id for edge in source_edges if edge.id not in seen])
+                for index, edge_id in enumerate(ordered_ids, start=1):
+                    edge = edge_map.get(edge_id)
+                    if edge is None:
+                        continue
+                    edge.narrative_order = index
 
         project.active_revision = target_revision
         project.updated_at = utc_now()

@@ -46,14 +46,14 @@ export function Header({
         <div className="flex items-center gap-2 px-3 py-1.5 bg-slate-50 rounded-md border border-slate-200 min-w-0">
           <span className={cn('w-2 h-2 rounded-full shadow-[0_0_8px_rgba(16,185,129,0.5)]', busy ? 'bg-amber-500 animate-pulse' : 'bg-emerald-500')} />
           <span className="text-xs font-semibold text-slate-700 truncate max-w-[240px]" title={projectTitle}>
-            Project: {projectTitle || '未选择项目'}
+            {t('web.top.project_label', {title: projectTitle || t('web.top.project_unselected')})}
           </span>
         </div>
 
         {selectedNodeTitle ? (
           <div className="hidden xl:flex items-center gap-2 px-3 py-1.5 bg-pink-50 rounded-md border border-pink-200 min-w-0">
             <span className="text-xs font-semibold text-pink-700 truncate max-w-[220px]" title={selectedNodeTitle}>
-              Node: {selectedNodeTitle}
+              {t('web.top.node_label', {title: selectedNodeTitle})}
             </span>
           </div>
         ) : null}
@@ -67,7 +67,7 @@ export function Header({
             className="flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-medium text-slate-500 hover:text-slate-800 hover:bg-slate-200/50 transition-colors disabled:opacity-50"
           >
             <Undo2 size={16} />
-            <span>回滚快照</span>
+            <span>{t('web.top.rollback_snapshot')}</span>
           </button>
           <div className="w-px h-4 bg-slate-200 mx-1" />
           <button
@@ -76,7 +76,7 @@ export function Header({
             className="flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-medium text-slate-500 hover:text-slate-800 hover:bg-slate-200/50 transition-colors disabled:opacity-50"
           >
             <RefreshCw size={16} />
-            <span>刷新工作区</span>
+            <span>{t('web.top.refresh_workspace')}</span>
           </button>
           <div className="w-px h-4 bg-slate-200 mx-1" />
           <button
@@ -85,7 +85,7 @@ export function Header({
             className="flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-medium text-slate-500 hover:text-slate-800 hover:bg-slate-200/50 transition-colors disabled:opacity-50"
           >
             <Save size={16} />
-            <span>保存快照</span>
+            <span>{t('web.top.save_snapshot')}</span>
           </button>
         </div>
 
@@ -95,7 +95,7 @@ export function Header({
           className="hidden md:flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium text-slate-600 hover:text-slate-900 hover:bg-slate-50 border border-slate-200 transition-colors disabled:opacity-50"
         >
           <AlertTriangle size={16} />
-          <span>校验项目</span>
+          <span>{t('web.top.validate_project')}</span>
         </button>
 
         <button
@@ -141,7 +141,7 @@ export function Header({
           )}
         >
           <MessageSquare size={16} />
-          <span className="hidden sm:inline">AI聊天</span>
+          <span className="hidden sm:inline">{t('web.chat.toggle')}</span>
         </button>
 
         <button
@@ -150,8 +150,8 @@ export function Header({
           className="ml-1 flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium bg-emerald-500 text-white hover:bg-emerald-600 border border-emerald-500 transition-colors shadow-[0_4px_10px_rgba(16,185,129,0.2)] disabled:opacity-50 disabled:cursor-not-allowed"
         >
           <Play size={16} />
-          <span className="hidden sm:inline">生成选中节点</span>
-          <span className="sm:hidden">生成</span>
+          <span className="hidden sm:inline">{t('web.top.generate_selected')}</span>
+          <span className="sm:hidden">{t('web.top.generate')}</span>
         </button>
       </div>
     </header>

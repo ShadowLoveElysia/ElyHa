@@ -20,11 +20,6 @@ import {ContextMenu} from './ContextMenu';
 import type {CreateNodePayload, GraphEdgePayload, GraphNodePayload, NodeType, UpdateNodePayload} from '../types';
 import type {TranslationVars} from '../i18n';
 
-const nodeTypes = {
-  custom: CustomNode,
-  group: GroupNode,
-};
-
 interface WorkspaceProps {
   projectId: string;
   nodes: GraphNodePayload[];
@@ -129,6 +124,13 @@ export function Workspace({
 }: WorkspaceProps) {
   const [rfInstance, setRfInstance] = useState<ReactFlowInstance | null>(null);
   const [menu, setMenu] = useState<{x: number; y: number; type: 'pane' | 'node'; nodeId?: string} | null>(null);
+  const nodeTypes = useMemo(
+    () => ({
+      custom: (props: any) => <CustomNode {...props} t={t} />,
+      group: (props: any) => <GroupNode {...props} t={t} />,
+    }),
+    [t],
+  );
 
   const nodeMap = useMemo(() => {
     return new Map(nodes.map((node) => [node.id, node]));
@@ -250,7 +252,7 @@ export function Workspace({
         const position = rfInstance.screenToFlowPosition({x: menu.x, y: menu.y});
         if (action === 'create-group') {
           await onCreateNode({
-            title: '新建分组节点',
+            title: t('web.node.create_group_title'),
             type: 'group',
             pos_x: position.x,
             pos_y: position.y,
@@ -262,7 +264,7 @@ export function Workspace({
         }
         if (action === 'create-node') {
           await onCreateNode({
-            title: '新建章节节点',
+            title: t('web.node.quick_create_title'),
             type: 'chapter',
             pos_x: position.x,
             pos_y: position.y,
@@ -282,8 +284,8 @@ export function Workspace({
 
         if (action === 'delete') {
           const ok = await onConfirm(
-            '删除节点',
-            `确认删除节点「${targetNode.title}」吗？`,
+            t('web.modal.node_delete_title'),
+            t('web.modal.node_delete_body', {title: targetNode.title}),
             true,
           );
           if (ok) {
@@ -403,10 +405,10 @@ export function Workspace({
         if (action === 'bind') {
           const currentStoryline = targetNode.storyline_id || '';
           const nextStoryline = await onPrompt({
-            title: '绑定剧情线',
-            message: '输入剧情线 ID（留空表示取消绑定）',
+            title: t('web.node.editor.storyline_prompt_title'),
+            message: t('web.node.editor.storyline_prompt_body'),
             defaultValue: currentStoryline,
-            placeholder: '例如：主线A',
+            placeholder: t('web.node.editor.storyline_prompt_placeholder'),
           });
           if (nextStoryline !== null) {
             await onUpdateNode(menu.nodeId, {
@@ -469,7 +471,7 @@ export function Workspace({
   if (!projectId) {
     return (
       <div className="w-full h-full bg-slate-50 flex items-center justify-center text-slate-500">
-        请先在左侧创建或选择项目。
+        {t('web.workspace.select_project_hint')}
       </div>
     );
   }
@@ -500,7 +502,11 @@ export function Workspace({
         }}
         onEdgeDoubleClick={(_event, edge) => {
           void (async () => {
-            const ok = await onConfirm('删除连线', '确认删除这条连线吗？', true);
+            const ok = await onConfirm(
+              t('web.modal.edge_delete_title'),
+              t('web.modal.edge_delete_body', {source: edge.source, target: edge.target}),
+              true,
+            );
             if (ok) {
               void onDeleteEdge(edge.id);
             }
@@ -522,12 +528,19 @@ export function Workspace({
       </ReactFlow>
 
       {menu && (
-        <ContextMenu x={menu.x} y={menu.y} type={menu.type} onClose={() => setMenu(null)} onAction={(action) => void handleMenuAction(action)} />
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          type={menu.type}
+          onClose={() => setMenu(null)}
+          onAction={(action) => void handleMenuAction(action)}
+          t={t}
+        />
       )}
 
       {busy ? (
         <div className="absolute inset-x-0 bottom-0 p-3 flex justify-center pointer-events-none">
-          <div className="px-3 py-1.5 rounded-full text-xs font-semibold bg-slate-900 text-white shadow-lg">正在同步后端数据...</div>
+          <div className="px-3 py-1.5 rounded-full text-xs font-semibold bg-slate-900 text-white shadow-lg">{t('web.workspace.syncing')}</div>
         </div>
       ) : null}
     </div>

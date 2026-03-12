@@ -2,10 +2,11 @@ import React, { useState } from 'react';
 import { NodeResizer, useReactFlow } from '@xyflow/react';
 import { Folder, ArrowDownAZ, ChevronDown, ChevronRight } from 'lucide-react';
 import { cn } from '../utils';
+import type {TranslationVars} from '../i18n';
 
-export function GroupNode({ id, data, selected }: any) {
+export function GroupNode({ id, data, selected, t }: any & { t?: (key: string, vars?: TranslationVars) => string }) {
   const { getNodes, setNodes } = useReactFlow();
-  const label = data?.label || '分组节点';
+  const label = data?.label || (t ? t('web.group.default_label') : 'Group');
   const [collapsed, setCollapsed] = useState(false);
   const [prevSize, setPrevSize] = useState({ width: 360, height: 500 });
 
@@ -75,10 +76,10 @@ export function GroupNode({ id, data, selected }: any) {
           <button 
             onClick={sortChildren} 
             className="flex items-center gap-1 px-2 py-1 text-[10px] font-bold text-pink-600 bg-pink-50 hover:bg-pink-100 rounded-md transition-colors"
-            title="按当前顺序自动排列子节点"
+            title={t ? t('web.group.sort_children_title') : 'Sort children'}
           >
             <ArrowDownAZ size={14} />
-            <span>自然排序</span>
+            <span>{t ? t('web.group.sort_children') : 'Sort'}</span>
           </button>
         )}
       </div>

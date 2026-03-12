@@ -12,7 +12,12 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from elyha_core.i18n import tr
+from elyha_core.i18n import (
+    catalog as i18n_catalog,
+    clear_i18n_cache,
+    normalize_locale,
+    tr,
+)
 from elyha_core.core_config import CORE_PROFILE, CoreConfigManager, CoreRuntimeConfig
 from elyha_core.llm_presets import LLMPreset, load_llm_presets
 from elyha_core.models.task import TaskStatus
@@ -30,6 +35,8 @@ from elyha_core.services.snapshot_service import SnapshotService
 from elyha_core.services.validation_service import ValidationService
 from elyha_core.storage.repository import SQLiteRepository
 from elyha_core.storage.sqlite_store import SQLiteStore
+
+API_KEY_CONFIGURED_PLACEHOLDER = "__ELYHA_API_KEY_CONFIGURED__"
 
 
 @dataclass(slots=True)
@@ -104,7 +111,7 @@ class GenerateChapterRequest(BaseModel):
     node_id: str
     token_budget: int = Field(default=2200, ge=1)
     style_hint: str = ""
-    workflow_mode: str = "multi_agent"
+    workflow_mode: str | None = None
 
 
 class GenerateBranchesRequest(BaseModel):
@@ -282,7 +289,11 @@ def _to_runtime_config_payload(config: CoreRuntimeConfig) -> dict[str, Any]:
         "locale": config.locale,
         "llm_provider": config.llm_provider,
         "api_url": config.api_url,
-        "api_key": config.api_key,
+        "api_key": (
+            API_KEY_CONFIGURED_PLACEHOLDER
+            if str(config.api_key).strip()
+            else ""
+        ),
         "model_name": config.model_name,
         "auto_complete": config.auto_complete,
         "think_switch": config.think_switch,
@@ -454,6 +465,11 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             for preset in services.llm_presets.values()
         ]
 
+    @api.get("/api/i18n/{locale}")
+    def get_i18n_catalog(locale: str) -> dict[str, str]:
+        clear_i18n_cache()
+        return i18n_catalog(normalize_locale(locale))
+
     @api.get("/api/settings/runtime")
     def get_runtime_settings() -> dict[str, Any]:
         profile, config = services.core_config_manager.load_active()
@@ -472,6 +488,8 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 raise PermissionError("core profile is read-only")
             merged = asdict(current)
             for key, value in patch.items():
+                if key == "api_key" and value == API_KEY_CONFIGURED_PLACEHOLDER:
+                    continue
                 merged[key] = value
             candidate = CoreRuntimeConfig(**merged).normalized()
             _apply_runtime_config(candidate)
@@ -777,14 +795,20 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     @api.post("/api/generate/chapter")
     def generate_chapter(payload: GenerateChapterRequest) -> dict[str, Any]:
         try:
+            workflow_mode = str(payload.workflow_mode or "").strip()
+            if not workflow_mode:
+                _, active_config = services.core_config_manager.load_active()
+                workflow_mode = active_config.default_workflow_mode
             result = services.ai_service.generate_chapter(
                 payload.project_id,
                 payload.node_id,
                 token_budget=payload.token_budget,
                 style_hint=payload.style_hint,
-                workflow_mode=payload.workflow_mode,
+                workflow_mode=workflow_mode,
             )
-        except (KeyError, ValueError) as exc:
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -810,7 +834,9 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 n=payload.n,
                 token_budget=payload.token_budget,
             )
-        except (KeyError, ValueError) as exc:
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -829,7 +855,9 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 node_id=payload.node_id,
                 token_budget=payload.token_budget,
             )
-        except (KeyError, ValueError) as exc:
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -859,7 +887,9 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 tone=payload.tone,
                 token_budget=payload.token_budget,
             )
-        except (KeyError, ValueError) as exc:
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -888,7 +918,9 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 token_budget=payload.token_budget,
                 max_nodes=payload.max_nodes,
             )
-        except (KeyError, ValueError) as exc:
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -919,7 +951,9 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 tone=payload.tone,
                 token_budget=payload.token_budget,
             )
-        except (KeyError, ValueError) as exc:
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -943,7 +977,9 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 tone=payload.tone,
                 token_budget=payload.token_budget,
             )
-        except (KeyError, ValueError) as exc:
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -988,7 +1024,9 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 payload.node_id,
                 token_budget=payload.token_budget,
             )
-        except (KeyError, ValueError) as exc:
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -1011,7 +1049,9 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 payload.node_id,
                 token_budget=payload.token_budget,
             )
-        except (KeyError, ValueError) as exc:
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc

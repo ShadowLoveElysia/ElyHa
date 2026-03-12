@@ -42,16 +42,16 @@ import type {
   WorkflowMode,
 } from './types';
 
-function errorToText(error: unknown): string {
+function errorToText(error: unknown, fallback = 'Unknown error'): string {
   if (error instanceof Error) {
     return error.message;
   }
-  return String(error || '未知错误');
+  return String(error || fallback);
 }
 
-function nodeMainText(metadata: unknown): string {
+function nodeMainText(metadata: unknown, emptyText: string): string {
   if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
-    return '该节点暂无正文。';
+    return emptyText;
   }
   const record = metadata as Record<string, unknown>;
   const content = typeof record.content === 'string' ? record.content : '';
@@ -62,7 +62,7 @@ function nodeMainText(metadata: unknown): string {
   if (summary.trim()) {
     return summary;
   }
-  return '该节点暂无正文。';
+  return emptyText;
 }
 
 interface NoticeState {
@@ -259,12 +259,12 @@ export default function App() {
       try {
         await task();
       } catch (error) {
-        setStatus(`${failPrefix}: ${errorToText(error)}`, true);
+        setStatus(`${failPrefix}: ${errorToText(error, t('web.error.unknown'))}`, true);
       } finally {
         setBusyCount((value) => Math.max(0, value - 1));
       }
     },
-    [setStatus],
+    [setStatus, t],
   );
 
   const applyLocale = useCallback(async (targetLocale: string) => {
@@ -316,14 +316,14 @@ export default function App() {
     }
     await execute(async () => {
       await loadProjectBundle(projectId);
-      setStatus('工作区已刷新');
-    }, '刷新工作区失败');
+      setStatus(t('web.toast.workspace_refreshed'));
+    }, t('web.error.workspace_refresh_failed'));
   }, [execute, loadProjectBundle, projectId, setStatus]);
 
   useEffect(() => {
     void execute(async () => {
       await refreshProjects();
-    }, '加载项目列表失败');
+    }, t('web.error.project_list_load_failed'));
   }, [execute, refreshProjects]);
 
   useEffect(() => {
@@ -337,7 +337,7 @@ export default function App() {
     }
     void execute(async () => {
       await loadProjectBundle(projectId);
-    }, '加载项目数据失败');
+    }, t('web.error.project_load_failed'));
   }, [execute, loadProjectBundle, projectId]);
 
   useEffect(() => {
@@ -375,10 +375,10 @@ export default function App() {
         const created = await createProject(title.trim());
         await refreshProjects(created.id);
         await loadProjectBundle(created.id);
-        setStatus(`已创建项目：${created.title}`);
-      }, '创建项目失败');
+        setStatus(t('web.toast.project_created', {title: created.title}));
+      }, t('web.error.project_create_failed'));
     },
-    [execute, loadProjectBundle, refreshProjects, setStatus],
+    [execute, loadProjectBundle, refreshProjects, setStatus, t],
   );
 
   const handleDeleteProject = useCallback(
@@ -386,20 +386,20 @@ export default function App() {
       await execute(async () => {
         await deleteProject(targetProjectId);
         await refreshProjects();
-        setStatus('项目已删除');
-      }, '删除项目失败');
+        setStatus(t('web.toast.project_deleted'));
+      }, t('web.error.project_delete_failed'));
     },
-    [execute, refreshProjects, setStatus],
+    [execute, refreshProjects, setStatus, t],
   );
 
   const handleQuickCreateNode = useCallback(async () => {
     if (!projectId) {
-      setStatus('请先选择项目', true);
+      setStatus(t('web.toast.project_required'), true);
       return;
     }
     await execute(async () => {
       const created = await createNode(projectId, {
-        title: '新建章节节点',
+        title: t('web.node.quick_create_title'),
         type: 'chapter',
         metadata: {
           content: '',
@@ -408,86 +408,86 @@ export default function App() {
       });
       await loadProjectBundle(projectId);
       setSelectedNodeId(created.id);
-      setStatus('节点已创建');
-    }, '创建节点失败');
-  }, [execute, loadProjectBundle, projectId, setStatus]);
+      setStatus(t('web.toast.node_created'));
+    }, t('web.error.node_create_failed'));
+  }, [execute, loadProjectBundle, projectId, setStatus, t]);
 
   const handleCreateNode = useCallback(
     async (payload: CreateNodePayload) => {
       if (!projectId) {
-        setStatus('请先选择项目', true);
+        setStatus(t('web.toast.project_required'), true);
         return;
       }
       await execute(async () => {
         const created = await createNode(projectId, payload);
         await loadProjectBundle(projectId);
         setSelectedNodeId(created.id);
-      }, '创建节点失败');
+      }, t('web.error.node_create_failed'));
     },
-    [execute, loadProjectBundle, projectId, setStatus],
+    [execute, loadProjectBundle, projectId, setStatus, t],
   );
 
   const handleUpdateNode = useCallback(
     async (nodeId: string, payload: UpdateNodePayload) => {
       if (!projectId) {
-        setStatus('请先选择项目', true);
+        setStatus(t('web.toast.project_required'), true);
         return;
       }
       await execute(async () => {
         const updated = await updateNode(projectId, nodeId, payload);
         setNodes((prev) => prev.map((item) => (item.id === updated.id ? updated : item)));
-      }, '更新节点失败');
+      }, t('web.error.node_update_failed'));
     },
-    [execute, projectId, setStatus],
+    [execute, projectId, setStatus, t],
   );
 
   const handleDeleteNode = useCallback(
     async (nodeId: string) => {
       if (!projectId) {
-        setStatus('请先选择项目', true);
+        setStatus(t('web.toast.project_required'), true);
         return;
       }
       await execute(async () => {
         await deleteNode(projectId, nodeId);
         setNodes((prev) => prev.filter((item) => item.id !== nodeId));
         setEdges((prev) => prev.filter((item) => item.source_id !== nodeId && item.target_id !== nodeId));
-      }, '删除节点失败');
+      }, t('web.error.node_delete_failed'));
     },
-    [execute, projectId, setStatus],
+    [execute, projectId, setStatus, t],
   );
 
   const handleCreateEdge = useCallback(
     async (sourceId: string, targetId: string, label = '') => {
       if (!projectId) {
-        setStatus('请先选择项目', true);
+        setStatus(t('web.toast.project_required'), true);
         return;
       }
       await execute(async () => {
         const created = await createEdge(projectId, sourceId, targetId, label);
         setEdges((prev) => [...prev, created]);
-      }, '创建连线失败');
+      }, t('web.error.edge_create_failed'));
     },
-    [execute, projectId, setStatus],
+    [execute, projectId, setStatus, t],
   );
 
   const handleDeleteEdge = useCallback(
     async (edgeId: string) => {
       if (!projectId) {
-        setStatus('请先选择项目', true);
+        setStatus(t('web.toast.project_required'), true);
         return;
       }
       await execute(async () => {
         await deleteEdge(projectId, edgeId);
         setEdges((prev) => prev.filter((item) => item.id !== edgeId));
-      }, '删除连线失败');
+      }, t('web.error.edge_delete_failed'));
     },
-    [execute, projectId, setStatus],
+    [execute, projectId, setStatus, t],
   );
 
   const handleDeleteEdgeBetween = useCallback(
     async (leftNodeId: string, rightNodeId: string) => {
       if (!projectId) {
-        setStatus('请先选择项目', true);
+        setStatus(t('web.toast.project_required'), true);
         return;
       }
       await execute(async () => {
@@ -590,19 +590,19 @@ export default function App() {
 
   const handleSnapshot = useCallback(async () => {
     if (!projectId) {
-      setStatus('请先选择项目', true);
+      setStatus(t('web.toast.project_required'), true);
       return;
     }
     await execute(async () => {
       const snap = await createSnapshot(projectId);
-      setStatus(`快照已保存 revision=${snap.revision}`);
+      setStatus(t('web.toast.snapshot', {revision: snap.revision}));
       await loadProjectBundle(projectId);
-    }, '保存快照失败');
-  }, [execute, loadProjectBundle, projectId, setStatus]);
+    }, t('web.error.snapshot_save_failed'));
+  }, [execute, loadProjectBundle, projectId, setStatus, t]);
 
   const handleRollback = useCallback(async () => {
     if (!projectId || !project) {
-      setStatus('请先选择项目', true);
+      setStatus(t('web.toast.project_required'), true);
       return;
     }
     await execute(async () => {
@@ -612,56 +612,77 @@ export default function App() {
         .filter((item) => item.revision < activeRevision)
         .sort((a, b) => b.revision - a.revision)[0];
       if (!target) {
-        setStatus('没有可回滚的更早快照');
+        setStatus(t('web.toast.rollback_snapshot_missing'));
         return;
       }
       await rollbackProject(projectId, target.revision);
       await loadProjectBundle(projectId);
-      setStatus(`已回滚到 revision=${target.revision}`);
-    }, '回滚失败');
-  }, [execute, loadProjectBundle, project, projectId, setStatus]);
+      setStatus(t('web.toast.rolled_back', {revision: target.revision}));
+    }, t('web.error.rollback_failed'));
+  }, [execute, loadProjectBundle, project, projectId, setStatus, t]);
 
   const handleValidate = useCallback(async () => {
     if (!projectId) {
-      setStatus('请先选择项目', true);
+      setStatus(t('web.toast.project_required'), true);
       return;
     }
     await execute(async () => {
       const report = await validateProject(projectId);
-      setStatus(`校验完成：错误 ${report.errors}，警告 ${report.warnings}，信息 ${report.infos}`);
-    }, '校验失败');
-  }, [execute, projectId, setStatus]);
+      setStatus(
+        t('web.toast.validation_done', {
+          errors: report.errors,
+          warnings: report.warnings,
+          infos: report.infos,
+        }),
+      );
+    }, t('web.error.validation_failed'));
+  }, [execute, projectId, setStatus, t]);
 
   const generateNodeById = useCallback(
     async (nodeId: string) => {
       if (!projectId || !nodeId) {
-        setStatus('请先选择一个节点', true);
+        setStatus(t('web.toast.node_required'), true);
         return;
       }
       await execute(async () => {
-        const result = await generateChapter(projectId, nodeId);
+        const result = await generateChapter(
+          projectId,
+          nodeId,
+          2200,
+          settingsDraft.default_workflow_mode,
+        );
         await loadProjectBundle(projectId);
-        setStatus(`生成完成：${result.provider} / revision ${result.revision}`);
-      }, '节点生成失败');
+        setStatus(
+          t('web.toast.generate_done', {
+            provider: result.provider,
+            revision: result.revision,
+          }),
+        );
+      }, t('web.error.generate_node_failed'));
     },
-    [execute, loadProjectBundle, projectId, setStatus],
+    [execute, loadProjectBundle, projectId, setStatus, settingsDraft.default_workflow_mode, t],
   );
 
   const handleGenerateSelected = useCallback(async () => {
     if (!selectedNodeId) {
-      setStatus('请先选择一个节点', true);
+      setStatus(t('web.toast.node_required'), true);
       return;
     }
     await generateNodeById(selectedNodeId);
-  }, [generateNodeById, selectedNodeId, setStatus]);
+  }, [generateNodeById, selectedNodeId, setStatus, t]);
 
   const handleCreateSuggestionNode = useCallback(
     async (option: AiSuggestedOption) => {
       if (!projectId) {
-        setStatus('请先选择项目', true);
+        setStatus(t('web.toast.project_required'), true);
         return;
       }
       await execute(async () => {
+        if (option.suggested_node_id) {
+          await loadProjectBundle(projectId);
+          setSelectedNodeId(option.suggested_node_id);
+          return;
+        }
         const content = option.description || option.summary || '';
         const metadata: Record<string, unknown> = {
           content,
@@ -671,15 +692,15 @@ export default function App() {
           metadata.outline_markdown = option.outline_steps;
         }
         const created = await createNode(projectId, {
-          title: option.title || 'AI 建议节点',
+          title: option.title || t('web.chat.suggestion_node_default_title'),
           type: 'chapter',
           metadata,
         });
         setNodes((prev) => [...prev, created]);
         setSelectedNodeId(created.id);
-      }, '创建建议节点失败');
+      }, t('web.error.suggestion_create_failed'));
     },
-    [execute, projectId, setStatus],
+    [execute, loadProjectBundle, projectId, setStatus, t],
   );
 
   const refreshInsights = useCallback(async () => {
@@ -692,11 +713,11 @@ export default function App() {
       const payload = await fetchProjectInsights(projectId);
       setInsights(payload);
     } catch (error) {
-      setStatus(`加载图谱失败: ${errorToText(error)}`, true);
+      setStatus(`${t('web.error.graph_load_failed')}: ${errorToText(error, t('web.error.unknown'))}`, true);
     } finally {
       setInsightsLoading(false);
     }
-  }, [projectId, setStatus]);
+  }, [projectId, setStatus, t]);
 
   useEffect(() => {
     if (activeTab !== 'graph' || !projectId) {
@@ -716,7 +737,7 @@ export default function App() {
       const payload = await loadRuntimeSettings();
       await applyLocale(payload.config.locale);
       await loadLlmPresetList();
-    }, '加载运行设置失败');
+    }, t('web.error.runtime_load_failed'));
   }, [applyLocale, execute, loadLlmPresetList, loadRuntimeSettings]);
 
   useEffect(() => {
@@ -725,7 +746,7 @@ export default function App() {
     }
     void execute(async () => {
       await loadRuntimeSettings();
-    }, '加载运行设置失败');
+    }, t('web.error.runtime_load_failed'));
   }, [activeTab, execute, loadRuntimeSettings, runtimeSettings]);
 
   const saveRuntime = useCallback(async () => {
@@ -742,7 +763,7 @@ export default function App() {
       applyRuntimeSettings(payload);
       await applyLocale(payload.config.locale);
       setStatus(t('web.toast.runtime_saved'));
-    }, '保存运行设置失败');
+    }, t('web.error.runtime_save_failed'));
   }, [applyLocale, applyRuntimeSettings, execute, setStatus, settingsDraft, t]);
 
   const llmSchemeOptions = useMemo(() => {
@@ -803,7 +824,7 @@ export default function App() {
           applyRuntimeSettings(payload);
           await applyLocale(payload.config.locale);
           setStatus(t('web.toast.runtime_profile_switched', {profile}));
-        }, '切换预设失败');
+        }, t('web.error.runtime_profile_switch_failed'));
         return;
       }
       setSelectedLlmScheme(nextValue);
@@ -837,7 +858,7 @@ export default function App() {
       await applyLocale(saved.config.locale);
       setSelectedLlmScheme(`profile:${profileName}`);
       setStatus(t('web.toast.runtime_profile_created', {profile: profileName}));
-    }, '创建预设失败');
+    }, t('web.error.runtime_profile_create_failed'));
   }, [applyLocale, applyRuntimeSettings, askPrompt, execute, runtimeSettings?.active_profile, setStatus, settingsDraft, t]);
 
   const handleSwitchLanguage = useCallback(async () => {
@@ -857,7 +878,7 @@ export default function App() {
       await applyLocale(selected);
       const nextLabel = SUPPORTED_LOCALES.find((item) => item.value === selected)?.label || selected;
       setStatus(t('web.toast.language_switched', {locale: nextLabel}));
-    }, '切换语言失败');
+    }, t('web.error.language_switch_failed'));
   }, [applyLocale, applyRuntimeSettings, askSelect, execute, locale, setStatus, t]);
 
   return (
@@ -872,6 +893,7 @@ export default function App() {
         onDeleteProject={handleDeleteProject}
         onQuickCreateNode={handleQuickCreateNode}
         onConfirm={askConfirm}
+        t={t}
       />
 
       <div className="flex-1 flex flex-col relative overflow-hidden">
@@ -922,29 +944,35 @@ export default function App() {
           {activeTab === 'outline' && (
             <div className="h-full overflow-y-auto p-6">
               <div className="max-w-5xl mx-auto bg-white rounded-2xl border border-slate-200 shadow-sm p-6">
-                <h2 className="text-xl font-bold text-slate-800">大纲视图</h2>
-                <p className="text-sm text-slate-500 mt-1">当前阶段先展示选中节点正文，下一阶段会接入完整大纲拆解流程。</p>
+                <h2 className="text-xl font-bold text-slate-800">{t('web.outline.view_title')}</h2>
+                <p className="text-sm text-slate-500 mt-1">{t('web.outline.view_description')}</p>
                 <div className="mt-5 rounded-xl bg-slate-50 border border-slate-200 p-4 min-h-[320px] whitespace-pre-wrap text-sm leading-relaxed text-slate-700">
                   {selectedNode
-                    ? nodeMainText(selectedNode.metadata)
-                    : '请先在工作区选择一个节点。'}
+                    ? nodeMainText(selectedNode.metadata, t('web.outline.node_empty'))
+                    : t('web.outline.select_node_hint')}
                 </div>
               </div>
             </div>
           )}
 
           {activeTab === 'graph' && (
-            <KnowledgeGraph projectId={projectId} insights={insights} loading={insightsLoading} onRefresh={refreshInsights} />
+            <KnowledgeGraph
+              projectId={projectId}
+              insights={insights}
+              loading={insightsLoading}
+              onRefresh={refreshInsights}
+              t={t}
+            />
           )}
 
           {activeTab === 'settings' && (
             <div className="h-full overflow-y-auto p-6">
               <div className="max-w-4xl mx-auto bg-white rounded-2xl border border-slate-200 shadow-sm p-6">
-                <h2 className="text-xl font-bold text-slate-800">运行设置</h2>
-                <p className="text-sm text-slate-500 mt-1">此面板直接读写后端 `/api/settings/runtime`。</p>
+                <h2 className="text-xl font-bold text-slate-800">{t('web.section.runtime')}</h2>
+                <p className="text-sm text-slate-500 mt-1">{t('web.runtime.panel_hint')}</p>
 
                 {!runtimeSettings ? (
-                  <div className="mt-5 text-slate-500">加载设置中...</div>
+                  <div className="mt-5 text-slate-500">{t('web.runtime.loading')}</div>
                 ) : (
                   <div className="mt-5 grid grid-cols-1 md:grid-cols-2 gap-4">
                     <FormRow label={t('web.runtime.active_profile')}>
@@ -998,7 +1026,7 @@ export default function App() {
                         type="password"
                         value={settingsDraft.api_key}
                         onChange={(event) => setSettingsDraft((prev) => ({...prev, api_key: event.target.value}))}
-                        placeholder="****************"
+                        placeholder={t('web.runtime.api_key_placeholder')}
                         autoComplete="new-password"
                         className="w-full h-10 rounded-lg border border-slate-200 px-3 text-sm"
                       />
@@ -1023,6 +1051,18 @@ export default function App() {
                       </select>
                     </FormRow>
 
+                    <div className="md:col-span-2 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+                      <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                        {t('web.runtime.workflow_mode_guide_title')}
+                      </p>
+                      <ul className="mt-2 list-disc space-y-1 pl-5 text-sm leading-relaxed text-slate-700">
+                        <li>{t('web.runtime.workflow_mode_guide_multi')}</li>
+                        <li>{t('web.runtime.workflow_mode_guide_single')}</li>
+                        <li>{t('web.runtime.workflow_mode_guide_node_auto')}</li>
+                        <li>{t('web.runtime.workflow_mode_guide_control')}</li>
+                      </ul>
+                    </div>
+
                     <div className="md:col-span-2 flex items-center gap-2 mt-1">
                       <input
                         id="web_search_enabled"
@@ -1043,7 +1083,7 @@ export default function App() {
                         onClick={() => void saveRuntime()}
                         className="h-10 px-5 rounded-lg bg-pink-500 text-white text-sm font-semibold hover:bg-pink-600"
                       >
-                        保存设置
+                        {t('web.runtime.save')}
                       </button>
                     </div>
                   </div>
@@ -1061,12 +1101,14 @@ export default function App() {
           onCreateSuggestionNode={handleCreateSuggestionNode}
           onRefreshProject={refreshCurrentProject}
           onStatus={setStatus}
+          t={t}
         />
 
         <WindowDialog
           dialog={dialog}
           onConfirm={(value) => resolveDialog({confirmed: true, value: value || ''})}
           onCancel={() => resolveDialog({confirmed: false, value: ''})}
+          t={t}
         />
 
         {notice ? (

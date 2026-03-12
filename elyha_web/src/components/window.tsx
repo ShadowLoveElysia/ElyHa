@@ -1,6 +1,7 @@
 import React, {useEffect, useState} from 'react';
 import {AlertTriangle} from 'lucide-react';
 import {cn} from '../utils';
+import type {TranslationVars} from '../i18n';
 
 export type WindowDialogType = 'alert' | 'confirm' | 'prompt' | 'select';
 export interface WindowDialogOption {
@@ -25,9 +26,10 @@ interface WindowDialogProps {
   dialog: WindowDialogState | null;
   onConfirm: (value?: string) => void;
   onCancel: () => void;
+  t?: (key: string, vars?: TranslationVars) => string;
 }
 
-export function WindowDialog({dialog, onConfirm, onCancel}: WindowDialogProps) {
+export function WindowDialog({dialog, onConfirm, onCancel, t}: WindowDialogProps) {
   const [value, setValue] = useState('');
 
   useEffect(() => {
@@ -78,8 +80,8 @@ export function WindowDialog({dialog, onConfirm, onCancel}: WindowDialogProps) {
     return null;
   }
 
-  const confirmText = dialog.confirmText || (dialog.type === 'prompt' ? '确认' : '确定');
-  const cancelText = dialog.cancelText || '取消';
+  const confirmText = dialog.confirmText || (t ? t('web.modal.confirm') : 'Confirm');
+  const cancelText = dialog.cancelText || (t ? t('web.modal.cancel') : 'Cancel');
   const isDanger = Boolean(dialog.danger);
 
   return (

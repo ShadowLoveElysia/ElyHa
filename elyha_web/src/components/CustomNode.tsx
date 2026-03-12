@@ -2,6 +2,7 @@ import React, {useEffect, useState} from 'react';
 import {Handle, Position} from '@xyflow/react';
 import {FileText, Sparkles, Settings2, Play, ChevronDown, ChevronUp, Save} from 'lucide-react';
 import {cn} from '../utils';
+import type {TranslationVars} from '../i18n';
 
 interface CustomNodeData {
   label: string;
@@ -14,9 +15,15 @@ interface CustomNodeData {
   onRun?: () => Promise<void>;
 }
 
-export function CustomNode({data, selected}: {data: CustomNodeData; selected: boolean}) {
+interface CustomNodeProps {
+  data: CustomNodeData;
+  selected: boolean;
+  t?: (key: string, vars?: TranslationVars) => string;
+}
+
+export function CustomNode({data, selected, t}: CustomNodeProps) {
   const safeData = data || ({} as CustomNodeData);
-  const label = safeData.label || '未命名节点';
+  const label = safeData.label || (t ? t('web.node.untitled') : 'Untitled');
   const nodeType = safeData.nodeType || 'chapter';
   const nodeTypeLabel = safeData.nodeTypeLabel || nodeType;
   const kind = safeData.type === 'generation' ? 'generation' : 'document';
@@ -84,7 +91,7 @@ export function CustomNode({data, selected}: {data: CustomNodeData; selected: bo
         <button
           className="text-slate-400 hover:text-slate-600 transition-colors"
           onClick={() => setEditing((value) => !value)}
-          title="编辑内容"
+          title={t ? t('web.node.edit_content') : 'Edit'}
         >
           <Settings2 size={14} />
         </button>
@@ -97,7 +104,7 @@ export function CustomNode({data, selected}: {data: CustomNodeData; selected: bo
               value={draftContent}
               onChange={(event) => setDraftContent(event.target.value)}
               className="w-full min-h-[120px] rounded-lg border border-slate-200 px-3 py-2 text-xs text-slate-700 focus:outline-none focus:ring-2 focus:ring-pink-300"
-              placeholder="输入节点内容"
+              placeholder={t ? t('web.node.content_placeholder') : 'Input content'}
             />
             <div className="flex items-center justify-end gap-2">
               <button
@@ -107,7 +114,7 @@ export function CustomNode({data, selected}: {data: CustomNodeData; selected: bo
                 }}
                 className="px-2.5 py-1.5 rounded-md text-xs font-semibold text-slate-500 hover:bg-slate-100"
               >
-                取消
+                {t ? t('web.modal.cancel') : 'Cancel'}
               </button>
               <button
                 onClick={() => void saveContent()}
@@ -115,14 +122,14 @@ export function CustomNode({data, selected}: {data: CustomNodeData; selected: bo
                 className="flex items-center gap-1 px-2.5 py-1.5 rounded-md text-xs font-semibold text-white bg-pink-500 hover:bg-pink-600 disabled:opacity-50"
               >
                 <Save size={12} />
-                保存
+                {t ? t('web.runtime.save') : 'Save'}
               </button>
             </div>
           </div>
         ) : (
           <div className="relative">
             <p className={cn('text-xs text-slate-600 leading-relaxed whitespace-pre-wrap transition-all duration-200', !expanded && 'line-clamp-4')}>
-              {content || '节点暂无正文，点击右上角设置按钮编辑。'}
+              {content || (t ? t('web.node.empty_content') : 'No content')}
             </p>
             <button
               onClick={() => setExpanded(!expanded)}
@@ -130,11 +137,11 @@ export function CustomNode({data, selected}: {data: CustomNodeData; selected: bo
             >
               {expanded ? (
                 <>
-                  <ChevronUp size={12} /> 收起内容
+                  <ChevronUp size={12} /> {t ? t('web.node.collapse_content') : 'Collapse'}
                 </>
               ) : (
                 <>
-                  <ChevronDown size={12} /> 展开全部
+                  <ChevronDown size={12} /> {t ? t('web.node.expand_content') : 'Expand'}
                 </>
               )}
             </button>
@@ -164,7 +171,7 @@ export function CustomNode({data, selected}: {data: CustomNodeData; selected: bo
             className="flex items-center gap-1 text-xs font-bold text-pink-600 hover:text-pink-700 transition-colors bg-pink-50 hover:bg-pink-100 px-2.5 py-1.5 rounded-md disabled:opacity-50"
           >
             <Play size={12} />
-            <span>{busy ? '运行中' : '运行'}</span>
+            <span>{busy ? (t ? t('web.node.running') : 'Running') : (t ? t('web.node.run') : 'Run')}</span>
           </button>
         </div>
       </div>

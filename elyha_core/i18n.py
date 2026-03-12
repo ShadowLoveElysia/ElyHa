@@ -59,6 +59,13 @@ def clear_i18n_cache() -> None:
     _load_catalogs.cache_clear()
 
 
+def catalog(locale: str | None = None) -> dict[str, str]:
+    """Return a copy of one locale catalog with normalization."""
+    chosen = normalize_locale(locale if locale is not None else os.getenv("ELYHA_LOCALE"))
+    catalogs = _load_catalogs()
+    return dict(catalogs.get(chosen, {}))
+
+
 def tr(key: str, *, locale: str | None = None, **kwargs: object) -> str:
     chosen = normalize_locale(locale if locale is not None else os.getenv("ELYHA_LOCALE"))
     catalogs = _load_catalogs()

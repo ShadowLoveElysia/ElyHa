@@ -10,13 +10,7 @@ import {
 } from 'lucide-react';
 import {cn} from '../utils';
 import type {ProjectPayload} from '../types';
-
-const navItems = [
-  {icon: LayoutDashboard, label: '工作区', id: 'workspace'},
-  {icon: ListTree, label: '大纲', id: 'outline'},
-  {icon: Network, label: '关系图谱', id: 'graph'},
-  {icon: Settings, label: '设置', id: 'settings'},
-];
+import type {TranslationVars} from '../i18n';
 
 interface SidebarProps {
   activeTab: string;
@@ -28,6 +22,7 @@ interface SidebarProps {
   onDeleteProject: (id: string) => Promise<void>;
   onQuickCreateNode: () => Promise<void>;
   onConfirm: (title: string, message: string, danger?: boolean) => Promise<boolean>;
+  t: (key: string, vars?: TranslationVars) => string;
 }
 
 export function Sidebar({
@@ -40,11 +35,18 @@ export function Sidebar({
   onDeleteProject,
   onQuickCreateNode,
   onConfirm,
+  t,
 }: SidebarProps) {
   const [newProjectTitle, setNewProjectTitle] = useState('');
   const [busy, setBusy] = useState(false);
 
   const currentProject = projects.find((item) => item.id === currentProjectId) || null;
+  const navItems = [
+    {icon: LayoutDashboard, label: t('web.nav.workspace'), id: 'workspace'},
+    {icon: ListTree, label: t('web.nav.outline'), id: 'outline'},
+    {icon: Network, label: t('web.nav.graph'), id: 'graph'},
+    {icon: Settings, label: t('web.nav.settings'), id: 'settings'},
+  ];
 
   const handleCreateProject = async () => {
     const title = newProjectTitle.trim();
@@ -65,8 +67,8 @@ export function Sidebar({
       return;
     }
     const ok = await onConfirm(
-      '删除项目',
-      `确认删除项目「${currentProject.title}」吗？此操作不可撤销。`,
+      t('web.modal.project_delete_title'),
+      t('web.modal.project_delete_body', {title: currentProject.title}),
       true,
     );
     if (!ok) {
@@ -119,13 +121,13 @@ export function Sidebar({
 
       <div className="p-3 border-t border-slate-200 flex flex-col gap-2">
         <div className="hidden lg:block">
-          <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1">当前项目</label>
+          <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1">{t('web.project.current')}</label>
           <select
             value={currentProjectId}
             onChange={(event) => onSelectProject(event.target.value)}
             className="w-full h-9 px-2 rounded-lg border border-slate-200 bg-white text-sm text-slate-700 focus:outline-none focus:ring-2 focus:ring-pink-300"
           >
-            {projects.length === 0 && <option value="">暂无项目</option>}
+            {projects.length === 0 && <option value="">{t('web.project.no_projects')}</option>}
             {projects.map((project) => (
               <option key={project.id} value={project.id}>
                 {project.title}
@@ -140,7 +142,7 @@ export function Sidebar({
           className="flex items-center justify-center lg:justify-start h-10 lg:px-3 rounded-lg text-slate-500 hover:bg-slate-50 hover:text-slate-900 transition-colors group relative font-medium disabled:opacity-50 disabled:cursor-not-allowed"
         >
           <PlusSquare size={20} className="shrink-0 text-slate-400 group-hover:text-slate-600" />
-          <span className="ml-3 text-sm hidden lg:block">新建节点</span>
+          <span className="ml-3 text-sm hidden lg:block">{t('web.sidebar.quick_create_node')}</span>
         </button>
 
         <button
@@ -149,14 +151,14 @@ export function Sidebar({
           className="flex items-center justify-center lg:justify-start h-10 lg:px-3 rounded-lg text-red-500 hover:bg-red-50 hover:text-red-700 transition-colors group relative font-medium disabled:opacity-50 disabled:cursor-not-allowed"
         >
           <Trash2 size={20} className="shrink-0" />
-          <span className="ml-3 text-sm hidden lg:block">删除项目</span>
+          <span className="ml-3 text-sm hidden lg:block">{t('web.project.delete')}</span>
         </button>
 
         <div className="hidden lg:flex items-center gap-2 pt-1">
           <input
             value={newProjectTitle}
             onChange={(event) => setNewProjectTitle(event.target.value)}
-            placeholder="新项目名称"
+            placeholder={t('web.project.new_placeholder')}
             className="flex-1 h-9 px-3 rounded-lg border border-slate-200 bg-white text-sm text-slate-700 focus:outline-none focus:ring-2 focus:ring-pink-300"
             onKeyDown={(event) => {
               if (event.key === 'Enter') {
@@ -169,7 +171,7 @@ export function Sidebar({
             onClick={() => void handleCreateProject()}
             disabled={!newProjectTitle.trim() || busy}
             className="h-9 px-3 rounded-lg bg-pink-500 text-white text-sm font-semibold hover:bg-pink-600 disabled:opacity-50 disabled:cursor-not-allowed"
-            title="新建项目"
+            title={t('web.project.create')}
           >
             <FolderOpen size={16} />
           </button>

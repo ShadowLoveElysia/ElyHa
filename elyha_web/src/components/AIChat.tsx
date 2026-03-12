@@ -3,6 +3,7 @@ import {Send, Bot, User, X, Sparkles, MoreHorizontal, PlusCircle, ShieldCheck} f
 import {cn} from '../utils';
 import {sendAiChat} from '../api';
 import type {AiSuggestedOption} from '../types';
+import type {TranslationVars} from '../i18n';
 
 interface ChatMessage {
   id: string;
@@ -19,13 +20,14 @@ interface AIChatProps {
   onCreateSuggestionNode?: (option: AiSuggestedOption) => Promise<void>;
   onRefreshProject?: () => Promise<void>;
   onStatus?: (text: string, isError?: boolean) => void;
+  t: (key: string, vars?: TranslationVars) => string;
 }
 
-function errorToText(error: unknown): string {
+function errorToText(error: unknown, fallback = 'Unknown error'): string {
   if (error instanceof Error) {
     return error.message;
   }
-  return String(error || '未知错误');
+  return String(error || fallback);
 }
 
 export function AIChat({
@@ -36,18 +38,27 @@ export function AIChat({
   onCreateSuggestionNode,
   onRefreshProject,
   onStatus,
+  t,
 }: AIChatProps) {
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      id: 'boot',
-      role: 'assistant',
-      content: '你好，我已接入 ElyHa 后端。你可以让我协助剧情构思、生成章节，或给出可一键创建的节点建议。',
-    },
-  ]);
+  const bootMessage = t('web.chat.boot_message');
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
   const [allowNodeWrite, setAllowNodeWrite] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    setMessages((prev) => {
+      if (prev.length === 0) {
+        return [{id: 'boot', role: 'assistant', content: bootMessage}];
+      }
+      const first = prev[0];
+      if (first.id !== 'boot' || first.content === bootMessage) {
+        return prev;
+      }
+      return [{...first, content: bootMessage}, ...prev.slice(1)];
+    });
+  }, [bootMessage]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({behavior: 'smooth'});
@@ -67,7 +78,7 @@ export function AIChat({
       appendMessage({
         id: `${Date.now()}-warn`,
         role: 'system',
-        content: '请先创建或选择项目，再使用 AI 聊天。',
+        content: t('web.chat.project_required'),
       });
       return;
     }
@@ -87,22 +98,22 @@ export function AIChat({
       appendMessage({
         id: `${Date.now()}-assistant`,
         role: 'assistant',
-        content: response.reply || 'AI 已处理请求，但没有返回文本。',
+        content: response.reply || t('web.chat.empty_reply'),
         suggestions: response.suggested_options || [],
       });
 
       if (response.updated_node_id) {
-        onStatus?.(`AI 已更新节点 ${response.updated_node_id}`, false);
+        onStatus?.(t('web.toast.ai_node_updated', {node: response.updated_node_id}), false);
         if (onRefreshProject) {
           await onRefreshProject();
         }
       }
     } catch (error) {
-      const text = errorToText(error);
+      const text = errorToText(error, t('web.error.unknown'));
       appendMessage({
         id: `${Date.now()}-error`,
         role: 'system',
-        content: `请求失败：${text}`,
+        content: t('web.chat.request_failed', {message: text}),
       });
       onStatus?.(text, true);
     } finally {
@@ -116,9 +127,9 @@ export function AIChat({
     }
     try {
       await onCreateSuggestionNode(option);
-      onStatus?.(`已创建建议节点：${option.title || '未命名'}`, false);
+      onStatus?.(t('web.chat.suggestion_adopted', {title: option.title || t('web.node.untitled')}), false);
     } catch (error) {
-      onStatus?.(`创建建议节点失败：${errorToText(error)}`, true);
+      onStatus?.(t('web.chat.suggestion_create_failed', {message: errorToText(error, t('web.error.unknown'))}), true);
     }
   };
 
@@ -132,7 +143,7 @@ export function AIChat({
       <div className="h-14 border-b border-slate-200 flex items-center justify-between px-4 shrink-0 bg-white/95 backdrop-blur">
         <div className="flex items-center gap-2 text-slate-800">
           <Sparkles size={18} className="text-pink-500" />
-          <span className="font-bold">AI 助手</span>
+          <span className="font-bold">{t('web.chat.drawer_title')}</span>
         </div>
         <div className="flex items-center gap-2">
           <button className="p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-md transition-colors">
@@ -149,7 +160,7 @@ export function AIChat({
 
       <div className="px-4 py-2 border-b border-slate-100 bg-slate-50 text-xs text-slate-600">
         <div className="flex items-center justify-between gap-3">
-          <span className="truncate">项目: {projectId || '未选择'}</span>
+          <span className="truncate">{t('web.chat.project_label', {project: projectId || t('web.top.project_unselected')})}</span>
           <label className="flex items-center gap-1.5 cursor-pointer select-none">
             <input
               type="checkbox"
@@ -158,7 +169,7 @@ export function AIChat({
             />
             <span className="inline-flex items-center gap-1">
               <ShieldCheck size={12} />
-              允许写入选中节点
+              {t('web.chat.allow_node_write')}
             </span>
           </label>
         </div>
@@ -197,16 +208,16 @@ export function AIChat({
                 <div className="space-y-2">
                   {msg.suggestions.map((option, idx) => (
                     <div key={`${msg.id}-${idx}`} className="rounded-xl border border-slate-200 bg-white p-3 text-xs shadow-sm">
-                      <div className="font-semibold text-slate-800">{option.title || `建议 ${idx + 1}`}</div>
+                      <div className="font-semibold text-slate-800">{option.title || t('web.chat.suggestion_index_title', {index: idx + 1})}</div>
                       <div className="text-slate-600 mt-1 whitespace-pre-wrap">
-                        {option.summary || option.description || option.outline_steps || '无摘要'}
+                        {option.summary || option.description || option.outline_steps || t('web.chat.no_summary')}
                       </div>
                       <button
                         onClick={() => void adoptSuggestion(option)}
                         className="mt-2 inline-flex items-center gap-1 rounded-md bg-emerald-50 text-emerald-700 px-2.5 py-1.5 text-xs font-semibold hover:bg-emerald-100"
                       >
                         <PlusCircle size={13} />
-                        创建为节点
+                        {t('web.chat.create_suggestion_node')}
                       </button>
                     </div>
                   ))}
@@ -224,7 +235,7 @@ export function AIChat({
             <textarea
               value={input}
               onChange={(event) => setInput(event.target.value)}
-              placeholder={projectId ? '输入你的想法或指令...' : '请先创建或选择项目'}
+              placeholder={projectId ? t('web.chat.input_placeholder') : t('web.chat.project_required')}
               disabled={!projectId || busy}
               className="w-full bg-slate-50 border border-slate-200 rounded-xl py-3 pl-4 pr-12 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-pink-500 focus:border-transparent resize-none min-h-[44px] max-h-32 shadow-inner disabled:opacity-60"
               rows={1}
@@ -245,8 +256,8 @@ export function AIChat({
           </div>
         </form>
         <div className="mt-2 flex items-center justify-between text-[10px] text-slate-400 font-medium">
-          <span>Shift + Enter 换行</span>
-          <span>{busy ? 'AI 处理中...' : '使用后端 /api/ai/chat'}</span>
+          <span>{t('web.chat.shift_enter_hint')}</span>
+          <span>{busy ? t('web.chat.processing') : t('web.chat.endpoint_hint')}</span>
         </div>
       </div>
     </div>

@@ -139,6 +139,7 @@ export interface AiSuggestedOption {
   summary?: string;
   description?: string;
   outline_steps?: string;
+  suggested_node_id?: string;
   next_1?: string;
   next_2?: string;
 }
