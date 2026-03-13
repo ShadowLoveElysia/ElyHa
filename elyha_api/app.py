@@ -32,6 +32,7 @@ from elyha_core.services.project_service import (
     ProjectSettingsPatch,
 )
 from elyha_core.services.snapshot_service import SnapshotService
+from elyha_core.services.state_service import StateService
 from elyha_core.services.validation_service import ValidationService
 from elyha_core.storage.repository import SQLiteRepository
 from elyha_core.storage.sqlite_store import SQLiteStore
@@ -46,6 +47,7 @@ class ServiceContainer:
     validation_service: ValidationService
     export_service: ExportService
     snapshot_service: SnapshotService
+    state_service: StateService
     context_service: ContextService
     ai_service: AIService
     insight_service: InsightService
@@ -104,6 +106,64 @@ class ExportRequest(BaseModel):
 
 class RollbackRequest(BaseModel):
     revision: int = Field(ge=0)
+
+
+class ExtractStateEventsRequest(BaseModel):
+    project_id: str
+    node_id: str
+    content: str = ""
+    thread_id: str = "default"
+    create_proposals: bool = False
+
+
+class CreateStateProposalsRequest(BaseModel):
+    project_id: str
+    node_id: str
+    thread_id: str = Field(min_length=1, max_length=128)
+    events: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ReviewStateProposalRequest(BaseModel):
+    action: str
+    reviewer: str = ""
+    note: str = ""
+
+
+class ApplyStateChangesRequest(BaseModel):
+    project_id: str
+    node_id: str
+    thread_id: str = Field(min_length=1, max_length=128)
+    proposal_ids: list[str] = Field(default_factory=list)
+
+
+class UpsertEntityAliasRequest(BaseModel):
+    project_id: str
+    entity_type: str
+    alias: str = Field(min_length=1, max_length=128)
+    canonical_id: str = Field(min_length=1, max_length=128)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+
+
+class UpsertStateSchemaRequest(BaseModel):
+    project_id: str
+    entity_type: str
+    attr_key: str = Field(min_length=1, max_length=128)
+    value_type: str
+    description: str = ""
+    constraints: dict[str, Any] = Field(default_factory=dict)
+    is_active: bool = True
+
+
+class RebuildStateSnapshotRequest(BaseModel):
+    upto_revision: int | None = Field(default=None, ge=0)
+
+
+class PromptStatePayloadRequest(BaseModel):
+    project_id: str
+    character_ids: list[str] = Field(default_factory=list)
+    item_ids: list[str] = Field(default_factory=list)
+    relationship_pairs: list[str] = Field(default_factory=list)
+    world_variable_keys: list[str] = Field(default_factory=list)
 
 
 class GenerateChapterRequest(BaseModel):
@@ -284,6 +344,27 @@ def _to_task_payload(task) -> dict[str, Any]:
     }
 
 
+def _parse_relationship_pairs(values: list[str]) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for raw in values:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        if "|" in text:
+            left, right = text.split("|", 1)
+        elif ":" in text:
+            left, right = text.split(":", 1)
+        elif "," in text:
+            left, right = text.split(",", 1)
+        else:
+            continue
+        src = left.strip()
+        dst = right.strip()
+        if src and dst:
+            pairs.append((src, dst))
+    return pairs
+
+
 def _to_runtime_config_payload(config: CoreRuntimeConfig) -> dict[str, Any]:
     return {
         "locale": config.locale,
@@ -383,6 +464,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     project_service = ProjectService(repository)
     graph_service = GraphService(repository)
     validation_service = ValidationService(repository)
+    state_service = StateService(repository)
     context_service = ContextService(repository)
     config_root = Path(os.getenv("ELYHA_CORE_CONFIG_DIR", db_file.parent / "core_configs"))
     core_config_manager = CoreConfigManager(config_root)
@@ -404,6 +486,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         validation_service=validation_service,
         export_service=ExportService(repository, validation_service),
         snapshot_service=SnapshotService(repository),
+        state_service=state_service,
         context_service=context_service,
         ai_service=ai_service,
         insight_service=InsightService(repository),
@@ -791,6 +874,309 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return _to_project_payload(project)
+
+    @api.post("/api/state/extract")
+    def extract_state_events(payload: ExtractStateEventsRequest) -> dict[str, Any]:
+        try:
+            extracted = services.state_service.extract_state_events(
+                payload.project_id,
+                payload.node_id,
+                payload.content,
+            )
+            proposals: list[dict[str, Any]] = []
+            if payload.create_proposals and extracted["events"]:
+                proposals = services.state_service.create_state_change_proposals(
+                    payload.project_id,
+                    payload.node_id,
+                    payload.thread_id,
+                    extracted["events"],
+                )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            **extracted,
+            "thread_id": payload.thread_id,
+            "proposals": proposals,
+            "proposal_count": len(proposals),
+        }
+
+    @api.post("/api/state/proposals")
+    def create_state_change_proposals(payload: CreateStateProposalsRequest) -> dict[str, Any]:
+        try:
+            proposals = services.state_service.create_state_change_proposals(
+                payload.project_id,
+                payload.node_id,
+                payload.thread_id,
+                payload.events,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "project_id": payload.project_id,
+            "node_id": payload.node_id,
+            "thread_id": payload.thread_id,
+            "created": len(proposals),
+            "proposals": proposals,
+        }
+
+    @api.get("/api/projects/{project_id}/state/proposals")
+    def list_state_change_proposals(
+        project_id: str,
+        node_id: str | None = None,
+        thread_id: str | None = None,
+        status: str | None = None,
+        include_applied: bool = True,
+    ) -> dict[str, Any]:
+        try:
+            proposals = services.state_service.list_state_change_proposals(
+                project_id,
+                node_id=node_id,
+                thread_id=thread_id,
+                status=status,
+                include_applied=include_applied,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "project_id": project_id,
+            "count": len(proposals),
+            "proposals": proposals,
+        }
+
+    @api.post("/api/state/proposals/{proposal_id}/review")
+    def review_state_change_proposal(
+        proposal_id: str,
+        payload: ReviewStateProposalRequest,
+    ) -> dict[str, Any]:
+        try:
+            proposal = services.state_service.review_state_change_proposal(
+                proposal_id,
+                payload.action,
+                payload.reviewer,
+                payload.note,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return proposal
+
+    @api.post("/api/state/apply")
+    def apply_state_changes(payload: ApplyStateChangesRequest) -> dict[str, Any]:
+        try:
+            result = services.state_service.apply_approved_state_changes(
+                payload.project_id,
+                payload.node_id,
+                payload.thread_id,
+                proposal_ids=payload.proposal_ids,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return result
+
+    @api.get("/api/projects/{project_id}/state/characters")
+    def get_character_status(
+        project_id: str,
+        character_ids: str | None = None,
+    ) -> dict[str, Any]:
+        ids = [part.strip() for part in str(character_ids or "").split(",") if part.strip()]
+        try:
+            rows = services.state_service.get_character_status(project_id, ids or None)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {
+            "project_id": project_id,
+            "count": len(rows),
+            "characters": rows,
+        }
+
+    @api.get("/api/projects/{project_id}/state/items")
+    def get_item_status(
+        project_id: str,
+        item_ids: str | None = None,
+    ) -> dict[str, Any]:
+        ids = [part.strip() for part in str(item_ids or "").split(",") if part.strip()]
+        try:
+            rows = services.state_service.get_item_status(project_id, ids or None)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {
+            "project_id": project_id,
+            "count": len(rows),
+            "items": rows,
+        }
+
+    @api.get("/api/projects/{project_id}/state/relationships")
+    def get_relationship_status(
+        project_id: str,
+        pairs: str | None = None,
+    ) -> dict[str, Any]:
+        parsed_pairs = _parse_relationship_pairs(
+            [part.strip() for part in str(pairs or "").split(";") if part.strip()]
+        )
+        try:
+            rows = services.state_service.get_relationship_status(project_id, parsed_pairs or None)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {
+            "project_id": project_id,
+            "count": len(rows),
+            "relationships": rows,
+        }
+
+    @api.get("/api/projects/{project_id}/state/world-variables")
+    def get_world_variable_status(
+        project_id: str,
+        keys: str | None = None,
+    ) -> dict[str, Any]:
+        key_list = [part.strip() for part in str(keys or "").split(",") if part.strip()]
+        try:
+            rows = services.state_service.get_world_variable_status(project_id, key_list or None)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {
+            "project_id": project_id,
+            "count": len(rows),
+            "world_variables": rows,
+        }
+
+    @api.post("/api/state/prompt-payload")
+    def build_prompt_state_payload(payload: PromptStatePayloadRequest) -> dict[str, Any]:
+        pairs = _parse_relationship_pairs(payload.relationship_pairs)
+        try:
+            return services.state_service.build_prompt_state_payload(
+                payload.project_id,
+                character_ids=payload.character_ids or None,
+                item_ids=payload.item_ids or None,
+                relationship_pairs=pairs or None,
+                world_variable_keys=payload.world_variable_keys or None,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @api.get("/api/projects/{project_id}/state/conflicts")
+    def list_state_conflicts(
+        project_id: str,
+        unresolved_only: bool = True,
+    ) -> dict[str, Any]:
+        try:
+            conflicts = services.state_service.list_state_conflicts(
+                project_id,
+                unresolved_only=unresolved_only,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {
+            "project_id": project_id,
+            "count": len(conflicts),
+            "conflicts": conflicts,
+        }
+
+    @api.post("/api/projects/{project_id}/state/audit")
+    def audit_state_consistency(
+        project_id: str,
+        record_conflicts: bool = True,
+    ) -> dict[str, Any]:
+        try:
+            return services.state_service.audit_state_consistency(
+                project_id,
+                record_conflicts=record_conflicts,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @api.post("/api/projects/{project_id}/state/rebuild")
+    def rebuild_state_snapshot(
+        project_id: str,
+        payload: RebuildStateSnapshotRequest,
+    ) -> dict[str, Any]:
+        try:
+            result = services.state_service.rebuild_state_snapshot(
+                project_id,
+                upto_revision=payload.upto_revision,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return result
+
+    @api.get("/api/projects/{project_id}/state/aliases/resolve")
+    def resolve_entity_alias(
+        project_id: str,
+        entity_type: str,
+        alias: str,
+    ) -> dict[str, Any]:
+        try:
+            canonical_id = services.state_service.resolve_entity_alias(project_id, entity_type, alias)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "project_id": project_id,
+            "entity_type": entity_type,
+            "alias": alias,
+            "canonical_id": canonical_id,
+        }
+
+    @api.put("/api/state/aliases")
+    def upsert_entity_alias(payload: UpsertEntityAliasRequest) -> dict[str, Any]:
+        try:
+            return services.state_service.upsert_entity_alias(
+                payload.project_id,
+                payload.entity_type,
+                payload.alias,
+                payload.canonical_id,
+                payload.confidence,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @api.put("/api/state/attribute-schema")
+    def upsert_state_attribute_schema(payload: UpsertStateSchemaRequest) -> dict[str, Any]:
+        try:
+            return services.state_service.upsert_state_attribute_schema(
+                payload.project_id,
+                payload.entity_type,
+                payload.attr_key,
+                payload.value_type,
+                payload.constraints,
+                description=payload.description,
+                is_active=payload.is_active,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @api.get("/api/projects/{project_id}/state/attribute-schema/{entity_type}")
+    def list_state_attribute_schema(
+        project_id: str,
+        entity_type: str,
+    ) -> dict[str, Any]:
+        try:
+            rows = services.state_service.list_state_attribute_schema(project_id, entity_type)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "project_id": project_id,
+            "entity_type": entity_type,
+            "count": len(rows),
+            "schemas": rows,
+        }
 
     @api.post("/api/generate/chapter")
     def generate_chapter(payload: GenerateChapterRequest) -> dict[str, Any]:

@@ -18,6 +18,7 @@ from elyha_core.llm_presets import LLMPreset, preset_to_platform_config
 from elyha_core.models.task import Task, TaskStatus
 from elyha_core.services.context_service import ContextPack, ContextService
 from elyha_core.services.graph_service import GraphService, NodeCreate
+from elyha_core.services.prompt_template_service import PromptTemplateService
 from elyha_core.services.validation_service import ValidationService
 from elyha_core.models.node import NodeType
 from elyha_core.storage.repository import SQLiteRepository
@@ -163,11 +164,13 @@ class AIService:
         llm_provider: str | None = None,
         llm_platform_config: dict[str, Any] | None = None,
         llm_presets: dict[str, LLMPreset] | None = None,
+        prompt_template_dir: str | None = None,
     ) -> None:
         self.repository = repository
         self.graph_service = graph_service
         self.context_service = context_service
         self.validation_service = validation_service
+        self.prompt_templates = PromptTemplateService(prompt_template_dir)
         self._default_platform_config = (llm_platform_config or {}).copy()
         self._llm_presets = dict(llm_presets or {})
         self._adapter_cache: dict[str, Any] = {}
@@ -752,10 +755,25 @@ class AIService:
                 self._set_task_failed(task, exc)
             raise
 
+    def _render_prompt_template(
+        self,
+        template_name: str,
+        *,
+        fallback_key: str,
+        **kwargs: object,
+    ) -> str:
+        fallback = tr(fallback_key)
+        return self.prompt_templates.render(
+            template_name,
+            fallback=fallback,
+            **kwargs,
+        )
+
     def _chapter_prompt(self, title: str, context: ContextPack, *, style_hint: str) -> str:
         style = style_hint.strip() or tr("ai.chapter.style_default")
-        return tr(
-            "ai.chapter.prompt",
+        return self._render_prompt_template(
+            "chapter_prompt",
+            fallback_key="ai.chapter.prompt",
             title=title,
             style=style,
             context=context.to_prompt(),
@@ -763,16 +781,18 @@ class AIService:
 
     def _planner_prompt(self, title: str, context: ContextPack, *, style_hint: str) -> str:
         style = style_hint.strip() or tr("ai.chapter.style_default")
-        return tr(
-            "ai.chapter.planner_prompt",
+        return self._render_prompt_template(
+            "chapter_planner_prompt",
+            fallback_key="ai.chapter.planner_prompt",
             title=title,
             style=style,
             context=context.to_prompt(),
         )
 
     def _writer_prompt(self, title: str, context: ContextPack, *, plan: str) -> str:
-        return tr(
-            "ai.chapter.writer_prompt",
+        return self._render_prompt_template(
+            "chapter_writer_prompt",
+            fallback_key="ai.chapter.writer_prompt",
             title=title,
             plan=plan,
             context=context.to_prompt(),
@@ -785,8 +805,9 @@ class AIService:
         *,
         draft: str,
     ) -> str:
-        return tr(
-            "ai.chapter.reviewer_prompt",
+        return self._render_prompt_template(
+            "chapter_reviewer_prompt",
+            fallback_key="ai.chapter.reviewer_prompt",
             title=title,
             draft=draft,
             context=context.to_prompt(),
@@ -799,16 +820,18 @@ class AIService:
         draft: str,
         review_feedback: str,
     ) -> str:
-        return tr(
-            "ai.chapter.synthesizer_prompt",
+        return self._render_prompt_template(
+            "chapter_synthesizer_prompt",
+            fallback_key="ai.chapter.synthesizer_prompt",
             title=title,
             draft=draft,
             review_feedback=review_feedback,
         )
 
     def _branch_prompt(self, title: str, context: ContextPack, *, n: int) -> str:
-        return tr(
-            "ai.branch.prompt",
+        return self._render_prompt_template(
+            "branch_prompt",
+            fallback_key="ai.branch.prompt",
             title=title,
             count=n,
             context=context.to_prompt(),
@@ -816,8 +839,9 @@ class AIService:
 
     def _review_prompt(self, review_type: str, title: str, context: ContextPack) -> str:
         target_key = "ai.review.target_lore" if review_type == "review_lore" else "ai.review.target_logic"
-        return tr(
-            "ai.review.prompt",
+        return self._render_prompt_template(
+            "review_prompt",
+            fallback_key="ai.review.prompt",
             title=title,
             target=tr(target_key),
             context=context.to_prompt(),
@@ -836,8 +860,9 @@ class AIService:
             edge_lines.append(
                 f"{index}. {edge.source_id} -> {edge.target_id} label={edge.label or '-'}"
             )
-        return tr(
-            "ai.chat.global_prompt",
+        return self._render_prompt_template(
+            "chat_global_prompt",
+            fallback_key="ai.chat.global_prompt",
             route=route,
             user_message=message,
             node_count=len(nodes),
@@ -847,8 +872,9 @@ class AIService:
         )
 
     def _chat_planner_prompt(self, title: str, context: ContextPack, user_message: str) -> str:
-        return tr(
-            "ai.chat.planner_prompt",
+        return self._render_prompt_template(
+            "chat_planner_prompt",
+            fallback_key="ai.chat.planner_prompt",
             title=title,
             request=user_message,
             context=context.to_prompt(),
@@ -869,8 +895,9 @@ class AIService:
         project = self.repository.get_project(project_id)
         project_title = project.title if project is not None else project_id
         snapshot = self._project_snapshot_prompt(project_id)
-        return tr(
-            "ai.outline.guide_prompt",
+        return self._render_prompt_template(
+            "outline_guide_prompt",
+            fallback_key="ai.outline.guide_prompt",
             project_title=project_title,
             goal=goal,
             sync_context=sync_context or "-",
@@ -895,8 +922,9 @@ class AIService:
         project = self.repository.get_project(project_id)
         project_title = project.title if project is not None else project_id
         snapshot = self._project_snapshot_prompt(project_id)
-        return tr(
-            "ai.workflow.clarify_prompt",
+        return self._render_prompt_template(
+            "workflow_clarify_prompt",
+            fallback_key="ai.workflow.clarify_prompt",
             project_title=project_title,
             goal=goal,
             sync_context=sync_context or "-",
@@ -920,8 +948,9 @@ class AIService:
         project = self.repository.get_project(project_id)
         project_title = project.title if project is not None else project_id
         snapshot = self._project_snapshot_prompt(project_id)
-        return tr(
-            "ai.workflow.sync_prompt",
+        return self._render_prompt_template(
+            "workflow_sync_prompt",
+            fallback_key="ai.workflow.sync_prompt",
             project_title=project_title,
             goal=goal,
             mode=mode or "-",
@@ -946,8 +975,9 @@ class AIService:
         project_title = project.title if project is not None else project_id
         snapshot = self._project_snapshot_prompt(project_id)
         beats_block = "\n".join(f"- {item}" for item in chapter_beats) if chapter_beats else "-"
-        return tr(
-            "ai.outline.detail_nodes_prompt",
+        return self._render_prompt_template(
+            "outline_detail_nodes_prompt",
+            fallback_key="ai.outline.detail_nodes_prompt",
             project_title=project_title,
             mode=mode or "-",
             outline_markdown=outline_markdown or "-",
@@ -966,8 +996,9 @@ class AIService:
     ) -> str:
         current_content = str(metadata.get("content", "")).strip() or tr("ai.chat.empty_fallback")
         current_outline = str(metadata.get("outline_markdown", "")).strip() or tr("ai.chat.empty_fallback")
-        return tr(
-            "ai.chat.writer_prompt",
+        return self._render_prompt_template(
+            "chat_writer_prompt",
+            fallback_key="ai.chat.writer_prompt",
             title=title,
             request=user_message,
             current_outline=current_outline,
@@ -1240,7 +1271,10 @@ class AIService:
         return response
 
     def _build_system_prompt(self, project_id: str | None = None) -> str:
-        base_prompt = tr("ai.system_prompt").strip()
+        base_prompt = (
+            self.prompt_templates.load("system_prompt")
+            or tr("ai.system_prompt")
+        ).strip()
         if not project_id:
             return base_prompt
         project = self.repository.get_project(project_id)
