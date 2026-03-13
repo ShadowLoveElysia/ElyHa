@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 import re
-from typing import Any, NoReturn, TypedDict, cast
+from typing import TYPE_CHECKING, Any, NoReturn, TypedDict, cast
 
 from elyha_core.adapters.llm_adapter import (
     LLMMessage,
@@ -16,6 +16,11 @@ from elyha_core.adapters.llm_adapter import (
 from elyha_core.i18n import tr
 from elyha_core.llm_presets import LLMPreset, preset_to_platform_config
 from elyha_core.models.task import Task, TaskStatus
+from elyha_core.services.context_assembler import (
+    BuildInput,
+    ContextAssembler,
+    PromptBundle,
+)
 from elyha_core.services.context_service import ContextPack, ContextService
 from elyha_core.services.graph_service import GraphService, NodeCreate
 from elyha_core.services.prompt_template_service import PromptTemplateService
@@ -26,6 +31,14 @@ from elyha_core.utils.clock import utc_now
 from elyha_core.utils.ids import generate_id
 from elyha_core.utils.text_splitter import split_text_by_chars
 from langgraph.graph import END, StateGraph
+
+if TYPE_CHECKING:
+    from elyha_core.services.state_service import StateService
+
+_STRICT_JSON_FENCE_PATTERN = re.compile(
+    r"^\s*```json\s*([\s\S]*?)\s*```\s*$",
+    flags=re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -49,6 +62,22 @@ class GenerateResult:
     provider: str
     workflow_mode: str = "single"
     agent_trace: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ChapterDraftResult:
+    task_id: str
+    project_id: str
+    node_id: str
+    content: str
+    prompt_tokens: int
+    completion_tokens: int
+    provider: str
+    workflow_mode: str = "single"
+    agent_trace: dict[str, str] = field(default_factory=dict)
+    node_metadata_patch: dict[str, Any] = field(default_factory=dict)
+    prompt_version: str = ""
+    diff_patch: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -127,6 +156,21 @@ class OutlineDetailNodesResult:
     completion_tokens: int = 0
 
 
+@dataclass(slots=True)
+class ClarificationQuestionResult:
+    project_id: str
+    clarification_id: str
+    question_type: str
+    question: str
+    options: list[dict[str, str]] = field(default_factory=list)
+    must_answer: bool = True
+    timeout_sec: int = 120
+    setting_proposal_status: str = "pending_confirmation"
+    provider: str = "unknown"
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+
 class WorkflowState(TypedDict, total=False):
     task_id: str
     task_type: str
@@ -140,13 +184,18 @@ class WorkflowState(TypedDict, total=False):
     context_pack: ContextPack
     llm_route: dict[str, Any]
     prompt: str
+    prompt_bundle: PromptBundle
     planner_prompt: str
+    planner_prompt_bundle: PromptBundle
     planner_response: LLMResponse
     writer_prompt: str
+    writer_prompt_bundle: PromptBundle
     writer_response: LLMResponse
     reviewer_prompt: str
+    reviewer_prompt_bundle: PromptBundle
     reviewer_response: LLMResponse
     synthesizer_prompt: str
+    synthesizer_prompt_bundle: PromptBundle
     agent_trace: dict[str, str]
     llm_response: LLMResponse
 
@@ -165,12 +214,15 @@ class AIService:
         llm_platform_config: dict[str, Any] | None = None,
         llm_presets: dict[str, LLMPreset] | None = None,
         prompt_template_dir: str | None = None,
+        state_service: StateService | None = None,
     ) -> None:
         self.repository = repository
         self.graph_service = graph_service
         self.context_service = context_service
         self.validation_service = validation_service
+        self.state_service = state_service
         self.prompt_templates = PromptTemplateService(prompt_template_dir)
+        self.context_assembler = ContextAssembler()
         self._default_platform_config = (llm_platform_config or {}).copy()
         self._llm_presets = dict(llm_presets or {})
         self._adapter_cache: dict[str, Any] = {}
@@ -181,7 +233,7 @@ class AIService:
         self._single_workflow = self._build_single_workflow()
         self._chapter_multi_workflow = self._build_chapter_multi_workflow()
 
-    def generate_chapter(
+    def generate_chapter_draft(
         self,
         project_id: str,
         node_id: str,
@@ -189,7 +241,7 @@ class AIService:
         token_budget: int = 2200,
         style_hint: str = "",
         workflow_mode: str = "multi_agent",
-    ) -> GenerateResult:
+    ) -> ChapterDraftResult:
         normalized_mode = self._normalize_workflow_mode(workflow_mode)
         task = self._create_task(project_id, node_id, task_type="generate_chapter")
         self._set_task_running(task)
@@ -215,39 +267,48 @@ class AIService:
             response = cast(LLMResponse, flow_state["llm_response"])
             agent_trace = cast(dict[str, str], flow_state.get("agent_trace", {}))
             route = cast(dict[str, Any], flow_state.get("llm_route", {}))
+            final_bundle_key = (
+                "synthesizer_prompt_bundle" if normalized_mode == "multi_agent" else "prompt_bundle"
+            )
+            final_bundle = cast(PromptBundle | None, flow_state.get(final_bundle_key))
+            agent_bundles: dict[str, PromptBundle] = {}
+            if normalized_mode == "multi_agent":
+                for key, agent_name in (
+                    ("planner_prompt_bundle", "planner"),
+                    ("writer_prompt_bundle", "writer"),
+                    ("reviewer_prompt_bundle", "reviewer"),
+                    ("synthesizer_prompt_bundle", "synthesizer"),
+                ):
+                    bundle = cast(PromptBundle | None, flow_state.get(key))
+                    if bundle is None:
+                        continue
+                    agent_bundles[agent_name] = bundle
             content = response.content.strip()
             if not content:
                 raise RuntimeError(tr("ai.error.empty_response"))
-            node_patch = {
-                "status": "generated",
-                "metadata": {
-                    **node.metadata,
-                    "content": content,
-                    "summary": content[:200],
-                    "last_generation_at": utc_now().isoformat(),
-                    "ai_workflow_mode": normalized_mode,
-                    "ai_agent_trace": agent_trace,
-                    "ai_agent_preset": str(route.get("preset_tag", "")),
-                    "ai_agent_name": str(route.get("preset_name", "")),
-                    "ai_review_passed_once": bool(node.metadata.get("ai_review_passed_once"))
-                    or normalized_mode == "multi_agent",
-                },
-            }
-            self.graph_service.update_node(project_id, node_id, node_patch)
-            self.repository.replace_node_chunks(node_id, split_text_by_chars(content))
-            revision = self._project_revision(project_id)
-            self._set_task_success(task, revision=revision)
-            return GenerateResult(
+            node_base_metadata = node.metadata if isinstance(getattr(node, "metadata", {}), dict) else {}
+            metadata_patch = self._build_chapter_metadata_patch(
+                node_metadata=node_base_metadata,
+                content=content,
+                workflow_mode=normalized_mode,
+                agent_trace=agent_trace,
+                route=route,
+                final_bundle=final_bundle,
+                agent_bundles=agent_bundles,
+            )
+            self._set_task_success(task, revision=self._project_revision(project_id))
+            return ChapterDraftResult(
                 task_id=task.id,
                 project_id=project_id,
                 node_id=node_id,
                 content=content,
-                revision=revision,
                 prompt_tokens=response.prompt_tokens,
                 completion_tokens=response.completion_tokens,
                 provider=response.provider,
                 workflow_mode=normalized_mode,
                 agent_trace=agent_trace,
+                node_metadata_patch=metadata_patch,
+                prompt_version=str(metadata_patch.get("ai_prompt_version", "")),
             )
         except Exception as exc:
             if self._is_task_cancelled(task.id):
@@ -255,6 +316,135 @@ class AIService:
             else:
                 self._set_task_failed(task, exc)
             raise
+
+    def generate_chapter_correction_draft(
+        self,
+        project_id: str,
+        node_id: str,
+        *,
+        user_correction: str,
+        base_content: str = "",
+        token_budget: int = 2200,
+    ) -> ChapterDraftResult:
+        correction_text = str(user_correction or "").strip()
+        if not correction_text:
+            raise ValueError("user_correction cannot be empty")
+        task = self._create_task(project_id, node_id, task_type="generate_chapter_correction_draft")
+        self._set_task_running(task)
+        try:
+            self._ensure_project_valid(project_id)
+            node = self.graph_service.get_node(project_id, node_id)
+            context = self.context_service.build_context(
+                project_id,
+                node_id,
+                token_budget=max(400, int(token_budget)),
+            )
+            prompt, bundle = self._chapter_correction_prompt(
+                project_id,
+                node,
+                context,
+                user_correction=correction_text,
+                base_content=base_content,
+                token_budget=max(400, int(token_budget)),
+            )
+            response = self._generate(
+                task_type="chapter_correction",
+                prompt=prompt,
+                platform_config={"token_budget": max(400, int(token_budget))},
+                llm_route=self._resolve_node_llm_route(node),
+                project_id=project_id,
+            )
+            strict = self._strict_json_fence_output_enabled(project_id)
+            parsed_correction = self._parse_correction_diff_payload(
+                response.content,
+                strict_json_fence=strict,
+            )
+            content = str(parsed_correction.get("revised_content") or "").strip()
+            if not content:
+                raise RuntimeError(tr("ai.error.empty_response"))
+            diff_patch = parsed_correction.get("diff_patch")
+            normalized_diff_patch = diff_patch if isinstance(diff_patch, dict) else {}
+            node_base_metadata = node.metadata if isinstance(getattr(node, "metadata", {}), dict) else {}
+            agent_trace = {
+                "correction": self._truncate_trace(content),
+                "correction_diff": self._truncate_trace(
+                    json.dumps(normalized_diff_patch, ensure_ascii=False) if normalized_diff_patch else ""
+                ),
+            }
+            metadata_patch = self._build_chapter_metadata_patch(
+                node_metadata=node_base_metadata,
+                content=content,
+                workflow_mode="single",
+                agent_trace=agent_trace,
+                route={},
+                final_bundle=bundle,
+                agent_bundles={},
+            )
+            self._set_task_success(task, revision=self._project_revision(project_id))
+            return ChapterDraftResult(
+                task_id=task.id,
+                project_id=project_id,
+                node_id=node_id,
+                content=content,
+                prompt_tokens=response.prompt_tokens,
+                completion_tokens=response.completion_tokens,
+                provider=response.provider,
+                workflow_mode="single",
+                agent_trace=agent_trace,
+                node_metadata_patch=metadata_patch,
+                prompt_version=str(metadata_patch.get("ai_prompt_version", "")),
+                diff_patch=normalized_diff_patch,
+            )
+        except Exception as exc:
+            if self._is_task_cancelled(task.id):
+                self._set_task_cancelled(task, message="task cancelled")
+            else:
+                self._set_task_failed(task, exc)
+            raise
+
+    def generate_chapter(
+        self,
+        project_id: str,
+        node_id: str,
+        *,
+        token_budget: int = 2200,
+        style_hint: str = "",
+        workflow_mode: str = "multi_agent",
+    ) -> GenerateResult:
+        draft = self.generate_chapter_draft(
+            project_id,
+            node_id,
+            token_budget=token_budget,
+            style_hint=style_hint,
+            workflow_mode=workflow_mode,
+        )
+        node = self.graph_service.get_node(project_id, node_id)
+        node_metadata = node.metadata if isinstance(getattr(node, "metadata", {}), dict) else {}
+        merged_metadata = {**node_metadata, **draft.node_metadata_patch}
+        merged_metadata["content"] = draft.content
+        merged_metadata["summary"] = draft.content[:200]
+        self.graph_service.update_node(
+            project_id,
+            node_id,
+            {
+                "status": "generated",
+                "metadata": merged_metadata,
+            },
+        )
+        self.repository.replace_node_chunks(node_id, split_text_by_chars(draft.content))
+        revision = self._project_revision(project_id)
+        return GenerateResult(
+            task_id=draft.task_id,
+            project_id=project_id,
+            node_id=node_id,
+            content=draft.content,
+            revision=revision,
+            prompt_tokens=draft.prompt_tokens,
+            completion_tokens=draft.completion_tokens,
+            provider=draft.provider,
+            workflow_mode=draft.workflow_mode,
+            agent_trace=draft.agent_trace,
+        )
 
     def generate_branches(
         self,
@@ -282,7 +472,11 @@ class AIService:
                 self._set_task_cancelled(task, message="task cancelled")
                 raise RuntimeError("task cancelled")
             response = cast(LLMResponse, flow_state["llm_response"])
-            options = self._parse_branch_options(response.content, count=n)
+            options = self._parse_branch_options(
+                response.content,
+                count=n,
+                strict_json_fence=self._strict_json_fence_output_enabled(project_id),
+            )
             self._set_task_success(task, revision=self._project_revision(project_id))
             return options
         except Exception as exc:
@@ -370,14 +564,25 @@ class AIService:
         llm_route = self._resolve_node_llm_route(node)
 
         if route == "planner":
+            planner_prompt, _planner_bundle = self._chat_planner_prompt(
+                project_id,
+                node,
+                context,
+                cleaned_message,
+                token_budget=max(600, token_budget // 2),
+            )
             response = self._generate(
                 task_type="chat_plan",
-                prompt=self._chat_planner_prompt(node.title, context, cleaned_message),
+                prompt=planner_prompt,
                 platform_config={"token_budget": max(600, token_budget // 2), "branch_count": 3},
                 llm_route=llm_route,
                 project_id=project_id,
             )
-            options = self._parse_branch_options(response.content, count=3)
+            options = self._parse_branch_options(
+                response.content,
+                count=3,
+                strict_json_fence=self._strict_json_fence_output_enabled(project_id),
+            )
             self._clear_suggested_nodes_for_source(project_id, source_node_id=node.id)
             suggested_node_ids = self._create_suggested_nodes(
                 project_id,
@@ -428,9 +633,17 @@ class AIService:
                     revision=self._project_revision(project_id),
                 )
 
+        writer_prompt, writer_bundle = self._chat_writer_prompt(
+            project_id,
+            node,
+            context,
+            cleaned_message,
+            node_metadata,
+            token_budget=token_budget,
+        )
         response = self._generate(
             task_type="chat_writer",
-            prompt=self._chat_writer_prompt(node.title, context, cleaned_message, node_metadata),
+            prompt=writer_prompt,
             platform_config={"token_budget": token_budget},
             llm_route=llm_route,
             project_id=project_id,
@@ -445,6 +658,11 @@ class AIService:
         patched_metadata["ai_chat_last_route"] = route
         patched_metadata["ai_last_human_edit_at"] = utc_now().isoformat()
         patched_metadata["ai_review_passed_once"] = auto_review_passed
+        patched_metadata["ai_prompt_version"] = writer_bundle.prompt_version
+        patched_metadata["ai_prompt_sections"] = writer_bundle.sections_payload()
+        patched_metadata["ai_prompt_dropped_sections"] = writer_bundle.dropped_sections
+        patched_metadata["ai_prompt_constraints"] = writer_bundle.key_constraints
+        patched_metadata["ai_last_prompt"] = writer_bundle.final_prompt
         self.graph_service.update_node(
             project_id,
             node.id,
@@ -497,7 +715,10 @@ class AIService:
             platform_config={"token_budget": max(800, token_budget)},
             project_id=project_id,
         )
-        parsed = self._parse_outline_guide_payload(response.content)
+        parsed = self._parse_outline_guide_payload(
+            response.content,
+            strict_json_fence=self._strict_json_fence_output_enabled(project_id),
+        )
         questions = self._normalize_outline_list(parsed.get("questions"), limit=8)
         chapter_beats = self._normalize_outline_list(parsed.get("chapter_beats"), limit=16)
         next_steps = self._normalize_outline_list(parsed.get("next_steps"), limit=8)
@@ -546,7 +767,11 @@ class AIService:
             platform_config={"token_budget": max(900, token_budget)},
             project_id=project_id,
         )
-        parsed_nodes = self._parse_outline_detail_nodes_payload(response.content, limit=safe_max_nodes)
+        parsed_nodes = self._parse_outline_detail_nodes_payload(
+            response.content,
+            limit=safe_max_nodes,
+            strict_json_fence=self._strict_json_fence_output_enabled(project_id),
+        )
         if not parsed_nodes:
             fallback_lines = normalized_beats or self._normalize_outline_list(clean_outline, limit=safe_max_nodes)
             parsed_nodes = self._build_outline_detail_nodes_from_lines(fallback_lines, limit=safe_max_nodes)
@@ -638,7 +863,10 @@ class AIService:
             },
             project_id=project_id,
         )
-        parsed = self._parse_workflow_sync_payload(response.content)
+        parsed = self._parse_workflow_sync_payload(
+            response.content,
+            strict_json_fence=self._strict_json_fence_output_enabled(project_id),
+        )
         background_markdown = str(parsed.get("background_markdown", "")).strip()
         if not background_markdown:
             background_markdown = response.content.strip() or tr("ai.chat.empty_fallback")
@@ -656,6 +884,50 @@ class AIService:
             risk_notes=risk_notes,
             search_requested=search_requested,
             search_used=search_used,
+            provider=response.provider,
+            prompt_tokens=response.prompt_tokens,
+            completion_tokens=response.completion_tokens,
+        )
+
+    def generate_clarification_question(
+        self,
+        project_id: str,
+        *,
+        node_id: str | None = None,
+        context: str = "",
+        token_budget: int = 900,
+    ) -> ClarificationQuestionResult:
+        if self.repository.get_project(project_id) is None:
+            self._raise_project_missing(project_id)
+        node = self.graph_service.get_node(project_id, node_id) if node_id else None
+        node_title = node.title if node is not None else ""
+        prompt = self._clarification_question_prompt(
+            project_id,
+            node_title=node_title,
+            context=str(context or "").strip(),
+        )
+        llm_route = self._resolve_node_llm_route(node) if node is not None else None
+        response = self._generate(
+            task_type="clarification_question",
+            prompt=prompt,
+            platform_config={"token_budget": max(500, token_budget)},
+            llm_route=llm_route,
+            project_id=project_id,
+        )
+        strict = self._strict_json_fence_output_enabled(project_id)
+        parsed = self._parse_clarification_question_payload(
+            response.content,
+            strict_json_fence=strict,
+        )
+        return ClarificationQuestionResult(
+            project_id=project_id,
+            clarification_id=str(parsed.get("clarification_id") or generate_id("clq")),
+            question_type=str(parsed.get("question_type") or "other"),
+            question=str(parsed.get("question") or "").strip() or tr("ai.chat.empty_fallback"),
+            options=cast(list[dict[str, str]], parsed.get("options", [])),
+            must_answer=bool(parsed.get("must_answer", True)),
+            timeout_sec=max(15, int(parsed.get("timeout_sec", 120))),
+            setting_proposal_status="pending_confirmation",
             provider=response.provider,
             prompt_tokens=response.prompt_tokens,
             completion_tokens=response.completion_tokens,
@@ -769,83 +1041,521 @@ class AIService:
             **kwargs,
         )
 
-    def _chapter_prompt(self, title: str, context: ContextPack, *, style_hint: str) -> str:
+    def _append_strict_json_fence_contract(self, prompt: str, *, enabled: bool) -> str:
+        if not enabled:
+            return prompt
+        contract = (
+            "\n\n[OutputContract]\n"
+            "strict_json_fence_output=true\n"
+            "Response must be and only be a single ```json ... ``` fenced block.\n"
+        )
+        return f"{prompt.rstrip()}{contract}"
+
+    def _project_settings(self, project_id: str):
+        project = self.repository.get_project(project_id)
+        if project is None:
+            self._raise_project_missing(project_id)
+        return project.settings
+
+    def _strict_json_fence_output_enabled(self, project_id: str) -> bool:
+        settings = self._project_settings(project_id)
+        return bool(getattr(settings, "strict_json_fence_output", False))
+
+    def _build_node_context_payload(
+        self,
+        *,
+        node: Any,
+        task_type: str,
+        task_instruction: str,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        metadata = node.metadata if isinstance(getattr(node, "metadata", {}), dict) else {}
+        payload: dict[str, Any] = {
+            "task_type": task_type,
+            "task_instruction": task_instruction,
+            "node": {
+                "id": str(getattr(node, "id", "")),
+                "title": str(getattr(node, "title", "")),
+                "type": str(getattr(getattr(node, "type", None), "value", "")),
+                "status": str(getattr(getattr(node, "status", None), "value", "")),
+                "storyline_id": str(getattr(node, "storyline_id", "") or ""),
+            },
+            "outline_markdown": str(metadata.get("outline_markdown", "")).strip(),
+            "goal": str(metadata.get("goal", "")).strip(),
+            "chapter_position": str(metadata.get("chapter_position", "")).strip(),
+            "forced_progression_points": metadata.get("forced_progression_points", []),
+        }
+        if extra:
+            payload["task_input"] = extra
+        return payload
+
+    def _node_content_text(self, node: Any) -> str:
+        node_id = str(getattr(node, "id", "")).strip()
+        if node_id:
+            chunks = self.repository.list_node_chunks(node_id)
+            if chunks:
+                return "\n".join(chunks).strip()
+        metadata = node.metadata if isinstance(getattr(node, "metadata", {}), dict) else {}
+        for key in ("content", "summary", "notes"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    def _collect_working_memory(self, project_id: str, node: Any) -> str:
+        nodes = self.graph_service.list_nodes(project_id)
+        current_storyline_id = str(getattr(node, "storyline_id", "") or "").strip()
+        eligible_status = {"generated", "reviewed", "approved"}
+        ranked: list[Any] = []
+        for item in nodes:
+            if current_storyline_id and str(getattr(item, "storyline_id", "") or "").strip() != current_storyline_id:
+                continue
+            status = str(getattr(getattr(item, "status", None), "value", "")).strip().lower()
+            if status and status not in eligible_status:
+                continue
+            if self._node_content_text(item):
+                ranked.append(item)
+        ranked.sort(key=lambda item: (item.updated_at, item.id), reverse=True)
+        picked = ranked[:6]
+        blocks: list[str] = []
+        for index, item in enumerate(reversed(picked), start=1):
+            content = self._node_content_text(item)
+            if not content:
+                continue
+            blocks.append(
+                f"[{index}] {item.title} ({item.type.value}, {item.status.value})\n{content}"
+            )
+        return "\n\n".join(blocks).strip()
+
+    def _build_rag_context(self, context: ContextPack) -> str:
+        lines: list[str] = []
+        for segment in context.segments:
+            if segment.kind not in {"constraint", "pinned", "ancestor", "recent"}:
+                continue
+            text = str(segment.text).strip()
+            if not text:
+                continue
+            lines.append(f"[{segment.kind}] {text}")
+        return "\n".join(lines).strip()
+
+    def _metadata_id_list(self, metadata: dict[str, Any], *keys: str) -> list[str]:
+        values: list[str] = []
+        for key in keys:
+            raw = metadata.get(key)
+            if isinstance(raw, list):
+                for item in raw:
+                    text = str(item).strip()
+                    if text:
+                        values.append(text)
+            elif isinstance(raw, str):
+                for part in raw.split(","):
+                    text = part.strip()
+                    if text:
+                        values.append(text)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for item in values:
+            if item in seen:
+                continue
+            seen.add(item)
+            deduped.append(item)
+        return deduped
+
+    def _metadata_relationship_pairs(self, metadata: dict[str, Any]) -> list[tuple[str, str]]:
+        raw = metadata.get("relationship_pairs")
+        pairs: list[tuple[str, str]] = []
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict):
+                    subject = str(item.get("subject") or item.get("a") or "").strip()
+                    obj = str(item.get("object") or item.get("b") or "").strip()
+                    if subject and obj:
+                        pairs.append((subject, obj))
+                else:
+                    text = str(item).strip()
+                    if not text:
+                        continue
+                    for sep in ("|", ",", "->", "=>"):
+                        if sep in text:
+                            left, right = text.split(sep, 1)
+                            subject = left.strip()
+                            obj = right.strip()
+                            if subject and obj:
+                                pairs.append((subject, obj))
+                            break
+        return pairs
+
+    def _collect_world_state_snapshot(self, project_id: str, node: Any) -> dict[str, Any]:
+        if self.state_service is None:
+            return {}
+        metadata = node.metadata if isinstance(getattr(node, "metadata", {}), dict) else {}
+        character_ids = self._metadata_id_list(metadata, "character_ids", "state_character_ids")
+        item_ids = self._metadata_id_list(metadata, "item_ids", "state_item_ids")
+        world_variable_keys = self._metadata_id_list(metadata, "world_variable_keys")
+        relationship_pairs = self._metadata_relationship_pairs(metadata)
+        payload = self.state_service.build_prompt_state_payload(
+            project_id,
+            character_ids=character_ids or None,
+            item_ids=item_ids or None,
+            relationship_pairs=relationship_pairs or None,
+            world_variable_keys=world_variable_keys or None,
+        )
+        conflicts = self.state_service.list_state_conflicts(project_id, unresolved_only=True)
+        return {
+            "state_snapshot": payload,
+            "state_conflicts": conflicts[:30],
+        }
+
+    def _build_prompt_bundle(
+        self,
+        *,
+        project_id: str,
+        node: Any,
+        context: ContextPack,
+        token_budget: int,
+        task_mode: str,
+        task_type: str,
+        task_instruction: str,
+        user_correction: str = "",
+        extra_node_context: dict[str, Any] | None = None,
+    ) -> PromptBundle:
+        settings = self._project_settings(project_id)
+        system_spec_parts: list[str] = []
+        style = str(getattr(settings, "system_prompt_style", "")).strip()
+        forbidden = str(getattr(settings, "system_prompt_forbidden", "")).strip()
+        notes = str(getattr(settings, "system_prompt_notes", "")).strip()
+        if style:
+            system_spec_parts.append(f"[WritingStyle]\n{style}")
+        if forbidden:
+            system_spec_parts.append(f"[Forbidden]\n{forbidden}")
+        if notes:
+            system_spec_parts.append(f"[Notes]\n{notes}")
+        system_spec = "\n\n".join(system_spec_parts).strip()
+
+        node_context_payload = self._build_node_context_payload(
+            node=node,
+            task_type=task_type,
+            task_instruction=task_instruction,
+            extra=extra_node_context,
+        )
+        working_memory = self._collect_working_memory(project_id, node)
+        recent_anchor = ""
+        node_metadata = node.metadata if isinstance(getattr(node, "metadata", {}), dict) else {}
+        summary = str(node_metadata.get("summary", "")).strip()
+        if summary:
+            recent_anchor = summary[:500]
+        bundle_input = BuildInput(
+            project_id=project_id,
+            node_id=str(node.id),
+            task_mode=task_mode,
+            token_budget=max(200, int(token_budget)),
+            system_spec=system_spec,
+            global_directives=str(getattr(settings, "global_directives", "") or ""),
+            world_state_snapshot=self._collect_world_state_snapshot(project_id, node),
+            node_context=node_context_payload,
+            working_memory=working_memory,
+            rag_context=self._build_rag_context(context),
+            user_correction=user_correction,
+            recent_anchor=recent_anchor,
+            context_soft_min_chars=int(getattr(settings, "context_soft_min_chars", 3000)),
+            context_soft_max_chars=int(getattr(settings, "context_soft_max_chars", 5000)),
+            context_sentence_safe_expand_chars=int(
+                getattr(settings, "context_sentence_safe_expand_chars", 500)
+            ),
+            context_soft_max_tokens=int(getattr(settings, "context_soft_max_tokens", 1600)),
+            strict_json_fence_output=bool(getattr(settings, "strict_json_fence_output", False)),
+        )
+        if task_mode == "correct":
+            return self.context_assembler.build_correction_prompt(bundle_input)
+        return self.context_assembler.build_generation_prompt(bundle_input)
+
+    def _chapter_prompt(
+        self,
+        project_id: str,
+        node: Any,
+        context: ContextPack,
+        *,
+        style_hint: str,
+        token_budget: int,
+    ) -> tuple[str, PromptBundle]:
         style = style_hint.strip() or tr("ai.chapter.style_default")
-        return self._render_prompt_template(
+        instruction = self._render_prompt_template(
             "chapter_prompt",
             fallback_key="ai.chapter.prompt",
-            title=title,
+            title=node.title,
             style=style,
-            context=context.to_prompt(),
+            context="(see structured context sections below)",
         )
+        bundle = self._build_prompt_bundle(
+            project_id=project_id,
+            node=node,
+            context=context,
+            token_budget=token_budget,
+            task_mode="generate",
+            task_type="generate_chapter",
+            task_instruction=instruction,
+            extra_node_context={"style_hint": style},
+        )
+        return bundle.final_prompt, bundle
 
-    def _planner_prompt(self, title: str, context: ContextPack, *, style_hint: str) -> str:
+    def _chapter_correction_prompt(
+        self,
+        project_id: str,
+        node: Any,
+        context: ContextPack,
+        *,
+        user_correction: str,
+        base_content: str,
+        token_budget: int,
+    ) -> tuple[str, PromptBundle]:
+        clean_correction = str(user_correction or "").strip()
+        clean_base_content = str(base_content or "").strip()
+        if not clean_base_content:
+            node_metadata = node.metadata if isinstance(getattr(node, "metadata", {}), dict) else {}
+            clean_base_content = str(node_metadata.get("content", "")).strip()
+        template_text = self.prompt_templates.load("chapter_correction_prompt")
+        if not template_text:
+            raise RuntimeError("missing prompt template: data/prompt/chapter_correction_prompt.txt")
+        instruction = self.prompt_templates.render_text(
+            template_text,
+            title=node.title,
+            correction=clean_correction,
+            base_content=clean_base_content or "(empty)",
+            context="(see structured context sections below)",
+        )
+        bundle = self._build_prompt_bundle(
+            project_id=project_id,
+            node=node,
+            context=context,
+            token_budget=token_budget,
+            task_mode="correct",
+            task_type="chapter_correction",
+            task_instruction=instruction,
+            user_correction=clean_correction,
+            extra_node_context={
+                "base_content_excerpt": clean_base_content[:1500],
+                "correction": clean_correction,
+            },
+        )
+        return bundle.final_prompt, bundle
+
+    def _build_chapter_metadata_patch(
+        self,
+        *,
+        node_metadata: dict[str, Any],
+        content: str,
+        workflow_mode: str,
+        agent_trace: dict[str, str],
+        route: dict[str, Any],
+        final_bundle: PromptBundle | None,
+        agent_bundles: dict[str, PromptBundle],
+    ) -> dict[str, Any]:
+        return {
+            "content": content,
+            "summary": content[:200],
+            "last_generation_at": utc_now().isoformat(),
+            "ai_chapter_done_signal": self._extract_chapter_done_signal_from_content(content),
+            "ai_workflow_mode": workflow_mode,
+            "ai_agent_trace": agent_trace,
+            "ai_agent_preset": str(route.get("preset_tag", "")),
+            "ai_agent_name": str(route.get("preset_name", "")),
+            "ai_review_passed_once": bool(node_metadata.get("ai_review_passed_once"))
+            or workflow_mode == "multi_agent",
+            "ai_prompt_version": final_bundle.prompt_version if final_bundle is not None else "",
+            "ai_prompt_sections": final_bundle.sections_payload() if final_bundle is not None else [],
+            "ai_prompt_dropped_sections": final_bundle.dropped_sections if final_bundle is not None else [],
+            "ai_prompt_constraints": final_bundle.key_constraints if final_bundle is not None else [],
+            "ai_last_prompt": final_bundle.final_prompt if final_bundle is not None else "",
+            "ai_prompt_sections_by_agent": {
+                name: bundle.sections_payload() for name, bundle in agent_bundles.items()
+            },
+            "ai_last_prompt_by_agent": {
+                name: bundle.final_prompt for name, bundle in agent_bundles.items()
+            },
+        }
+
+    def _extract_chapter_done_signal_from_content(self, content: str) -> bool:
+        text = str(content or "")
+        if not text:
+            return False
+        if re.search(r"\bchapter_done_signal\b\s*[:=]\s*(true|1|yes)\b", text, flags=re.IGNORECASE):
+            return True
+        if re.search(r"章节完成信号\s*[:：]\s*(true|1|是)", text, flags=re.IGNORECASE):
+            return True
+        return False
+
+    def _planner_prompt(
+        self,
+        project_id: str,
+        node: Any,
+        context: ContextPack,
+        *,
+        style_hint: str,
+        token_budget: int,
+    ) -> tuple[str, PromptBundle]:
         style = style_hint.strip() or tr("ai.chapter.style_default")
-        return self._render_prompt_template(
+        instruction = self._render_prompt_template(
             "chapter_planner_prompt",
             fallback_key="ai.chapter.planner_prompt",
-            title=title,
+            title=node.title,
             style=style,
-            context=context.to_prompt(),
+            context="(see structured context sections below)",
         )
+        bundle = self._build_prompt_bundle(
+            project_id=project_id,
+            node=node,
+            context=context,
+            token_budget=token_budget,
+            task_mode="generate",
+            task_type="chapter_plan",
+            task_instruction=instruction,
+            extra_node_context={"style_hint": style},
+        )
+        return bundle.final_prompt, bundle
 
-    def _writer_prompt(self, title: str, context: ContextPack, *, plan: str) -> str:
-        return self._render_prompt_template(
+    def _writer_prompt(
+        self,
+        project_id: str,
+        node: Any,
+        context: ContextPack,
+        *,
+        plan: str,
+        token_budget: int,
+    ) -> tuple[str, PromptBundle]:
+        instruction = self._render_prompt_template(
             "chapter_writer_prompt",
             fallback_key="ai.chapter.writer_prompt",
-            title=title,
+            title=node.title,
             plan=plan,
-            context=context.to_prompt(),
+            context="(see structured context sections below)",
         )
+        bundle = self._build_prompt_bundle(
+            project_id=project_id,
+            node=node,
+            context=context,
+            token_budget=token_budget,
+            task_mode="generate",
+            task_type="chapter_write",
+            task_instruction=instruction,
+            extra_node_context={"planner_output": plan},
+        )
+        return bundle.final_prompt, bundle
 
     def _chapter_reviewer_prompt(
         self,
-        title: str,
+        project_id: str,
+        node: Any,
         context: ContextPack,
         *,
         draft: str,
-    ) -> str:
-        return self._render_prompt_template(
+        token_budget: int,
+    ) -> tuple[str, PromptBundle]:
+        instruction = self._render_prompt_template(
             "chapter_reviewer_prompt",
             fallback_key="ai.chapter.reviewer_prompt",
-            title=title,
+            title=node.title,
             draft=draft,
-            context=context.to_prompt(),
+            context="(see structured context sections below)",
         )
+        bundle = self._build_prompt_bundle(
+            project_id=project_id,
+            node=node,
+            context=context,
+            token_budget=token_budget,
+            task_mode="generate",
+            task_type="chapter_review",
+            task_instruction=instruction,
+            extra_node_context={"draft_excerpt": draft[:800]},
+        )
+        return bundle.final_prompt, bundle
 
     def _synthesizer_prompt(
         self,
-        title: str,
+        project_id: str,
+        node: Any,
+        context: ContextPack,
         *,
         draft: str,
         review_feedback: str,
-    ) -> str:
-        return self._render_prompt_template(
+        token_budget: int,
+    ) -> tuple[str, PromptBundle]:
+        instruction = self._render_prompt_template(
             "chapter_synthesizer_prompt",
             fallback_key="ai.chapter.synthesizer_prompt",
-            title=title,
+            title=node.title,
             draft=draft,
             review_feedback=review_feedback,
         )
+        bundle = self._build_prompt_bundle(
+            project_id=project_id,
+            node=node,
+            context=context,
+            token_budget=token_budget,
+            task_mode="generate",
+            task_type="chapter_synthesize",
+            task_instruction=instruction,
+            extra_node_context={
+                "draft_excerpt": draft[:800],
+                "review_feedback_excerpt": review_feedback[:800],
+            },
+        )
+        return bundle.final_prompt, bundle
 
-    def _branch_prompt(self, title: str, context: ContextPack, *, n: int) -> str:
-        return self._render_prompt_template(
+    def _branch_prompt(
+        self,
+        project_id: str,
+        node: Any,
+        context: ContextPack,
+        *,
+        n: int,
+        token_budget: int,
+    ) -> tuple[str, PromptBundle]:
+        instruction = self._render_prompt_template(
             "branch_prompt",
             fallback_key="ai.branch.prompt",
-            title=title,
+            title=node.title,
             count=n,
-            context=context.to_prompt(),
+            context="(see structured context sections below)",
         )
+        bundle = self._build_prompt_bundle(
+            project_id=project_id,
+            node=node,
+            context=context,
+            token_budget=token_budget,
+            task_mode="generate",
+            task_type="generate_branches",
+            task_instruction=instruction,
+            extra_node_context={"branch_count": n},
+        )
+        return bundle.final_prompt, bundle
 
-    def _review_prompt(self, review_type: str, title: str, context: ContextPack) -> str:
+    def _review_prompt(
+        self,
+        project_id: str,
+        review_type: str,
+        node: Any,
+        context: ContextPack,
+        *,
+        token_budget: int,
+    ) -> tuple[str, PromptBundle]:
         target_key = "ai.review.target_lore" if review_type == "review_lore" else "ai.review.target_logic"
-        return self._render_prompt_template(
+        instruction = self._render_prompt_template(
             "review_prompt",
             fallback_key="ai.review.prompt",
-            title=title,
+            title=node.title,
             target=tr(target_key),
-            context=context.to_prompt(),
+            context="(see structured context sections below)",
         )
+        bundle = self._build_prompt_bundle(
+            project_id=project_id,
+            node=node,
+            context=context,
+            token_budget=token_budget,
+            task_mode="generate",
+            task_type=review_type,
+            task_instruction=instruction,
+        )
+        return bundle.final_prompt, bundle
 
     def _chat_global_prompt(self, project_id: str, message: str, *, route: str) -> str:
         nodes = self.graph_service.list_nodes(project_id)
@@ -871,14 +1581,33 @@ class AIService:
             edges="\n".join(edge_lines) if edge_lines else "-",
         )
 
-    def _chat_planner_prompt(self, title: str, context: ContextPack, user_message: str) -> str:
-        return self._render_prompt_template(
+    def _chat_planner_prompt(
+        self,
+        project_id: str,
+        node: Any,
+        context: ContextPack,
+        user_message: str,
+        *,
+        token_budget: int,
+    ) -> tuple[str, PromptBundle]:
+        instruction = self._render_prompt_template(
             "chat_planner_prompt",
             fallback_key="ai.chat.planner_prompt",
-            title=title,
+            title=node.title,
             request=user_message,
-            context=context.to_prompt(),
+            context="(see structured context sections below)",
         )
+        bundle = self._build_prompt_bundle(
+            project_id=project_id,
+            node=node,
+            context=context,
+            token_budget=token_budget,
+            task_mode="generate",
+            task_type="chat_plan",
+            task_instruction=instruction,
+            extra_node_context={"user_request": user_message},
+        )
+        return bundle.final_prompt, bundle
 
     def _outline_guide_prompt(
         self,
@@ -895,7 +1624,7 @@ class AIService:
         project = self.repository.get_project(project_id)
         project_title = project.title if project is not None else project_id
         snapshot = self._project_snapshot_prompt(project_id)
-        return self._render_prompt_template(
+        prompt = self._render_prompt_template(
             "outline_guide_prompt",
             fallback_key="ai.outline.guide_prompt",
             project_title=project_title,
@@ -907,6 +1636,10 @@ class AIService:
             constraints=constraints or "-",
             tone=tone or "-",
             snapshot=snapshot,
+        )
+        return self._append_strict_json_fence_contract(
+            prompt,
+            enabled=self._strict_json_fence_output_enabled(project_id),
         )
 
     def _workflow_clarify_prompt(
@@ -934,6 +1667,46 @@ class AIService:
             snapshot=snapshot,
         )
 
+    def _clarification_question_prompt(
+        self,
+        project_id: str,
+        *,
+        node_title: str,
+        context: str,
+    ) -> str:
+        project = self.repository.get_project(project_id)
+        project_title = project.title if project is not None else project_id
+        template = self.prompt_templates.load("clarification_question_prompt")
+        if template:
+            prompt = self.prompt_templates.render_text(
+                template,
+                project_title=project_title,
+                node_title=node_title or "-",
+                context=context or "-",
+            )
+        else:
+            prompt = (
+                "Generate one clarification question in JSON.\n"
+                "Output format:\n"
+                "{\n"
+                '  "clarification_id":"...","question_type":"plot_direction|route_choice|character_style|world_rule|pace|other",\n'
+                '  "question":"...",\n'
+                '  "options":[{"value":"...","label":"...","reason":"..."}],\n'
+                '  "must_answer":true,\n'
+                '  "timeout_sec":120\n'
+                "}\n"
+                "Rules:\n"
+                "- options must include value=other.\n"
+                "- question should be specific and answerable.\n"
+                f"[Project]\n{project_title}\n\n"
+                f"[Node]\n{node_title or '-'}\n\n"
+                f"[Context]\n{context or '-'}"
+            )
+        return self._append_strict_json_fence_contract(
+            prompt,
+            enabled=self._strict_json_fence_output_enabled(project_id),
+        )
+
     def _workflow_sync_prompt(
         self,
         project_id: str,
@@ -948,7 +1721,7 @@ class AIService:
         project = self.repository.get_project(project_id)
         project_title = project.title if project is not None else project_id
         snapshot = self._project_snapshot_prompt(project_id)
-        return self._render_prompt_template(
+        prompt = self._render_prompt_template(
             "workflow_sync_prompt",
             fallback_key="ai.workflow.sync_prompt",
             project_title=project_title,
@@ -959,6 +1732,10 @@ class AIService:
             tone=tone or "-",
             search_requested="true" if search_requested else "false",
             snapshot=snapshot,
+        )
+        return self._append_strict_json_fence_contract(
+            prompt,
+            enabled=self._strict_json_fence_output_enabled(project_id),
         )
 
     def _outline_detail_nodes_prompt(
@@ -975,7 +1752,7 @@ class AIService:
         project_title = project.title if project is not None else project_id
         snapshot = self._project_snapshot_prompt(project_id)
         beats_block = "\n".join(f"- {item}" for item in chapter_beats) if chapter_beats else "-"
-        return self._render_prompt_template(
+        prompt = self._render_prompt_template(
             "outline_detail_nodes_prompt",
             fallback_key="ai.outline.detail_nodes_prompt",
             project_title=project_title,
@@ -986,25 +1763,47 @@ class AIService:
             max_nodes=max_nodes,
             snapshot=snapshot,
         )
+        return self._append_strict_json_fence_contract(
+            prompt,
+            enabled=self._strict_json_fence_output_enabled(project_id),
+        )
 
     def _chat_writer_prompt(
         self,
-        title: str,
+        project_id: str,
+        node: Any,
         context: ContextPack,
         user_message: str,
         metadata: dict[str, Any],
-    ) -> str:
+        *,
+        token_budget: int,
+    ) -> tuple[str, PromptBundle]:
         current_content = str(metadata.get("content", "")).strip() or tr("ai.chat.empty_fallback")
         current_outline = str(metadata.get("outline_markdown", "")).strip() or tr("ai.chat.empty_fallback")
-        return self._render_prompt_template(
+        instruction = self._render_prompt_template(
             "chat_writer_prompt",
             fallback_key="ai.chat.writer_prompt",
-            title=title,
+            title=node.title,
             request=user_message,
             current_outline=current_outline,
             current_content=current_content,
-            context=context.to_prompt(),
+            context="(see structured context sections below)",
         )
+        bundle = self._build_prompt_bundle(
+            project_id=project_id,
+            node=node,
+            context=context,
+            token_budget=token_budget,
+            task_mode="correct",
+            task_type="chat_writer",
+            task_instruction=instruction,
+            user_correction=user_message,
+            extra_node_context={
+                "current_outline": current_outline,
+                "current_content_excerpt": current_content[:1000],
+            },
+        )
+        return bundle.final_prompt, bundle
 
     def _build_outline_detail_nodes_from_lines(
         self,
@@ -1046,8 +1845,9 @@ class AIService:
         text: str,
         *,
         limit: int,
+        strict_json_fence: bool = False,
     ) -> list[OutlineDetailNode]:
-        parsed = self._parse_outline_guide_payload(text)
+        parsed = self._parse_outline_guide_payload(text, strict_json_fence=strict_json_fence)
         candidates: list[dict[str, Any]] = []
         if isinstance(parsed, dict):
             raw_nodes = (
@@ -1130,10 +1930,33 @@ class AIService:
             f"[Edges]\n{chr(10).join(edge_lines) if edge_lines else '-'}"
         )
 
-    def _parse_outline_guide_payload(self, text: str) -> dict[str, Any]:
+    def _parse_strict_json_fence_payload(self, text: str) -> Any:
+        raw = str(text or "")
+        match = _STRICT_JSON_FENCE_PATTERN.fullmatch(raw)
+        if not match:
+            raise RuntimeError("strict_json_fence_output=true requires a single ```json``` fenced payload")
+        payload_text = match.group(1).strip()
+        if not payload_text:
+            raise RuntimeError("strict_json_fence_output=true received empty JSON fence payload")
+        try:
+            return json.loads(payload_text)
+        except Exception as exc:
+            raise RuntimeError("strict_json_fence_output=true received invalid JSON payload") from exc
+
+    def _parse_outline_guide_payload(
+        self,
+        text: str,
+        *,
+        strict_json_fence: bool = False,
+    ) -> dict[str, Any]:
         raw = str(text or "").strip()
         if not raw:
             return {}
+        if strict_json_fence:
+            payload = self._parse_strict_json_fence_payload(raw)
+            if isinstance(payload, dict):
+                return payload
+            raise RuntimeError("strict_json_fence_output=true requires JSON object payload")
         candidates: list[str] = []
         for match in re.finditer(r"```(?:json)?\s*([\s\S]*?)```", raw, flags=re.IGNORECASE):
             candidates.append(match.group(1).strip())
@@ -1178,8 +2001,13 @@ class AIService:
                 break
         return result
 
-    def _parse_workflow_sync_payload(self, text: str) -> dict[str, Any]:
-        parsed = self._parse_outline_guide_payload(text)
+    def _parse_workflow_sync_payload(
+        self,
+        text: str,
+        *,
+        strict_json_fence: bool = False,
+    ) -> dict[str, Any]:
+        parsed = self._parse_outline_guide_payload(text, strict_json_fence=strict_json_fence)
         if parsed:
             return parsed
         raw = str(text or "").strip()
@@ -1192,6 +2020,136 @@ class AIService:
             "risk_notes": [],
             "search_used": False,
         }
+
+    def _parse_clarification_question_payload(
+        self,
+        text: str,
+        *,
+        strict_json_fence: bool,
+    ) -> dict[str, Any]:
+        parsed = self._parse_outline_guide_payload(text, strict_json_fence=strict_json_fence)
+        if not parsed:
+            if strict_json_fence:
+                raise RuntimeError("strict_json_fence_output=true requires clarification JSON fence")
+            question = str(text or "").strip()
+            return {
+                "clarification_id": generate_id("clq"),
+                "question_type": "other",
+                "question": question or tr("ai.chat.empty_fallback"),
+                "options": [
+                    {"value": "other", "label": "其他", "reason": ""},
+                ],
+                "must_answer": True,
+                "timeout_sec": 120,
+            }
+
+        normalized_type = str(parsed.get("question_type") or "other").strip()
+        allowed_types = {
+            "plot_direction",
+            "route_choice",
+            "character_style",
+            "world_rule",
+            "pace",
+            "other",
+        }
+        if normalized_type not in allowed_types:
+            normalized_type = "other"
+
+        options: list[dict[str, str]] = []
+        raw_options = parsed.get("options")
+        if isinstance(raw_options, list):
+            for item in raw_options:
+                if not isinstance(item, dict):
+                    continue
+                value = str(item.get("value") or "").strip()
+                label = str(item.get("label") or value).strip()
+                reason = str(item.get("reason") or "").strip()
+                if not value or not label:
+                    continue
+                options.append({"value": value, "label": label, "reason": reason})
+        if not any(item.get("value") == "other" for item in options):
+            options.append({"value": "other", "label": "其他", "reason": ""})
+        if not options:
+            options = [{"value": "other", "label": "其他", "reason": ""}]
+
+        return {
+            "clarification_id": str(parsed.get("clarification_id") or generate_id("clq")).strip(),
+            "question_type": normalized_type,
+            "question": str(parsed.get("question") or "").strip(),
+            "options": options,
+            "must_answer": bool(parsed.get("must_answer", True)),
+            "timeout_sec": int(parsed.get("timeout_sec", 120) or 120),
+        }
+
+    def _parse_correction_diff_payload(
+        self,
+        text: str,
+        *,
+        strict_json_fence: bool,
+    ) -> dict[str, Any]:
+        raw = str(text or "").strip()
+        if not raw:
+            return {"revised_content": "", "diff_patch": {}}
+
+        parsed = self._parse_outline_guide_payload(raw, strict_json_fence=strict_json_fence)
+        if not parsed:
+            if strict_json_fence:
+                raise RuntimeError("strict_json_fence_output=true requires correction JSON fence payload")
+            return {"revised_content": raw, "diff_patch": {}}
+
+        revised_content = str(
+            parsed.get("revised_content")
+            or parsed.get("content")
+            or parsed.get("full_text")
+            or parsed.get("full_content")
+            or ""
+        ).strip()
+        if not revised_content:
+            if strict_json_fence:
+                raise RuntimeError("strict_json_fence_output=true requires revised_content in correction payload")
+            revised_content = raw
+
+        diff_patch = parsed.get("diff_patch")
+        if not isinstance(diff_patch, dict):
+            diff_patch = {}
+        raw_hunks = diff_patch.get("hunks")
+        if isinstance(raw_hunks, list):
+            normalized_hunks: list[dict[str, Any]] = []
+            for item in raw_hunks:
+                if not isinstance(item, dict):
+                    continue
+                op = str(item.get("op") or "").strip().lower()
+                if op not in {"add", "delete", "replace"}:
+                    continue
+                try:
+                    start_line = int(item.get("start_line") or 1)
+                except (TypeError, ValueError):
+                    start_line = 1
+                try:
+                    end_line = int(item.get("end_line") or max(0, start_line - 1))
+                except (TypeError, ValueError):
+                    end_line = max(0, start_line - 1)
+                normalized_hunks.append(
+                    {
+                        "hunk_id": str(item.get("hunk_id") or generate_id("hunk")).strip(),
+                        "op": op,
+                        "start_line": max(1, start_line),
+                        "end_line": max(0, end_line),
+                        "old_text": str(item.get("old_text") or ""),
+                        "new_text": str(item.get("new_text") or ""),
+                        "reason": str(item.get("reason") or "").strip(),
+                    }
+                )
+            diff_patch = {
+                "diff_id": str(diff_patch.get("diff_id") or generate_id("diff")).strip(),
+                "base_revision": int(diff_patch.get("base_revision") or 0),
+                "base_content_hash": str(diff_patch.get("base_content_hash") or "").strip(),
+                "hunks": normalized_hunks,
+            }
+        else:
+            diff_patch = {}
+
+        return {"revised_content": revised_content, "diff_patch": diff_patch}
 
     def _create_suggested_nodes(
         self,
@@ -1385,23 +2343,35 @@ class AIService:
         task_type = state["task_type"]
         node = state["node"]
         context = state["context_pack"]
+        project_id = str(state.get("project_id", ""))
+        token_budget = int(state.get("token_budget", 2200))
         if task_type == "generate_chapter":
-            prompt = self._chapter_prompt(
-                node.title,
+            prompt, bundle = self._chapter_prompt(
+                project_id,
+                node,
                 context,
                 style_hint=str(state.get("style_hint", "")),
+                token_budget=token_budget,
             )
         elif task_type == "generate_branches":
-            prompt = self._branch_prompt(
-                node.title,
+            prompt, bundle = self._branch_prompt(
+                project_id,
+                node,
                 context,
                 n=int(state.get("branch_count", 3)),
+                token_budget=token_budget,
             )
         elif task_type in {"review_lore", "review_logic"}:
-            prompt = self._review_prompt(task_type, node.title, context)
+            prompt, bundle = self._review_prompt(
+                project_id,
+                task_type,
+                node,
+                context,
+                token_budget=token_budget,
+            )
         else:
             raise ValueError(tr("ai.workflow.unsupported_task_type", task_type=task_type))
-        return {"prompt": prompt}
+        return {"prompt": prompt, "prompt_bundle": bundle}
 
     def _wf_llm_node(self, state: WorkflowState) -> WorkflowState:
         self._ensure_task_not_cancelled(state)
@@ -1424,12 +2394,14 @@ class AIService:
         self._ensure_task_not_cancelled(state)
         node = state["node"]
         context = state["context_pack"]
-        prompt = self._planner_prompt(
-            node.title,
+        prompt, bundle = self._planner_prompt(
+            str(state.get("project_id", "")),
+            node,
             context,
             style_hint=str(state.get("style_hint", "")),
+            token_budget=max(400, int(state.get("token_budget", 2200)) // 2),
         )
-        return {"planner_prompt": prompt}
+        return {"planner_prompt": prompt, "planner_prompt_bundle": bundle}
 
     def _wf_planner_llm_node(self, state: WorkflowState) -> WorkflowState:
         self._ensure_task_not_cancelled(state)
@@ -1451,8 +2423,14 @@ class AIService:
         node = state["node"]
         context = state["context_pack"]
         planner_response = cast(LLMResponse, state["planner_response"])
-        prompt = self._writer_prompt(node.title, context, plan=planner_response.content)
-        return {"writer_prompt": prompt}
+        prompt, bundle = self._writer_prompt(
+            str(state.get("project_id", "")),
+            node,
+            context,
+            plan=planner_response.content,
+            token_budget=int(state.get("token_budget", 2200)),
+        )
+        return {"writer_prompt": prompt, "writer_prompt_bundle": bundle}
 
     def _wf_writer_llm_node(self, state: WorkflowState) -> WorkflowState:
         self._ensure_task_not_cancelled(state)
@@ -1474,12 +2452,14 @@ class AIService:
         node = state["node"]
         context = state["context_pack"]
         writer_response = cast(LLMResponse, state["writer_response"])
-        prompt = self._chapter_reviewer_prompt(
-            node.title,
+        prompt, bundle = self._chapter_reviewer_prompt(
+            str(state.get("project_id", "")),
+            node,
             context,
             draft=writer_response.content,
+            token_budget=max(400, int(state.get("token_budget", 2200)) // 2),
         )
-        return {"reviewer_prompt": prompt}
+        return {"reviewer_prompt": prompt, "reviewer_prompt_bundle": bundle}
 
     def _wf_reviewer_llm_node(self, state: WorkflowState) -> WorkflowState:
         self._ensure_task_not_cancelled(state)
@@ -1499,14 +2479,18 @@ class AIService:
     def _wf_synthesizer_prompt_node(self, state: WorkflowState) -> WorkflowState:
         self._ensure_task_not_cancelled(state)
         node = state["node"]
+        context = state["context_pack"]
         writer_response = cast(LLMResponse, state["writer_response"])
         reviewer_response = cast(LLMResponse, state["reviewer_response"])
-        prompt = self._synthesizer_prompt(
-            node.title,
+        prompt, bundle = self._synthesizer_prompt(
+            str(state.get("project_id", "")),
+            node,
+            context,
             draft=writer_response.content,
             review_feedback=reviewer_response.content,
+            token_budget=int(state.get("token_budget", 2200)),
         )
-        return {"synthesizer_prompt": prompt}
+        return {"synthesizer_prompt": prompt, "synthesizer_prompt_bundle": bundle}
 
     def _wf_synthesizer_llm_node(self, state: WorkflowState) -> WorkflowState:
         self._ensure_task_not_cancelled(state)
@@ -1580,8 +2564,17 @@ class AIService:
             return compact
         return f"{compact[: max_len - 3]}..."
 
-    def _parse_branch_options(self, content: str, *, count: int) -> list[BranchOption]:
-        parsed_payload, parsed_mode = self._parse_branch_options_payload(content)
+    def _parse_branch_options(
+        self,
+        content: str,
+        *,
+        count: int,
+        strict_json_fence: bool = False,
+    ) -> list[BranchOption]:
+        parsed_payload, parsed_mode = self._parse_branch_options_payload(
+            content,
+            strict_json_fence=strict_json_fence,
+        )
         if parsed_payload:
             parsed_options: list[BranchOption] = []
             top_level_mode = self._normalize_plan_mode(parsed_mode or parsed_payload[0].get("plan_mode"))
@@ -1628,6 +2621,9 @@ class AIService:
                 )
             return parsed_options
 
+        if strict_json_fence:
+            raise RuntimeError("strict_json_fence_output=true requires valid JSON fence payload")
+
         options: list[BranchOption] = []
         for line in content.splitlines():
             text = line.strip()
@@ -1666,10 +2662,28 @@ class AIService:
             )
         return options
 
-    def _parse_branch_options_payload(self, content: str) -> tuple[list[dict[str, Any]], str]:
+    def _parse_branch_options_payload(
+        self,
+        content: str,
+        *,
+        strict_json_fence: bool = False,
+    ) -> tuple[list[dict[str, Any]], str]:
         raw = str(content or "").strip()
         if not raw:
             return [], "story_extend"
+        if strict_json_fence:
+            payload = self._parse_strict_json_fence_payload(raw)
+            if isinstance(payload, list):
+                return [item for item in payload if isinstance(item, dict)], "story_extend"
+            if isinstance(payload, dict):
+                top_level_mode = self._normalize_plan_mode(payload.get("plan_mode"))
+                options = payload.get("options")
+                if isinstance(options, list):
+                    return [item for item in options if isinstance(item, dict)], top_level_mode
+                option = payload.get("option")
+                if isinstance(option, dict):
+                    return [option], top_level_mode
+            raise RuntimeError("strict_json_fence_output=true requires JSON object/array payload")
         candidates = [raw]
         bracket_match = re.search(r"\[[\s\S]*\]", raw)
         if bracket_match:

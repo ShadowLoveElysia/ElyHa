@@ -1,8 +1,16 @@
 import React, {useEffect, useRef, useState} from 'react';
 import {Send, Bot, User, X, Sparkles, MoreHorizontal, PlusCircle, ShieldCheck} from 'lucide-react';
 import {cn} from '../utils';
-import {sendAiChat} from '../api';
-import type {AiSuggestedOption} from '../types';
+import {
+  getAgentSession,
+  listAgentSettingProposals,
+  reviewAgentSettingProposalsBatch,
+  sendAiChat,
+  startAgentSession,
+  submitAgentDiffReview,
+  submitAgentDecision,
+} from '../api';
+import type {AgentSessionPayload, AiSuggestedOption} from '../types';
 import type {TranslationVars} from '../i18n';
 
 interface ChatMessage {
@@ -30,6 +38,17 @@ function errorToText(error: unknown, fallback = 'Unknown error'): string {
   return String(error || fallback);
 }
 
+function makeDecisionId(prefix: string): string {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+  return value as Record<string, unknown>;
+}
+
 export function AIChat({
   isOpen,
   onClose,
@@ -45,6 +64,15 @@ export function AIChat({
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
   const [allowNodeWrite, setAllowNodeWrite] = useState(false);
+  const [agentThreadId, setAgentThreadId] = useState('');
+  const [agentSession, setAgentSession] = useState<AgentSessionPayload | null>(null);
+  const [sessionBusy, setSessionBusy] = useState(false);
+  const [correctionInput, setCorrectionInput] = useState('');
+  const [persistDirective, setPersistDirective] = useState('');
+  const [proposalBusy, setProposalBusy] = useState(false);
+  const [proposalQueue, setProposalQueue] = useState<Array<Record<string, unknown>>>([]);
+  const [selectedProposalIds, setSelectedProposalIds] = useState<string[]>([]);
+  const [deferReviewEnabled, setDeferReviewEnabled] = useState(true);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -63,6 +91,15 @@ export function AIChat({
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({behavior: 'smooth'});
   }, [messages]);
+
+  useEffect(() => {
+    if (!agentSession) {
+      return;
+    }
+    if (agentSession.status === 'AWAITING_SETTING_PROPOSAL_CONFIRM') {
+      void loadProposalQueue();
+    }
+  }, [agentSession?.status]);
 
   const appendMessage = (message: ChatMessage) => {
     setMessages((prev) => [...prev, message]);
@@ -133,6 +170,226 @@ export function AIChat({
     }
   };
 
+  const applySessionPayload = (payload: {thread_id: string; session: AgentSessionPayload}) => {
+    const cleanThreadId = String(payload.thread_id || '').trim();
+    if (cleanThreadId) {
+      setAgentThreadId(cleanThreadId);
+    }
+    setAgentSession(payload.session || null);
+  };
+
+  const startSession = async () => {
+    if (!projectId) {
+      onStatus?.(t('web.chat.project_required'), true);
+      return;
+    }
+    if (!selectedNodeId) {
+      onStatus?.('selected node required', true);
+      return;
+    }
+    setSessionBusy(true);
+    try {
+      const payload = await startAgentSession({
+        project_id: projectId,
+        node_id: selectedNodeId,
+        mode: 'single_agent',
+        token_budget: 2200,
+        thread_id: agentThreadId.trim() || undefined,
+      });
+      applySessionPayload(payload);
+      onStatus?.(`agent session started: ${payload.thread_id}`, false);
+      if (onRefreshProject) {
+        await onRefreshProject();
+      }
+    } catch (error) {
+      onStatus?.(errorToText(error, t('web.error.unknown')), true);
+    } finally {
+      setSessionBusy(false);
+    }
+  };
+
+  const refreshSession = async () => {
+    const threadId = agentThreadId.trim();
+    if (!threadId) {
+      onStatus?.('agent thread_id required', true);
+      return;
+    }
+    setSessionBusy(true);
+    try {
+      const payload = await getAgentSession(threadId);
+      applySessionPayload(payload);
+      onStatus?.(`session status: ${payload.session.status}`, false);
+    } catch (error) {
+      onStatus?.(errorToText(error, t('web.error.unknown')), true);
+    } finally {
+      setSessionBusy(false);
+    }
+  };
+
+  const submitSessionDecision = async (action: string, payload: Record<string, unknown> = {}) => {
+    const threadId = agentThreadId.trim();
+    if (!threadId) {
+      onStatus?.('agent thread_id required', true);
+      return;
+    }
+    setSessionBusy(true);
+    try {
+      const response = await submitAgentDecision({
+        thread_id: threadId,
+        action,
+        decision_id: makeDecisionId('d-ui'),
+        expected_state_version: agentSession?.state_version,
+        payload,
+      });
+      applySessionPayload(response);
+      onStatus?.(`decision applied: ${action} -> ${response.session.status}`, false);
+      if (response.session.status === 'AWAITING_SETTING_PROPOSAL_CONFIRM') {
+        void loadProposalQueue();
+      }
+      if (action === 'confirm_yes' || action === 'confirm_yes_persist_rule' || action === 'satisfied') {
+        if (onRefreshProject) {
+          await onRefreshProject();
+        }
+      }
+    } catch (error) {
+      onStatus?.(errorToText(error, t('web.error.unknown')), true);
+    } finally {
+      setSessionBusy(false);
+    }
+  };
+
+  const applyDiffReview = async (rejectAll: boolean) => {
+    const threadId = agentThreadId.trim();
+    if (!threadId) {
+      onStatus?.('agent thread_id required', true);
+      return;
+    }
+    if (!agentSession) {
+      onStatus?.('session not loaded', true);
+      return;
+    }
+    const pendingMeta = asRecord(agentSession.pending_meta);
+    const diffPatch = asRecord(pendingMeta.diff_patch);
+    const diffId = String(diffPatch.diff_id || '').trim();
+    if (!diffId) {
+      onStatus?.('diff_patch missing', true);
+      return;
+    }
+    const hunks = Array.isArray(diffPatch.hunks)
+      ? diffPatch.hunks.map((item) => asRecord(item))
+      : [];
+    const allHunkIds = hunks
+      .map((item) => String(item.hunk_id || '').trim())
+      .filter(Boolean);
+    setSessionBusy(true);
+    try {
+      const payload = await submitAgentDiffReview({
+        thread_id: threadId,
+        diff_id: diffId,
+        decision_id: makeDecisionId('d-diff'),
+        expected_base_revision: Number(diffPatch.base_revision || 0),
+        expected_base_hash: String(diffPatch.base_content_hash || ''),
+        expected_state_version: agentSession.state_version,
+        accepted_hunk_ids: rejectAll ? [] : allHunkIds,
+        rejected_hunk_ids: rejectAll ? allHunkIds : [],
+      });
+      applySessionPayload(payload);
+      onStatus?.(
+        rejectAll ? 'diff review done: rejected all hunks' : 'diff review done: applied selected hunks',
+        false,
+      );
+    } catch (error) {
+      onStatus?.(errorToText(error, t('web.error.unknown')), true);
+    } finally {
+      setSessionBusy(false);
+    }
+  };
+
+  const loadProposalQueue = async () => {
+    const threadId = (agentThreadId || agentSession?.thread_id || '').trim();
+    if (!threadId) {
+      onStatus?.('agent thread_id required', true);
+      return;
+    }
+    setProposalBusy(true);
+    try {
+      const payload = await listAgentSettingProposals(threadId, 'pending_review');
+      setProposalQueue(payload.setting_proposals || []);
+      const ids = (payload.setting_proposals || [])
+        .map((item) => String(item.id || '').trim())
+        .filter(Boolean);
+      setSelectedProposalIds(ids);
+      onStatus?.(`pending proposals: ${payload.count}`, false);
+    } catch (error) {
+      onStatus?.(errorToText(error, t('web.error.unknown')), true);
+    } finally {
+      setProposalBusy(false);
+    }
+  };
+
+  const reviewProposalBatch = async (action: 'approve' | 'reject') => {
+    const threadId = (agentThreadId || agentSession?.thread_id || '').trim();
+    if (!threadId) {
+      onStatus?.('agent thread_id required', true);
+      return;
+    }
+    if (selectedProposalIds.length === 0) {
+      onStatus?.('no proposal selected', true);
+      return;
+    }
+    setProposalBusy(true);
+    try {
+      const payload = await reviewAgentSettingProposalsBatch({
+        thread_id: threadId,
+        action,
+        proposal_ids: selectedProposalIds,
+        decision_id: makeDecisionId('d-batch'),
+        expected_state_version: agentSession?.state_version,
+      });
+      applySessionPayload(payload);
+      await loadProposalQueue();
+      onStatus?.(`batch ${action} done: ${selectedProposalIds.length}`, false);
+    } catch (error) {
+      onStatus?.(errorToText(error, t('web.error.unknown')), true);
+    } finally {
+      setProposalBusy(false);
+    }
+  };
+
+  const deferCurrentProposal = async () => {
+    const threadId = (agentThreadId || agentSession?.thread_id || '').trim();
+    if (!threadId) {
+      onStatus?.('agent thread_id required', true);
+      return;
+    }
+    await submitSessionDecision('defer_setting_update');
+    void loadProposalQueue();
+  };
+
+  const toggleProposalSelected = (proposalId: string, checked: boolean) => {
+    setSelectedProposalIds((prev) => {
+      const clean = proposalId.trim();
+      if (!clean) {
+        return prev;
+      }
+      if (checked) {
+        if (prev.includes(clean)) {
+          return prev;
+        }
+        return [...prev, clean];
+      }
+      return prev.filter((item) => item !== clean);
+    });
+  };
+
+  const sessionPendingMeta = asRecord(agentSession?.pending_meta);
+  const sessionDiffPatch = asRecord(sessionPendingMeta.diff_patch);
+  const sessionDiffHunks = Array.isArray(sessionDiffPatch.hunks)
+    ? sessionDiffPatch.hunks.map((item) => asRecord(item)).filter((item) => String(item.hunk_id || '').trim())
+    : [];
+  const sessionStatus = String(agentSession?.status || '').trim();
+  const pendingStateUpdateCount = Number(agentSession?.pending_state_update_count || 0);
+
   return (
     <div
       className={cn(
@@ -172,6 +429,241 @@ export function AIChat({
               {t('web.chat.allow_node_write')}
             </span>
           </label>
+        </div>
+      </div>
+
+      <div className="px-4 py-2 border-b border-slate-100 bg-slate-50/70 text-[11px] text-slate-600 space-y-2">
+        <div className="flex items-center gap-2">
+          <input
+            value={agentThreadId}
+            onChange={(event) => setAgentThreadId(event.target.value)}
+            placeholder="agent thread_id"
+            className="flex-1 h-8 rounded-md border border-slate-200 bg-white px-2 text-xs"
+          />
+          <button
+            onClick={() => void refreshSession()}
+            disabled={sessionBusy || !agentThreadId.trim()}
+            className="h-8 px-2 rounded-md border border-slate-200 bg-white hover:bg-slate-100 disabled:opacity-60"
+          >
+            Refresh
+          </button>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => void startSession()}
+            disabled={sessionBusy || !projectId || !selectedNodeId}
+            className="h-8 px-3 rounded-md bg-indigo-50 text-indigo-700 border border-indigo-200 hover:bg-indigo-100 disabled:opacity-60"
+          >
+            Start Session
+          </button>
+          <button
+            onClick={() => void loadProposalQueue()}
+            disabled={proposalBusy || !agentThreadId.trim()}
+            className="h-8 px-3 rounded-md border border-slate-200 bg-white hover:bg-slate-100 disabled:opacity-60"
+          >
+            Load Proposals
+          </button>
+        </div>
+
+        <div className="rounded-md border border-slate-200 bg-white p-2 text-[11px]">
+          {agentSession ? (
+            <div className="space-y-1">
+              <div>
+                status=<span className="font-semibold text-slate-800">{agentSession.status}</span>, version=
+                {agentSession.state_version}
+              </div>
+              <div>
+                pending_content_chars={String(agentSession.pending_content || '').length}, pending_state_update=
+                {pendingStateUpdateCount}
+              </div>
+              <div>latest_setting_proposal_id={agentSession.latest_setting_proposal_id || '-'}</div>
+            </div>
+          ) : (
+            <div className="text-slate-400">Session not loaded.</div>
+          )}
+        </div>
+
+        <input
+          value={correctionInput}
+          onChange={(event) => setCorrectionInput(event.target.value)}
+          placeholder="correction / unsatisfied note"
+          className="w-full h-8 rounded-md border border-slate-200 bg-white px-2 text-xs"
+        />
+        <input
+          value={persistDirective}
+          onChange={(event) => setPersistDirective(event.target.value)}
+          placeholder="directive for confirm_yes_persist_rule"
+          className="w-full h-8 rounded-md border border-slate-200 bg-white px-2 text-xs"
+        />
+
+        {(sessionStatus === 'AWAITING_CONFIRM' || sessionStatus === 'AWAITING_CORRECTION_CONFIRM') && (
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              onClick={() => void submitSessionDecision('confirm_yes')}
+              disabled={sessionBusy || !agentThreadId.trim()}
+              className="h-8 px-3 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100 disabled:opacity-60"
+            >
+              Confirm Yes
+            </button>
+            <button
+              onClick={() =>
+                void submitSessionDecision('confirm_yes_persist_rule', {directive: persistDirective.trim()})
+              }
+              disabled={sessionBusy || !agentThreadId.trim() || !persistDirective.trim()}
+              className="h-8 px-3 rounded-md bg-cyan-50 text-cyan-700 border border-cyan-200 hover:bg-cyan-100 disabled:opacity-60"
+            >
+              Confirm + Persist
+            </button>
+            <button
+              onClick={() =>
+                void submitSessionDecision('correct', {
+                  correction: correctionInput.trim() || '请继续修订并提高一致性。',
+                })
+              }
+              disabled={sessionBusy || !agentThreadId.trim()}
+              className="h-8 px-3 rounded-md bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100 disabled:opacity-60"
+            >
+              Correct
+            </button>
+            <button
+              onClick={() => void submitSessionDecision('stop')}
+              disabled={sessionBusy || !agentThreadId.trim()}
+              className="h-8 px-3 rounded-md bg-rose-50 text-rose-700 border border-rose-200 hover:bg-rose-100 disabled:opacity-60"
+            >
+              Stop
+            </button>
+          </div>
+        )}
+
+        {sessionStatus === 'AWAITING_CHAPTER_REVIEW' && (
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              onClick={() => void submitSessionDecision('satisfied')}
+              disabled={sessionBusy || !agentThreadId.trim()}
+              className="h-8 px-3 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100 disabled:opacity-60"
+            >
+              Chapter Satisfied
+            </button>
+            <button
+              onClick={() =>
+                void submitSessionDecision('unsatisfied', {
+                  correction: correctionInput.trim() || '继续修订章节完成度。',
+                })
+              }
+              disabled={sessionBusy || !agentThreadId.trim()}
+              className="h-8 px-3 rounded-md bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100 disabled:opacity-60"
+            >
+              Chapter Unsatisfied
+            </button>
+          </div>
+        )}
+
+        {sessionStatus === 'AWAITING_SETTING_PROPOSAL_CONFIRM' && (
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              onClick={() =>
+                void submitSessionDecision('approve_setting_update', {
+                  proposal_id: agentSession?.latest_setting_proposal_id || '',
+                })
+              }
+              disabled={sessionBusy || !agentThreadId.trim()}
+              className="h-8 px-3 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100 disabled:opacity-60"
+            >
+              Approve Proposal
+            </button>
+            <button
+              onClick={() =>
+                void submitSessionDecision('reject_setting_update', {
+                  proposal_id: agentSession?.latest_setting_proposal_id || '',
+                })
+              }
+              disabled={sessionBusy || !agentThreadId.trim()}
+              className="h-8 px-3 rounded-md bg-rose-50 text-rose-700 border border-rose-200 hover:bg-rose-100 disabled:opacity-60"
+            >
+              Reject Proposal
+            </button>
+            <button
+              onClick={() => void deferCurrentProposal()}
+              disabled={sessionBusy || !agentThreadId.trim() || !deferReviewEnabled}
+              className="h-8 px-3 rounded-md border border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100 disabled:opacity-60"
+            >
+              Defer Current
+            </button>
+          </div>
+        )}
+
+        {sessionStatus === 'AWAITING_CORRECTION_CONFIRM' && sessionDiffHunks.length > 0 && (
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-slate-500">Diff hunks: {sessionDiffHunks.length}</span>
+            <button
+              onClick={() => void applyDiffReview(false)}
+              disabled={sessionBusy || !agentThreadId.trim()}
+              className="h-8 px-3 rounded-md bg-violet-50 text-violet-700 border border-violet-200 hover:bg-violet-100 disabled:opacity-60"
+            >
+              Apply Diff Hunks
+            </button>
+            <button
+              onClick={() => void applyDiffReview(true)}
+              disabled={sessionBusy || !agentThreadId.trim()}
+              className="h-8 px-3 rounded-md bg-slate-100 text-slate-700 border border-slate-200 hover:bg-slate-200 disabled:opacity-60"
+            >
+              Reject All Hunks
+            </button>
+          </div>
+        )}
+
+        <div className="flex items-center justify-between">
+          <label className="inline-flex items-center gap-1">
+            <input
+              type="checkbox"
+              checked={deferReviewEnabled}
+              onChange={(event) => setDeferReviewEnabled(event.target.checked)}
+            />
+            <span>Enable defer-review shortcut</span>
+          </label>
+        </div>
+
+        {proposalQueue.length > 0 ? (
+          <div className="space-y-1 max-h-28 overflow-y-auto rounded-md border border-slate-200 bg-white p-2">
+            {proposalQueue.map((proposal) => {
+              const proposalId = String(proposal.id || '').trim();
+              const checked = selectedProposalIds.includes(proposalId);
+              const proposalType = String(proposal.proposal_type || '');
+              const proposalStatus = String(proposal.status || '');
+              return (
+                <label key={proposalId} className="flex items-center gap-2 text-[11px]">
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={(event) => toggleProposalSelected(proposalId, event.target.checked)}
+                  />
+                  <span className="truncate">
+                    {proposalId} [{proposalType || 'unknown'} / {proposalStatus || 'pending'}]
+                  </span>
+                </label>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="text-slate-400">No pending setting proposals.</div>
+        )}
+
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => void reviewProposalBatch('approve')}
+            disabled={proposalBusy || selectedProposalIds.length === 0}
+            className="h-8 px-3 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100 disabled:opacity-60"
+          >
+            Approve Selected
+          </button>
+          <button
+            onClick={() => void reviewProposalBatch('reject')}
+            disabled={proposalBusy || selectedProposalIds.length === 0}
+            className="h-8 px-3 rounded-md bg-rose-50 text-rose-700 border border-rose-200 hover:bg-rose-100 disabled:opacity-60"
+          >
+            Reject Selected
+          </button>
         </div>
       </div>
 

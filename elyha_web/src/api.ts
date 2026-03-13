@@ -1,6 +1,10 @@
 import type {
+  AgentSettingProposalsResponse,
+  AgentSessionResponse,
   AiChatPayload,
   AiChatResponse,
+  ClarificationQuestionPayload,
+  ClarificationQuestionResponse,
   CreateNodePayload,
   GenerateChapterResponse,
   GraphEdgePayload,
@@ -8,9 +12,17 @@ import type {
   LlmPresetPayload,
   ProjectInsights,
   ProjectPayload,
+  RequestAgentClarificationPayload,
+  ResumeAgentSessionPayload,
+  ReviewAgentSettingProposalPayload,
+  ReviewAgentSettingProposalsBatchPayload,
   RuntimeConfigPayload,
   RuntimeSettingsPayload,
   SnapshotPayload,
+  StartAgentSessionPayload,
+  SubmitAgentClarificationAnswerPayload,
+  SubmitAgentDiffReviewPayload,
+  SubmitAgentDecisionPayload,
   UpdateNodePayload,
   ValidationReport,
   WorkflowMode,
@@ -235,6 +247,106 @@ export async function sendAiChat(payload: AiChatPayload): Promise<AiChatResponse
     method: 'POST',
     body: payload,
     timeoutMs: 180_000,
+  });
+}
+
+export async function requestClarificationQuestion(
+  payload: ClarificationQuestionPayload,
+): Promise<ClarificationQuestionResponse> {
+  return apiRequest<ClarificationQuestionResponse>('/api/ai/clarification/question', {
+    method: 'POST',
+    body: payload,
+    timeoutMs: 120_000,
+  });
+}
+
+export async function startAgentSession(payload: StartAgentSessionPayload): Promise<AgentSessionResponse> {
+  return apiRequest<AgentSessionResponse>('/api/agent/session/start', {
+    method: 'POST',
+    body: payload,
+    timeoutMs: 240_000,
+  });
+}
+
+export async function resumeAgentSession(payload: ResumeAgentSessionPayload): Promise<AgentSessionResponse> {
+  return apiRequest<AgentSessionResponse>('/api/agent/session/resume', {
+    method: 'POST',
+    body: payload,
+  });
+}
+
+export async function getAgentSession(threadId: string): Promise<AgentSessionResponse> {
+  return apiRequest<AgentSessionResponse>(`/api/agent/session/${threadId}`);
+}
+
+export async function submitAgentDecision(payload: SubmitAgentDecisionPayload): Promise<AgentSessionResponse> {
+  return apiRequest<AgentSessionResponse>('/api/agent/session/decision', {
+    method: 'POST',
+    body: payload,
+    timeoutMs: 240_000,
+  });
+}
+
+export async function requestAgentClarification(
+  payload: RequestAgentClarificationPayload,
+): Promise<AgentSessionResponse> {
+  return apiRequest<AgentSessionResponse>('/api/agent/session/clarification/question', {
+    method: 'POST',
+    body: payload,
+    timeoutMs: 180_000,
+  });
+}
+
+export async function submitAgentClarificationAnswer(
+  payload: SubmitAgentClarificationAnswerPayload,
+): Promise<AgentSessionResponse> {
+  return apiRequest<AgentSessionResponse>('/api/agent/session/clarification/answer', {
+    method: 'POST',
+    body: payload,
+  });
+}
+
+export async function reviewAgentSettingProposal(
+  payload: ReviewAgentSettingProposalPayload,
+): Promise<AgentSessionResponse> {
+  return apiRequest<AgentSessionResponse>('/api/agent/session/setting_proposal/review', {
+    method: 'POST',
+    body: payload,
+    timeoutMs: 180_000,
+  });
+}
+
+export async function listAgentSettingProposals(
+  threadId: string,
+  status = '',
+): Promise<AgentSettingProposalsResponse> {
+  const suffix = status ? `?status=${encodeURIComponent(status)}` : '';
+  return apiRequest<AgentSettingProposalsResponse>(`/api/agent/session/${threadId}/setting_proposals${suffix}`);
+}
+
+export async function reviewAgentSettingProposalsBatch(
+  payload: ReviewAgentSettingProposalsBatchPayload,
+): Promise<AgentSessionResponse> {
+  return apiRequest<AgentSessionResponse>('/api/agent/session/setting_proposals/review_batch', {
+    method: 'POST',
+    body: payload,
+    timeoutMs: 180_000,
+  });
+}
+
+export async function submitAgentDiffReview(
+  payload: SubmitAgentDiffReviewPayload,
+): Promise<AgentSessionResponse> {
+  return apiRequest<AgentSessionResponse>('/api/agent/session/diff/review', {
+    method: 'POST',
+    body: payload,
+    timeoutMs: 180_000,
+  });
+}
+
+export async function cancelAgentSession(threadId: string): Promise<AgentSessionResponse> {
+  return apiRequest<AgentSessionResponse>(`/api/agent/session/${threadId}/cancel`, {
+    method: 'POST',
   });
 }
 

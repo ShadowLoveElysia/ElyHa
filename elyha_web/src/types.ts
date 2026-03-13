@@ -10,6 +10,12 @@ export interface ProjectSettings {
   system_prompt_style: string;
   system_prompt_forbidden: string;
   system_prompt_notes: string;
+  global_directives: string;
+  context_soft_min_chars: number;
+  context_soft_max_chars: number;
+  context_sentence_safe_expand_chars: number;
+  context_soft_max_tokens: number;
+  strict_json_fence_output: boolean;
 }
 
 export interface ProjectPayload {
@@ -154,6 +160,139 @@ export interface AiChatResponse {
   suggested_node_ids: string[];
   suggested_options: AiSuggestedOption[];
   revision: number;
+}
+
+export interface ClarificationQuestionPayload {
+  project_id: string;
+  node_id?: string;
+  context?: string;
+  token_budget?: number;
+}
+
+export interface ClarificationQuestionResponse {
+  project_id: string;
+  clarification_id: string;
+  question_type: string;
+  question: string;
+  options: Array<{
+    value: string;
+    label: string;
+    reason?: string;
+  }>;
+  must_answer: boolean;
+  timeout_sec: number;
+  setting_proposal_status: string;
+  provider: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+}
+
+export interface AgentSessionPayload {
+  thread_id: string;
+  project_id: string;
+  node_id: string;
+  mode: string;
+  status: string;
+  state_version: number;
+  token_budget: number;
+  style_hint: string;
+  pending_content: string;
+  pending_meta: Record<string, unknown>;
+  pending_clarification: Record<string, unknown>;
+  latest_clarification_id: string;
+  latest_setting_proposal_id: string;
+  latest_setting_proposal?: Record<string, unknown> | null;
+  last_committed_revision: number;
+  last_error: string;
+  pending_state_update_count?: number;
+  state_update_retry_summary?: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StartAgentSessionPayload {
+  project_id: string;
+  node_id: string;
+  mode?: string;
+  token_budget?: number;
+  style_hint?: string;
+  thread_id?: string;
+}
+
+export interface ResumeAgentSessionPayload {
+  thread_id: string;
+}
+
+export interface SubmitAgentDecisionPayload {
+  thread_id: string;
+  action: string;
+  decision_id: string;
+  expected_state_version?: number;
+  payload?: Record<string, unknown>;
+}
+
+export interface RequestAgentClarificationPayload {
+  thread_id: string;
+  context?: string;
+  token_budget?: number;
+}
+
+export interface SubmitAgentClarificationAnswerPayload {
+  thread_id: string;
+  clarification_id: string;
+  decision_id: string;
+  selected_option?: string;
+  answer_text?: string;
+}
+
+export interface ReviewAgentSettingProposalPayload {
+  thread_id: string;
+  proposal_id: string;
+  action: string;
+  reviewer?: string;
+  note?: string;
+  decision_id: string;
+  expected_state_version?: number;
+}
+
+export interface ReviewAgentSettingProposalsBatchPayload {
+  thread_id: string;
+  action: string;
+  proposal_ids?: string[];
+  reviewer?: string;
+  note?: string;
+  decision_id: string;
+  expected_state_version?: number;
+}
+
+export interface SubmitAgentDiffReviewPayload {
+  thread_id: string;
+  diff_id: string;
+  decision_id: string;
+  accepted_hunk_ids?: string[];
+  rejected_hunk_ids?: string[];
+  expected_base_revision?: number;
+  expected_base_hash?: string;
+  expected_state_version?: number;
+}
+
+export interface AgentSessionResponse {
+  thread_id: string;
+  session: AgentSessionPayload;
+  clarification_request?: Record<string, unknown>;
+  setting_proposal?: Record<string, unknown>;
+  setting_proposals?: Array<Record<string, unknown>>;
+  diff_review?: Record<string, unknown>;
+  commit?: Record<string, unknown>;
+  review_action?: string;
+  review_count?: number;
+}
+
+export interface AgentSettingProposalsResponse {
+  thread_id: string;
+  status_filter: string;
+  setting_proposals: Array<Record<string, unknown>>;
+  count: number;
 }
 
 export interface GenerateChapterResponse {

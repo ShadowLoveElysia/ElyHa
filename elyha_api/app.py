@@ -31,6 +31,8 @@ from elyha_core.services.project_service import (
     ProjectService,
     ProjectSettingsPatch,
 )
+from elyha_core.services.session_orchestrator_service import SessionOrchestratorService
+from elyha_core.services.setting_proposal_service import SettingProposalService
 from elyha_core.services.snapshot_service import SnapshotService
 from elyha_core.services.state_service import StateService
 from elyha_core.services.validation_service import ValidationService
@@ -50,6 +52,8 @@ class ServiceContainer:
     state_service: StateService
     context_service: ContextService
     ai_service: AIService
+    setting_proposal_service: SettingProposalService
+    session_orchestrator_service: SessionOrchestratorService
     insight_service: InsightService
     core_config_manager: CoreConfigManager
     llm_presets: dict[str, LLMPreset]
@@ -66,6 +70,12 @@ class UpdateSettingsRequest(BaseModel):
     system_prompt_style: str | None = Field(default=None, max_length=4000)
     system_prompt_forbidden: str | None = Field(default=None, max_length=4000)
     system_prompt_notes: str | None = Field(default=None, max_length=4000)
+    global_directives: str | None = Field(default=None, max_length=12000)
+    context_soft_min_chars: int | None = Field(default=None, ge=1)
+    context_soft_max_chars: int | None = Field(default=None, ge=1)
+    context_sentence_safe_expand_chars: int | None = Field(default=None, ge=0)
+    context_soft_max_tokens: int | None = Field(default=None, ge=1)
+    strict_json_fence_output: bool | None = None
 
 
 class CreateNodeRequest(BaseModel):
@@ -236,6 +246,79 @@ class WorkflowSyncRequest(BaseModel):
     token_budget: int = Field(default=1400, ge=1)
 
 
+class ClarificationQuestionRequest(BaseModel):
+    project_id: str
+    node_id: str | None = None
+    context: str = ""
+    token_budget: int = Field(default=900, ge=1)
+
+
+class StartAgentSessionRequest(BaseModel):
+    project_id: str
+    node_id: str
+    mode: str = "single_agent"
+    token_budget: int = Field(default=2200, ge=1)
+    style_hint: str = ""
+    thread_id: str | None = None
+
+
+class ResumeAgentSessionRequest(BaseModel):
+    thread_id: str = Field(min_length=1, max_length=128)
+
+
+class SubmitAgentDecisionRequest(BaseModel):
+    thread_id: str = Field(min_length=1, max_length=128)
+    action: str = Field(min_length=1, max_length=64)
+    decision_id: str = Field(min_length=1, max_length=128)
+    expected_state_version: int | None = Field(default=None, ge=1)
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class RequestAgentClarificationRequest(BaseModel):
+    thread_id: str = Field(min_length=1, max_length=128)
+    context: str = ""
+    token_budget: int = Field(default=900, ge=1)
+
+
+class SubmitClarificationAnswerRequest(BaseModel):
+    thread_id: str = Field(min_length=1, max_length=128)
+    clarification_id: str = Field(min_length=1, max_length=128)
+    decision_id: str = Field(min_length=1, max_length=128)
+    selected_option: str = ""
+    answer_text: str = ""
+
+
+class ReviewSettingProposalActionRequest(BaseModel):
+    thread_id: str = Field(min_length=1, max_length=128)
+    proposal_id: str = Field(min_length=1, max_length=128)
+    action: str = Field(min_length=1, max_length=32)
+    reviewer: str = ""
+    note: str = ""
+    decision_id: str = Field(min_length=1, max_length=128)
+    expected_state_version: int | None = Field(default=None, ge=1)
+
+
+class SubmitDiffReviewRequest(BaseModel):
+    thread_id: str = Field(min_length=1, max_length=128)
+    diff_id: str = Field(min_length=1, max_length=128)
+    decision_id: str = Field(min_length=1, max_length=128)
+    accepted_hunk_ids: list[str] = Field(default_factory=list)
+    rejected_hunk_ids: list[str] = Field(default_factory=list)
+    expected_base_revision: int | None = Field(default=None, ge=0)
+    expected_base_hash: str | None = Field(default=None, max_length=128)
+    expected_state_version: int | None = Field(default=None, ge=1)
+
+
+class ReviewSettingProposalsBatchRequest(BaseModel):
+    thread_id: str = Field(min_length=1, max_length=128)
+    action: str = Field(min_length=1, max_length=32)
+    proposal_ids: list[str] = Field(default_factory=list)
+    reviewer: str = ""
+    note: str = ""
+    decision_id: str = Field(min_length=1, max_length=128)
+    expected_state_version: int | None = Field(default=None, ge=1)
+
+
 class UpdateRuntimeSettingsRequest(BaseModel):
     locale: str | None = None
     llm_provider: str | None = None
@@ -286,6 +369,12 @@ def _to_project_payload(project) -> dict[str, Any]:
             "system_prompt_style": project.settings.system_prompt_style,
             "system_prompt_forbidden": project.settings.system_prompt_forbidden,
             "system_prompt_notes": project.settings.system_prompt_notes,
+            "global_directives": project.settings.global_directives,
+            "context_soft_min_chars": project.settings.context_soft_min_chars,
+            "context_soft_max_chars": project.settings.context_soft_max_chars,
+            "context_sentence_safe_expand_chars": project.settings.context_sentence_safe_expand_chars,
+            "context_soft_max_tokens": project.settings.context_soft_max_tokens,
+            "strict_json_fence_output": project.settings.strict_json_fence_output,
         },
     }
 
@@ -443,6 +532,7 @@ def _build_ai_service(
     graph_service: GraphService,
     context_service: ContextService,
     validation_service: ValidationService,
+    state_service: StateService,
     runtime_config: CoreRuntimeConfig,
     llm_presets: dict[str, LLMPreset],
 ) -> AIService:
@@ -454,6 +544,7 @@ def _build_ai_service(
         llm_provider=runtime_config.llm_provider,
         llm_platform_config=_to_llm_platform_config(runtime_config),
         llm_presets=llm_presets,
+        state_service=state_service,
     )
 
 
@@ -466,6 +557,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     validation_service = ValidationService(repository)
     state_service = StateService(repository)
     context_service = ContextService(repository)
+    setting_proposal_service = SettingProposalService(repository)
     config_root = Path(os.getenv("ELYHA_CORE_CONFIG_DIR", db_file.parent / "core_configs"))
     core_config_manager = CoreConfigManager(config_root)
     preset_path = Path(os.getenv("ELYHA_PRESET_PATH", Path(__file__).resolve().parent.parent / "preset.json"))
@@ -477,8 +569,16 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         graph_service,
         context_service,
         validation_service,
+        state_service,
         runtime_config,
         llm_presets,
+    )
+    session_orchestrator_service = SessionOrchestratorService(
+        repository,
+        graph_service,
+        ai_service,
+        state_service,
+        setting_proposal_service,
     )
     services = ServiceContainer(
         project_service=project_service,
@@ -489,6 +589,8 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         state_service=state_service,
         context_service=context_service,
         ai_service=ai_service,
+        setting_proposal_service=setting_proposal_service,
+        session_orchestrator_service=session_orchestrator_service,
         insight_service=InsightService(repository),
         core_config_manager=core_config_manager,
         llm_presets=llm_presets,
@@ -537,9 +639,11 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             graph_service,
             context_service,
             validation_service,
+            state_service,
             config,
             services.llm_presets,
         )
+        services.session_orchestrator_service.set_ai_service(services.ai_service)
 
     @api.get("/api/llm/presets")
     def list_llm_presets() -> list[dict[str, Any]]:
@@ -702,6 +806,12 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             system_prompt_style=payload.system_prompt_style,
             system_prompt_forbidden=payload.system_prompt_forbidden,
             system_prompt_notes=payload.system_prompt_notes,
+            global_directives=payload.global_directives,
+            context_soft_min_chars=payload.context_soft_min_chars,
+            context_soft_max_chars=payload.context_soft_max_chars,
+            context_sentence_safe_expand_chars=payload.context_sentence_safe_expand_chars,
+            context_soft_max_tokens=payload.context_soft_max_tokens,
+            strict_json_fence_output=payload.strict_json_fence_output,
         )
         try:
             project = services.project_service.update_project_settings(project_id, patch)
@@ -1381,6 +1491,213 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             "prompt_tokens": result.prompt_tokens,
             "completion_tokens": result.completion_tokens,
         }
+
+    @api.post("/api/ai/clarification/question")
+    def ai_clarification_question(payload: ClarificationQuestionRequest) -> dict[str, Any]:
+        try:
+            result = services.ai_service.generate_clarification_question(
+                payload.project_id,
+                node_id=payload.node_id,
+                context=payload.context,
+                token_budget=payload.token_budget,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return {
+            "project_id": result.project_id,
+            "clarification_id": result.clarification_id,
+            "question_type": result.question_type,
+            "question": result.question,
+            "options": result.options,
+            "must_answer": result.must_answer,
+            "timeout_sec": result.timeout_sec,
+            "setting_proposal_status": result.setting_proposal_status,
+            "provider": result.provider,
+            "prompt_tokens": result.prompt_tokens,
+            "completion_tokens": result.completion_tokens,
+        }
+
+    @api.post("/api/agent/session/start")
+    def start_agent_session(payload: StartAgentSessionRequest) -> dict[str, Any]:
+        try:
+            return services.session_orchestrator_service.start_session(
+                project_id=payload.project_id,
+                node_id=payload.node_id,
+                mode=payload.mode,
+                token_budget=payload.token_budget,
+                style_hint=payload.style_hint,
+                thread_id=payload.thread_id,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @api.post("/api/agent/session/resume")
+    def resume_agent_session(payload: ResumeAgentSessionRequest) -> dict[str, Any]:
+        try:
+            session = services.session_orchestrator_service.resume_session(payload.thread_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "thread_id": payload.thread_id,
+            "session": session,
+        }
+
+    @api.get("/api/agent/session/{thread_id}")
+    def get_agent_session(thread_id: str) -> dict[str, Any]:
+        try:
+            session = services.session_orchestrator_service.get_session_state(thread_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "thread_id": thread_id,
+            "session": session,
+        }
+
+    @api.post("/api/agent/session/decision")
+    def submit_agent_decision(payload: SubmitAgentDecisionRequest) -> dict[str, Any]:
+        try:
+            return services.session_orchestrator_service.submit_decision(
+                thread_id=payload.thread_id,
+                action=payload.action,
+                decision_id=payload.decision_id,
+                expected_state_version=payload.expected_state_version,
+                payload=payload.payload,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @api.post("/api/agent/session/clarification/question")
+    def request_agent_clarification(payload: RequestAgentClarificationRequest) -> dict[str, Any]:
+        try:
+            return services.session_orchestrator_service.request_clarification_question(
+                thread_id=payload.thread_id,
+                context=payload.context,
+                token_budget=payload.token_budget,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @api.post("/api/agent/session/clarification/answer")
+    def submit_agent_clarification_answer(payload: SubmitClarificationAnswerRequest) -> dict[str, Any]:
+        try:
+            return services.session_orchestrator_service.submit_clarification_answer(
+                thread_id=payload.thread_id,
+                clarification_id=payload.clarification_id,
+                decision_id=payload.decision_id,
+                selected_option=payload.selected_option,
+                answer_text=payload.answer_text,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @api.post("/api/agent/session/setting_proposal/review")
+    def review_agent_setting_proposal(payload: ReviewSettingProposalActionRequest) -> dict[str, Any]:
+        try:
+            return services.session_orchestrator_service.review_setting_proposal(
+                thread_id=payload.thread_id,
+                proposal_id=payload.proposal_id,
+                action=payload.action,
+                reviewer=payload.reviewer,
+                note=payload.note,
+                decision_id=payload.decision_id,
+                expected_state_version=payload.expected_state_version,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @api.get("/api/agent/session/{thread_id}/setting_proposals")
+    def list_agent_setting_proposals(thread_id: str, status: str | None = None) -> dict[str, Any]:
+        try:
+            proposals = services.session_orchestrator_service.list_setting_proposals(
+                thread_id=thread_id,
+                status=status,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "thread_id": thread_id,
+            "status_filter": status or "",
+            "setting_proposals": proposals,
+            "count": len(proposals),
+        }
+
+    @api.post("/api/agent/session/setting_proposals/review_batch")
+    def review_agent_setting_proposals_batch(payload: ReviewSettingProposalsBatchRequest) -> dict[str, Any]:
+        try:
+            return services.session_orchestrator_service.review_setting_proposals_batch(
+                thread_id=payload.thread_id,
+                action=payload.action,
+                proposal_ids=payload.proposal_ids,
+                reviewer=payload.reviewer,
+                note=payload.note,
+                decision_id=payload.decision_id,
+                expected_state_version=payload.expected_state_version,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @api.post("/api/agent/session/diff/review")
+    def review_agent_diff(payload: SubmitDiffReviewRequest) -> dict[str, Any]:
+        try:
+            return services.session_orchestrator_service.submit_diff_review(
+                thread_id=payload.thread_id,
+                diff_id=payload.diff_id,
+                decision_id=payload.decision_id,
+                accepted_hunk_ids=payload.accepted_hunk_ids,
+                rejected_hunk_ids=payload.rejected_hunk_ids,
+                expected_base_revision=payload.expected_base_revision,
+                expected_base_hash=payload.expected_base_hash,
+                expected_state_version=payload.expected_state_version,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @api.post("/api/agent/session/{thread_id}/cancel")
+    def cancel_agent_session(thread_id: str) -> dict[str, Any]:
+        try:
+            return services.session_orchestrator_service.cancel_session(thread_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @api.post("/api/projects/{project_id}/suggestions/cleanup")
     def clear_suggestions(project_id: str) -> dict[str, Any]:

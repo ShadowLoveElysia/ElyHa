@@ -42,6 +42,14 @@ def _coerce_positive_int(value: object, fallback: int) -> int:
     return parsed if parsed > 0 else fallback
 
 
+def _coerce_non_negative_int(value: object, fallback: int) -> int:
+    try:
+        parsed = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed >= 0 else fallback
+
+
 def _coerce_text(value: object, fallback: str = "") -> str:
     if value is None:
         return fallback
@@ -58,15 +66,32 @@ class ProjectSettings:
     system_prompt_style: str = ""
     system_prompt_forbidden: str = ""
     system_prompt_notes: str = ""
+    global_directives: str = ""
+    context_soft_min_chars: int = 3000
+    context_soft_max_chars: int = 5000
+    context_sentence_safe_expand_chars: int = 500
+    context_soft_max_tokens: int = 1600
+    strict_json_fence_output: bool = False
 
     def __post_init__(self) -> None:
         if self.auto_snapshot_minutes <= 0:
             raise ValueError(tr("err.auto_snapshot_minutes_positive"))
         if self.auto_snapshot_operations <= 0:
             raise ValueError(tr("err.auto_snapshot_operations_positive"))
+        if self.context_soft_min_chars <= 0:
+            raise ValueError("context_soft_min_chars must be positive")
+        if self.context_soft_max_chars <= 0:
+            raise ValueError("context_soft_max_chars must be positive")
+        if self.context_soft_max_chars < self.context_soft_min_chars:
+            raise ValueError("context_soft_max_chars must be >= context_soft_min_chars")
+        if self.context_sentence_safe_expand_chars < 0:
+            raise ValueError("context_sentence_safe_expand_chars must be >= 0")
+        if self.context_soft_max_tokens <= 0:
+            raise ValueError("context_soft_max_tokens must be positive")
         self.system_prompt_style = _normalize_prompt_text(self.system_prompt_style)
         self.system_prompt_forbidden = _normalize_prompt_text(self.system_prompt_forbidden)
         self.system_prompt_notes = _normalize_prompt_text(self.system_prompt_notes)
+        self.global_directives = _normalize_prompt_text(self.global_directives, limit=12000)
 
 
 def project_settings_from_payload(raw: Any) -> ProjectSettings:
@@ -76,6 +101,7 @@ def project_settings_from_payload(raw: Any) -> ProjectSettings:
     system_prompt_style = _coerce_text(payload.get("system_prompt_style"), "")
     system_prompt_forbidden = _coerce_text(payload.get("system_prompt_forbidden"), "")
     system_prompt_notes = _coerce_text(payload.get("system_prompt_notes"), "")
+    global_directives = _coerce_text(payload.get("global_directives"), "")
 
     # Legacy keys from older workflow-doc based schemas.
     legacy_constitution = _coerce_text(payload.get("constitution_markdown"), "")
@@ -103,6 +129,14 @@ def project_settings_from_payload(raw: Any) -> ProjectSettings:
         system_prompt_style=system_prompt_style,
         system_prompt_forbidden=system_prompt_forbidden,
         system_prompt_notes=system_prompt_notes,
+        global_directives=global_directives,
+        context_soft_min_chars=_coerce_positive_int(payload.get("context_soft_min_chars"), 3000),
+        context_soft_max_chars=_coerce_positive_int(payload.get("context_soft_max_chars"), 5000),
+        context_sentence_safe_expand_chars=_coerce_non_negative_int(
+            payload.get("context_sentence_safe_expand_chars"), 500
+        ),
+        context_soft_max_tokens=_coerce_positive_int(payload.get("context_soft_max_tokens"), 1600),
+        strict_json_fence_output=_coerce_bool(payload.get("strict_json_fence_output"), False),
     )
 
 

@@ -7,7 +7,7 @@ import sqlite3
 
 from elyha_core.i18n import tr
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 
 def _now_iso() -> str:
@@ -316,6 +316,98 @@ MIGRATIONS: dict[int, str] = {
         ON state_attribute_schema(project_id, entity_type, attr_key);
     CREATE INDEX IF NOT EXISTS idx_state_attr_schema_project_entity_active
         ON state_attribute_schema(project_id, entity_type, is_active, attr_key);
+    """,
+    4: """
+    CREATE TABLE IF NOT EXISTS agent_sessions (
+        thread_id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        node_id TEXT NOT NULL,
+        mode TEXT NOT NULL DEFAULT 'single_agent',
+        status TEXT NOT NULL,
+        state_version INTEGER NOT NULL DEFAULT 1,
+        token_budget INTEGER NOT NULL DEFAULT 2200,
+        style_hint TEXT NOT NULL DEFAULT '',
+        pending_content TEXT NOT NULL DEFAULT '',
+        pending_meta_json TEXT NOT NULL DEFAULT '{}',
+        pending_clarification_json TEXT NOT NULL DEFAULT '{}',
+        latest_clarification_id TEXT NOT NULL DEFAULT '',
+        latest_setting_proposal_id TEXT NOT NULL DEFAULT '',
+        last_committed_revision INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_sessions_project_status
+        ON agent_sessions(project_id, status, updated_at, thread_id);
+    CREATE INDEX IF NOT EXISTS idx_agent_sessions_project_node
+        ON agent_sessions(project_id, node_id, updated_at, thread_id);
+
+    CREATE TABLE IF NOT EXISTS agent_session_decisions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        thread_id TEXT NOT NULL,
+        decision_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        payload_json TEXT NOT NULL DEFAULT '{}',
+        status_before TEXT NOT NULL,
+        status_after TEXT NOT NULL,
+        state_version_before INTEGER NOT NULL,
+        state_version_after INTEGER NOT NULL,
+        response_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(thread_id) REFERENCES agent_sessions(thread_id) ON DELETE CASCADE,
+        UNIQUE(thread_id, decision_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_session_decisions_thread_created
+        ON agent_session_decisions(thread_id, created_at, id);
+
+    CREATE TABLE IF NOT EXISTS setting_proposals (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        node_id TEXT NOT NULL,
+        clarification_id TEXT NOT NULL DEFAULT '',
+        proposal_type TEXT NOT NULL,
+        target_scope TEXT NOT NULL,
+        effective_from_revision INTEGER NOT NULL DEFAULT 0,
+        supersedes_proposal_id TEXT NOT NULL DEFAULT '',
+        proposal_json TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending_review',
+        reviewer TEXT NOT NULL DEFAULT '',
+        review_note TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        reviewed_at TEXT NOT NULL DEFAULT '',
+        applied_at TEXT NOT NULL DEFAULT '',
+        applied_revision INTEGER NOT NULL DEFAULT 0,
+        FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+        FOREIGN KEY(thread_id) REFERENCES agent_sessions(thread_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_setting_proposals_thread_status_created
+        ON setting_proposals(thread_id, status, created_at, id);
+    CREATE INDEX IF NOT EXISTS idx_setting_proposals_project_status_created
+        ON setting_proposals(project_id, status, created_at, id);
+    """,
+    5: """
+    CREATE TABLE IF NOT EXISTS state_update_outbox (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        node_id TEXT NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 0,
+        payload_json TEXT NOT NULL DEFAULT '{}',
+        status TEXT NOT NULL DEFAULT 'pending',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_retry_at TEXT NOT NULL DEFAULT '',
+        last_error TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        applied_at TEXT NOT NULL DEFAULT '',
+        FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_state_update_outbox_project_status_retry
+        ON state_update_outbox(project_id, status, next_retry_at, created_at, id);
+    CREATE INDEX IF NOT EXISTS idx_state_update_outbox_thread_status_retry
+        ON state_update_outbox(thread_id, status, next_retry_at, created_at, id);
     """,
 }
 

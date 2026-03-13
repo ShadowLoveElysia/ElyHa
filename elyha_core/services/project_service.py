@@ -22,6 +22,12 @@ class ProjectSettingsPatch:
     system_prompt_style: str | None = None
     system_prompt_forbidden: str | None = None
     system_prompt_notes: str | None = None
+    global_directives: str | None = None
+    context_soft_min_chars: int | None = None
+    context_soft_max_chars: int | None = None
+    context_sentence_safe_expand_chars: int | None = None
+    context_soft_max_tokens: int | None = None
+    strict_json_fence_output: bool | None = None
 
 
 class ProjectService:
@@ -123,6 +129,36 @@ class ProjectService:
                 if patch.system_prompt_notes is None
                 else patch.system_prompt_notes
             ),
+            global_directives=(
+                current.global_directives
+                if patch.global_directives is None
+                else patch.global_directives
+            ),
+            context_soft_min_chars=(
+                current.context_soft_min_chars
+                if patch.context_soft_min_chars is None
+                else patch.context_soft_min_chars
+            ),
+            context_soft_max_chars=(
+                current.context_soft_max_chars
+                if patch.context_soft_max_chars is None
+                else patch.context_soft_max_chars
+            ),
+            context_sentence_safe_expand_chars=(
+                current.context_sentence_safe_expand_chars
+                if patch.context_sentence_safe_expand_chars is None
+                else patch.context_sentence_safe_expand_chars
+            ),
+            context_soft_max_tokens=(
+                current.context_soft_max_tokens
+                if patch.context_soft_max_tokens is None
+                else patch.context_soft_max_tokens
+            ),
+            strict_json_fence_output=(
+                current.strict_json_fence_output
+                if patch.strict_json_fence_output is None
+                else patch.strict_json_fence_output
+            ),
         )
         project.settings = updated
         self._record_project_operation(
@@ -135,6 +171,12 @@ class ProjectService:
                 "system_prompt_style": updated.system_prompt_style,
                 "system_prompt_forbidden": updated.system_prompt_forbidden,
                 "system_prompt_notes": updated.system_prompt_notes,
+                "global_directives": updated.global_directives,
+                "context_soft_min_chars": updated.context_soft_min_chars,
+                "context_soft_max_chars": updated.context_soft_max_chars,
+                "context_sentence_safe_expand_chars": updated.context_sentence_safe_expand_chars,
+                "context_soft_max_tokens": updated.context_soft_max_tokens,
+                "strict_json_fence_output": updated.strict_json_fence_output,
             },
         )
         return self.load_project(project_id)
