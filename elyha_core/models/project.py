@@ -72,6 +72,11 @@ class ProjectSettings:
     context_sentence_safe_expand_chars: int = 500
     context_soft_max_tokens: int = 1600
     strict_json_fence_output: bool = False
+    context_compaction_enabled: bool = True
+    context_compaction_trigger_ratio: int = 80
+    context_compaction_keep_recent_chunks: int = 4
+    context_compaction_group_chunks: int = 4
+    context_compaction_chunk_chars: int = 1200
 
     def __post_init__(self) -> None:
         if self.auto_snapshot_minutes <= 0:
@@ -88,6 +93,14 @@ class ProjectSettings:
             raise ValueError("context_sentence_safe_expand_chars must be >= 0")
         if self.context_soft_max_tokens <= 0:
             raise ValueError("context_soft_max_tokens must be positive")
+        if self.context_compaction_trigger_ratio <= 0 or self.context_compaction_trigger_ratio > 100:
+            raise ValueError("context_compaction_trigger_ratio must be in 1..100")
+        if self.context_compaction_keep_recent_chunks <= 0:
+            raise ValueError("context_compaction_keep_recent_chunks must be positive")
+        if self.context_compaction_group_chunks <= 0:
+            raise ValueError("context_compaction_group_chunks must be positive")
+        if self.context_compaction_chunk_chars <= 0:
+            raise ValueError("context_compaction_chunk_chars must be positive")
         self.system_prompt_style = _normalize_prompt_text(self.system_prompt_style)
         self.system_prompt_forbidden = _normalize_prompt_text(self.system_prompt_forbidden)
         self.system_prompt_notes = _normalize_prompt_text(self.system_prompt_notes)
@@ -137,6 +150,19 @@ def project_settings_from_payload(raw: Any) -> ProjectSettings:
         ),
         context_soft_max_tokens=_coerce_positive_int(payload.get("context_soft_max_tokens"), 1600),
         strict_json_fence_output=_coerce_bool(payload.get("strict_json_fence_output"), False),
+        context_compaction_enabled=_coerce_bool(payload.get("context_compaction_enabled"), True),
+        context_compaction_trigger_ratio=_coerce_positive_int(
+            payload.get("context_compaction_trigger_ratio"), 80
+        ),
+        context_compaction_keep_recent_chunks=_coerce_positive_int(
+            payload.get("context_compaction_keep_recent_chunks"), 4
+        ),
+        context_compaction_group_chunks=_coerce_positive_int(
+            payload.get("context_compaction_group_chunks"), 4
+        ),
+        context_compaction_chunk_chars=_coerce_positive_int(
+            payload.get("context_compaction_chunk_chars"), 1200
+        ),
     )
 
 

@@ -7,6 +7,8 @@ import json
 import re
 from typing import Any
 
+from elyha_core.utils.token_counter import TokenCounter
+
 
 PROMPT_VERSION = "hitl_context_v1"
 
@@ -32,6 +34,12 @@ class BuildInput:
     context_sentence_safe_expand_chars: int = 500
     context_soft_max_tokens: int = 1600
     strict_json_fence_output: bool = False
+    tokenizer_model: str = ""
+    context_compaction_enabled: bool = True
+    context_compaction_trigger_ratio: int = 80
+    context_compaction_keep_recent_chunks: int = 4
+    context_compaction_group_chunks: int = 4
+    context_compaction_chunk_chars: int = 1200
 
 
 @dataclass(slots=True)
@@ -48,6 +56,8 @@ class PromptBundle:
     dropped_sections: list[dict[str, Any]] = field(default_factory=list)
     prompt_version: str = PROMPT_VERSION
     key_constraints: list[str] = field(default_factory=list)
+    token_counter_backend: str = ""
+    cache_monitor: dict[str, Any] = field(default_factory=dict)
 
     def sections_payload(self) -> list[dict[str, Any]]:
         return [
@@ -74,6 +84,9 @@ class _Section:
 class ContextAssembler:
     """Assemble bounded prompt context with deterministic trimming."""
 
+    def __init__(self, token_counter: TokenCounter | None = None) -> None:
+        self._token_counter = token_counter or TokenCounter()
+
     def build_generation_prompt(self, input_data: BuildInput) -> PromptBundle:
         return self._build_prompt(input_data, correction_mode=False)
 
@@ -84,6 +97,8 @@ class ContextAssembler:
         token_budget = max(200, int(input_data.token_budget))
         dropped: list[dict[str, Any]] = []
         key_constraints = self._key_constraints(correction_mode=correction_mode)
+        model_hint = str(input_data.tokenizer_model or "").strip()
+        token_backend = self._token_counter.backend(model_hint=model_hint)
 
         system_spec = self._normalize_system_spec(input_data)
         global_directives = self._normalize_global_directives(input_data.global_directives)
@@ -105,26 +120,36 @@ class ContextAssembler:
         if correction_mode and user_correction:
             sections["UserCorrection"] = _Section("UserCorrection", user_correction, required=True)
 
+        def _section_tokens(name: str) -> int:
+            section = sections[name]
+            if not section.text:
+                return 0
+            return self._count_tokens(section.text, model_hint=model_hint)
+
         section_budgets = self._section_token_budgets(token_budget)
         sections["SystemSpec"] = self._trim_basic(
             sections["SystemSpec"],
             max_tokens=section_budgets["SystemSpec"],
             dropped=dropped,
+            model_hint=model_hint,
         )
         sections["GlobalDirectives"] = self._trim_basic(
             sections["GlobalDirectives"],
             max_tokens=section_budgets["GlobalDirectives"],
             dropped=dropped,
+            model_hint=model_hint,
         )
         sections["NodeContext"] = self._trim_basic(
             sections["NodeContext"],
             max_tokens=section_budgets["NodeContext"],
             dropped=dropped,
+            model_hint=model_hint,
         )
         sections["LocalRAGContext"] = self._trim_basic(
             sections["LocalRAGContext"],
             max_tokens=section_budgets["LocalRAGContext"],
             dropped=dropped,
+            model_hint=model_hint,
         )
         sections["WorkingMemoryRecent"] = self._trim_working_memory_by_tokens(
             sections["WorkingMemoryRecent"],
@@ -132,6 +157,7 @@ class ContextAssembler:
             dropped=dropped,
             input_data=input_data,
             aggressive=False,
+            model_hint=model_hint,
         )
 
         # Overflow handling: LocalRAGContext -> WorkingMemoryRecent, do not trim snapshot/correction.
@@ -147,24 +173,26 @@ class ContextAssembler:
             ordered_names.append("UserCorrection")
 
         def _total_tokens() -> int:
-            return sum(sections[name].tokens for name in ordered_names if sections[name].text)
+            return sum(_section_tokens(name) for name in ordered_names if sections[name].text)
 
         if _total_tokens() > token_budget and sections["LocalRAGContext"].text:
-            reduce_to = max(0, sections["LocalRAGContext"].tokens - (_total_tokens() - token_budget))
+            reduce_to = max(0, _section_tokens("LocalRAGContext") - (_total_tokens() - token_budget))
             sections["LocalRAGContext"] = self._trim_basic(
                 sections["LocalRAGContext"],
                 max_tokens=reduce_to,
                 dropped=dropped,
+                model_hint=model_hint,
             )
 
         if _total_tokens() > token_budget and sections["WorkingMemoryRecent"].text:
-            reduce_to = max(64, sections["WorkingMemoryRecent"].tokens - (_total_tokens() - token_budget))
+            reduce_to = max(64, _section_tokens("WorkingMemoryRecent") - (_total_tokens() - token_budget))
             sections["WorkingMemoryRecent"] = self._trim_working_memory_by_tokens(
                 sections["WorkingMemoryRecent"],
                 max_tokens=reduce_to,
                 dropped=dropped,
                 input_data=input_data,
                 aggressive=True,
+                model_hint=model_hint,
             )
 
         # Emergency fallback if still overflowing due required sections.
@@ -175,8 +203,13 @@ class ContextAssembler:
                     break
                 if not sections[name].text:
                     continue
-                target = max(32, sections[name].tokens - overflow)
-                sections[name] = self._trim_basic(sections[name], max_tokens=target, dropped=dropped)
+                target = max(32, _section_tokens(name) - overflow)
+                sections[name] = self._trim_basic(
+                    sections[name],
+                    max_tokens=target,
+                    dropped=dropped,
+                    model_hint=model_hint,
+                )
                 overflow = _total_tokens() - token_budget
 
         lines: list[str] = []
@@ -208,7 +241,11 @@ class ContextAssembler:
         final_prompt = "\n".join(lines).strip()
 
         section_infos = [
-            PromptSectionInfo(name=name, chars=sections[name].chars, tokens=sections[name].tokens)
+            PromptSectionInfo(
+                name=name,
+                chars=sections[name].chars,
+                tokens=_section_tokens(name),
+            )
             for name in ordered_names
             if sections[name].text
         ]
@@ -217,6 +254,7 @@ class ContextAssembler:
             sections=section_infos,
             dropped_sections=dropped,
             key_constraints=key_constraints,
+            token_counter_backend=token_backend,
         )
 
     def _section_token_budgets(self, token_budget: int) -> dict[str, int]:
@@ -314,22 +352,82 @@ class ContextAssembler:
         if not text:
             return "", dropped
 
+        anchor = self._normalize_text(input_data.recent_anchor)
+        if not bool(input_data.context_compaction_enabled):
+            return self._normalize_working_memory_legacy(input_data, anchor=anchor)
+
+        token_limit = max(80, int(input_data.context_soft_max_tokens))
+        model_hint = str(input_data.tokenizer_model or "").strip()
+        trigger_ratio = min(100, max(50, int(input_data.context_compaction_trigger_ratio)))
+        trigger_base = max(token_limit, int(input_data.token_budget))
+        compaction_trigger_tokens = max(token_limit, int(trigger_base * trigger_ratio / 100))
+
+        merged = text
+        raw_tokens = self._count_tokens(merged, model_hint=model_hint)
+        if raw_tokens >= compaction_trigger_tokens:
+            compacted, compaction_info = self._compact_working_memory_append_only(
+                merged,
+                input_data=input_data,
+            )
+            if compacted != merged:
+                merged = compacted
+                dropped.append(compaction_info)
+
+        if anchor:
+            merged = f"{merged}\n\n[RecentReplyAndProposalSummary]\n{anchor}".strip()
+        merged_tokens = self._count_tokens(merged, model_hint=model_hint)
+        if merged_tokens > token_limit:
+            if "[CompactedContext]" in merged and "[RecentRaw]" in merged:
+                merged = self._clip_compacted_working_memory(
+                    merged,
+                    token_limit=token_limit,
+                    expand_chars=max(0, int(input_data.context_sentence_safe_expand_chars)),
+                    model_hint=model_hint,
+                )
+            else:
+                merged = self._clip_text_by_token_limit(
+                    merged,
+                    token_limit=token_limit,
+                    sentence_safe=True,
+                    expand_chars=max(0, int(input_data.context_sentence_safe_expand_chars)),
+                    model_hint=model_hint,
+                )
+            dropped.append(
+                {
+                    "section": "WorkingMemoryRecent",
+                    "reason": "token_soft_limit",
+                    "detail": f"token_limit={token_limit}",
+                }
+            )
+        return merged, dropped
+
+    def _normalize_working_memory_legacy(
+        self,
+        input_data: BuildInput,
+        *,
+        anchor: str,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        dropped: list[dict[str, Any]] = []
+        text = self._normalize_text(input_data.working_memory)
+        if not text:
+            return "", dropped
+        model_hint = str(input_data.tokenizer_model or "").strip()
         soft_min = max(200, int(input_data.context_soft_min_chars))
         soft_max = max(soft_min, int(input_data.context_soft_max_chars))
         expand = max(0, int(input_data.context_sentence_safe_expand_chars))
         token_limit = max(80, int(input_data.context_soft_max_tokens))
 
-        anchor = self._normalize_text(input_data.recent_anchor)
         if len(text) <= soft_max:
             merged = text
             if anchor:
                 merged = f"{merged}\n\n[RecentReplyAndProposalSummary]\n{anchor}".strip()
-            if self._estimate_tokens(merged) > token_limit:
+            if self._count_tokens(merged, model_hint=model_hint) > token_limit:
                 merged = self._clip_text_by_token_limit(
                     merged,
                     token_limit=token_limit,
                     sentence_safe=True,
                     expand_chars=expand,
+                    model_hint=model_hint,
                 )
                 dropped.append(
                     {
@@ -354,22 +452,118 @@ class ContextAssembler:
             }
         )
 
-        if self._estimate_tokens(merged) > token_limit:
-            available_chars = max(64, token_limit * 4)
+        if self._count_tokens(merged, model_hint=model_hint) > token_limit:
             merged = self._clip_text_by_token_limit(
                 merged,
                 token_limit=max(64, token_limit),
                 sentence_safe=True,
                 expand_chars=expand,
+                model_hint=model_hint,
             )
             dropped.append(
                 {
                     "section": "WorkingMemoryRecent",
                     "reason": "token_soft_limit",
-                    "detail": f"token_limit={token_limit}, approx_chars={available_chars}",
+                    "detail": f"token_limit={token_limit}",
                 }
             )
         return merged, dropped
+
+    def _compact_working_memory_append_only(
+        self,
+        text: str,
+        *,
+        input_data: BuildInput,
+    ) -> tuple[str, dict[str, Any]]:
+        cleaned = self._normalize_text(text)
+        if not cleaned:
+            return "", {
+                "section": "WorkingMemoryRecent",
+                "reason": "append_only_compaction",
+                "detail": "empty_input",
+            }
+        keep_recent = max(1, int(input_data.context_compaction_keep_recent_chunks))
+        group_size = max(1, int(input_data.context_compaction_group_chunks))
+        chunk_chars = max(240, int(input_data.context_compaction_chunk_chars))
+        chunks = self._chunk_text_for_compaction(cleaned, target_chars=chunk_chars)
+        if len(chunks) <= keep_recent + group_size:
+            return cleaned, {
+                "section": "WorkingMemoryRecent",
+                "reason": "append_only_compaction",
+                "detail": "append_phase_no_full_group",
+            }
+
+        compactable_count = max(0, len(chunks) - keep_recent)
+        full_group_chunk_count = (compactable_count // group_size) * group_size
+        if full_group_chunk_count <= 0:
+            return cleaned, {
+                "section": "WorkingMemoryRecent",
+                "reason": "append_only_compaction",
+                "detail": "append_phase_no_full_group",
+            }
+
+        compacted_chunks = chunks[:full_group_chunk_count]
+        recent_chunks = chunks[full_group_chunk_count:]
+        group_total = full_group_chunk_count // group_size
+        group_summaries: list[str] = []
+        for index in range(group_total):
+            start = index * group_size
+            end = start + group_size
+            group_text = "\n\n".join(compacted_chunks[start:end]).strip()
+            summary = self._summarize_head(group_text)
+            group_summaries.append(f"{index + 1}. {summary}")
+
+        lines: list[str] = [
+            "[CompactedContext]",
+            "Working memory uses append-only staircase compaction.",
+            *group_summaries,
+            "",
+        ]
+        recent_block = "\n\n".join(item for item in recent_chunks if item.strip()).strip()
+        if recent_block:
+            lines.append("[RecentRaw]")
+            lines.append(recent_block)
+
+        compacted = "\n".join(lines).strip()
+        detail = (
+            f"groups={group_total},group_size={group_size},"
+            f"compacted_chunks={full_group_chunk_count},recent_chunks={len(recent_chunks)}"
+        )
+        return compacted, {
+            "section": "WorkingMemoryRecent",
+            "reason": "append_only_compaction",
+            "detail": detail,
+        }
+
+    def _chunk_text_for_compaction(self, text: str, *, target_chars: int) -> list[str]:
+        cleaned = self._normalize_text(text)
+        if not cleaned:
+            return []
+        segments = [
+            part.strip()
+            for part in re.split(r"(?<=[。！？.!?\n])\s*", cleaned)
+            if part and part.strip()
+        ]
+        if not segments:
+            segments = [cleaned]
+
+        chunks: list[str] = []
+        current: list[str] = []
+        current_len = 0
+        target = max(240, int(target_chars))
+        for segment in segments:
+            segment_len = len(segment)
+            projected = current_len + segment_len + (1 if current else 0)
+            if current and projected > target:
+                chunks.append(" ".join(current).strip())
+                current = [segment]
+                current_len = segment_len
+            else:
+                current.append(segment)
+                current_len = projected
+        if current:
+            chunks.append(" ".join(current).strip())
+        return [item for item in chunks if item]
 
     def _normalize_user_correction(self, value: Any) -> str:
         text = self._normalize_text(value)
@@ -381,23 +575,33 @@ class ContextAssembler:
             f"{text}"
         )
 
-    def _trim_basic(self, section: _Section, *, max_tokens: int, dropped: list[dict[str, Any]]) -> _Section:
+    def _trim_basic(
+        self,
+        section: _Section,
+        *,
+        max_tokens: int,
+        dropped: list[dict[str, Any]],
+        model_hint: str,
+    ) -> _Section:
         if not section.text:
             return section
         if max_tokens <= 0:
             dropped.append({"section": section.name, "reason": "budget_zero", "detail": "dropped"})
             return _Section(name=section.name, text="", required=section.required)
-        if section.tokens <= max_tokens:
+        source_tokens = self._count_tokens(section.text, model_hint=model_hint)
+        if source_tokens <= max_tokens:
             return section
-        char_limit = max(16, max_tokens * 4)
-        trimmed = section.text[:char_limit].rstrip()
-        if len(trimmed) < len(section.text):
-            trimmed = f"{trimmed}..."
+        trimmed = self._clip_head_text_by_token_limit(
+            section.text,
+            token_limit=max_tokens,
+            model_hint=model_hint,
+        )
+        trimmed_tokens = self._count_tokens(trimmed, model_hint=model_hint)
         dropped.append(
             {
                 "section": section.name,
                 "reason": "budget_trim",
-                "detail": f"tokens:{section.tokens}->{max(1, len(trimmed) // 4)}",
+                "detail": f"tokens:{source_tokens}->{trimmed_tokens}",
             }
         )
         return _Section(name=section.name, text=trimmed, required=section.required)
@@ -410,26 +614,38 @@ class ContextAssembler:
         dropped: list[dict[str, Any]],
         input_data: BuildInput,
         aggressive: bool,
+        model_hint: str,
     ) -> _Section:
         if not section.text:
             return section
         if max_tokens <= 0:
             dropped.append({"section": section.name, "reason": "budget_zero", "detail": "dropped"})
             return _Section(name=section.name, text="", required=section.required)
-        if section.tokens <= max_tokens:
+        source_tokens = self._count_tokens(section.text, model_hint=model_hint)
+        if source_tokens <= max_tokens:
             return section
         expand = max(0, int(input_data.context_sentence_safe_expand_chars))
-        clipped = self._clip_text_by_token_limit(
-            section.text,
-            token_limit=max_tokens,
-            sentence_safe=True,
-            expand_chars=0 if aggressive else expand,
-        )
+        if "[CompactedContext]" in section.text and "[RecentRaw]" in section.text:
+            clipped = self._clip_compacted_working_memory(
+                section.text,
+                token_limit=max_tokens,
+                expand_chars=0 if aggressive else expand,
+                model_hint=model_hint,
+            )
+        else:
+            clipped = self._clip_text_by_token_limit(
+                section.text,
+                token_limit=max_tokens,
+                sentence_safe=True,
+                expand_chars=0 if aggressive else expand,
+                model_hint=model_hint,
+            )
+        clipped_tokens = self._count_tokens(clipped, model_hint=model_hint)
         dropped.append(
             {
                 "section": section.name,
                 "reason": "budget_trim",
-                "detail": f"tokens:{section.tokens}->{max(1, len(clipped) // 4)}",
+                "detail": f"tokens:{source_tokens}->{clipped_tokens}",
             }
         )
         return _Section(name=section.name, text=clipped, required=section.required)
@@ -441,16 +657,119 @@ class ContextAssembler:
         token_limit: int,
         sentence_safe: bool,
         expand_chars: int,
+        model_hint: str,
     ) -> str:
         if not text:
             return ""
-        char_limit = max(16, token_limit * 4)
-        if len(text) <= char_limit:
+        if token_limit <= 0:
+            return ""
+        source_tokens = self._count_tokens(text, model_hint=model_hint)
+        if source_tokens <= token_limit:
+            return text
+        char_limit = self._max_tail_chars_for_tokens(
+            text,
+            token_limit=token_limit,
+            model_hint=model_hint,
+        )
+        if char_limit >= len(text):
             return text
         if not sentence_safe:
-            return f"{text[:char_limit].rstrip()}..."
+            return text[-char_limit:].lstrip()
         tail = self._clip_tail_sentence_safe(text, target_chars=char_limit, expand_chars=expand_chars)
-        return tail if len(tail) <= len(text) else text
+        if self._count_tokens(tail, model_hint=model_hint) <= token_limit:
+            return tail if len(tail) <= len(text) else text
+        return self._clip_text_by_token_limit(
+            tail,
+            token_limit=token_limit,
+            sentence_safe=False,
+            expand_chars=0,
+            model_hint=model_hint,
+        )
+
+    def _clip_compacted_working_memory(
+        self,
+        text: str,
+        *,
+        token_limit: int,
+        expand_chars: int,
+        model_hint: str,
+    ) -> str:
+        marker = "[RecentRaw]"
+        idx = text.find(marker)
+        if idx < 0:
+            return self._clip_text_by_token_limit(
+                text,
+                token_limit=token_limit,
+                sentence_safe=True,
+                expand_chars=expand_chars,
+                model_hint=model_hint,
+            )
+        prefix = text[: idx + len(marker)].rstrip()
+        recent_raw = text[idx + len(marker) :].strip()
+        prefix_tokens = self._count_tokens(prefix, model_hint=model_hint)
+        if prefix_tokens >= token_limit:
+            return self._clip_head_text_by_token_limit(
+                prefix,
+                token_limit=token_limit,
+                model_hint=model_hint,
+            )
+        remaining = max(1, token_limit - prefix_tokens)
+        if not recent_raw:
+            return prefix
+        clipped_recent = self._clip_text_by_token_limit(
+            recent_raw,
+            token_limit=remaining,
+            sentence_safe=True,
+            expand_chars=expand_chars,
+            model_hint=model_hint,
+        )
+        return f"{prefix}\n{clipped_recent}".strip()
+
+    def _clip_head_text_by_token_limit(self, text: str, *, token_limit: int, model_hint: str) -> str:
+        if not text:
+            return ""
+        if token_limit <= 0:
+            return ""
+        source_tokens = self._count_tokens(text, model_hint=model_hint)
+        if source_tokens <= token_limit:
+            return text
+        char_limit = self._max_head_chars_for_tokens(
+            text,
+            token_limit=token_limit,
+            model_hint=model_hint,
+        )
+        clipped = text[:char_limit].rstrip()
+        if char_limit < len(text):
+            clipped = f"{clipped}..."
+        return clipped
+
+    def _max_head_chars_for_tokens(self, text: str, *, token_limit: int, model_hint: str) -> int:
+        lo = 1
+        hi = len(text)
+        best = 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            candidate = text[:mid]
+            if self._count_tokens(candidate, model_hint=model_hint) <= token_limit:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return max(1, best)
+
+    def _max_tail_chars_for_tokens(self, text: str, *, token_limit: int, model_hint: str) -> int:
+        lo = 1
+        hi = len(text)
+        best = 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            candidate = text[-mid:]
+            if self._count_tokens(candidate, model_hint=model_hint) <= token_limit:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return max(1, best)
 
     def _clip_tail_sentence_safe(self, text: str, *, target_chars: int, expand_chars: int) -> str:
         if len(text) <= target_chars:
@@ -514,9 +833,10 @@ class ContextAssembler:
             return fallback
 
     def _estimate_tokens(self, text: str) -> int:
-        if not text:
-            return 0
-        return max(1, len(text) // 4)
+        return self._count_tokens(text, model_hint=self._token_counter.default_model_hint())
+
+    def _count_tokens(self, text: str, *, model_hint: str) -> int:
+        return self._token_counter.count(text, model_hint=model_hint)
 
     def _try_load_json(self, text: str) -> Any:
         try:

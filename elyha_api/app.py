@@ -76,6 +76,11 @@ class UpdateSettingsRequest(BaseModel):
     context_sentence_safe_expand_chars: int | None = Field(default=None, ge=0)
     context_soft_max_tokens: int | None = Field(default=None, ge=1)
     strict_json_fence_output: bool | None = None
+    context_compaction_enabled: bool | None = None
+    context_compaction_trigger_ratio: int | None = Field(default=None, ge=1, le=100)
+    context_compaction_keep_recent_chunks: int | None = Field(default=None, ge=1)
+    context_compaction_group_chunks: int | None = Field(default=None, ge=1)
+    context_compaction_chunk_chars: int | None = Field(default=None, ge=1)
 
 
 class CreateNodeRequest(BaseModel):
@@ -375,6 +380,11 @@ def _to_project_payload(project) -> dict[str, Any]:
             "context_sentence_safe_expand_chars": project.settings.context_sentence_safe_expand_chars,
             "context_soft_max_tokens": project.settings.context_soft_max_tokens,
             "strict_json_fence_output": project.settings.strict_json_fence_output,
+            "context_compaction_enabled": project.settings.context_compaction_enabled,
+            "context_compaction_trigger_ratio": project.settings.context_compaction_trigger_ratio,
+            "context_compaction_keep_recent_chunks": project.settings.context_compaction_keep_recent_chunks,
+            "context_compaction_group_chunks": project.settings.context_compaction_group_chunks,
+            "context_compaction_chunk_chars": project.settings.context_compaction_chunk_chars,
         },
     }
 
@@ -812,6 +822,11 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             context_sentence_safe_expand_chars=payload.context_sentence_safe_expand_chars,
             context_soft_max_tokens=payload.context_soft_max_tokens,
             strict_json_fence_output=payload.strict_json_fence_output,
+            context_compaction_enabled=payload.context_compaction_enabled,
+            context_compaction_trigger_ratio=payload.context_compaction_trigger_ratio,
+            context_compaction_keep_recent_chunks=payload.context_compaction_keep_recent_chunks,
+            context_compaction_group_chunks=payload.context_compaction_group_chunks,
+            context_compaction_chunk_chars=payload.context_compaction_chunk_chars,
         )
         try:
             project = services.project_service.update_project_settings(project_id, patch)

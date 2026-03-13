@@ -16,6 +16,11 @@ export interface ProjectSettings {
   context_sentence_safe_expand_chars: number;
   context_soft_max_tokens: number;
   strict_json_fence_output: boolean;
+  context_compaction_enabled: boolean;
+  context_compaction_trigger_ratio: number;
+  context_compaction_keep_recent_chunks: number;
+  context_compaction_group_chunks: number;
+  context_compaction_chunk_chars: number;
 }
 
 export interface ProjectPayload {

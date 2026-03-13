@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import json
+import os
 import re
 from typing import TYPE_CHECKING, Any, NoReturn, TypedDict, cast
 
@@ -226,6 +228,7 @@ class AIService:
         self._default_platform_config = (llm_platform_config or {}).copy()
         self._llm_presets = dict(llm_presets or {})
         self._adapter_cache: dict[str, Any] = {}
+        self._prompt_cache_monitor: dict[str, dict[str, Any]] = {}
         self.llm_adapter = create_llm_adapter(
             llm_provider,
             platform_config=self._default_platform_config,
@@ -663,6 +666,8 @@ class AIService:
         patched_metadata["ai_prompt_dropped_sections"] = writer_bundle.dropped_sections
         patched_metadata["ai_prompt_constraints"] = writer_bundle.key_constraints
         patched_metadata["ai_last_prompt"] = writer_bundle.final_prompt
+        patched_metadata["ai_prompt_token_counter_backend"] = writer_bundle.token_counter_backend
+        patched_metadata["ai_prompt_cache_monitor"] = writer_bundle.cache_monitor
         self.graph_service.update_node(
             project_id,
             node.id,
@@ -1244,6 +1249,7 @@ class AIService:
         summary = str(node_metadata.get("summary", "")).strip()
         if summary:
             recent_anchor = summary[:500]
+        tokenizer_model = self._resolve_tokenizer_model_hint()
         bundle_input = BuildInput(
             project_id=project_id,
             node_id=str(node.id),
@@ -1264,10 +1270,33 @@ class AIService:
             ),
             context_soft_max_tokens=int(getattr(settings, "context_soft_max_tokens", 1600)),
             strict_json_fence_output=bool(getattr(settings, "strict_json_fence_output", False)),
+            tokenizer_model=tokenizer_model,
+            context_compaction_enabled=bool(getattr(settings, "context_compaction_enabled", True)),
+            context_compaction_trigger_ratio=int(
+                getattr(settings, "context_compaction_trigger_ratio", 80)
+            ),
+            context_compaction_keep_recent_chunks=int(
+                getattr(settings, "context_compaction_keep_recent_chunks", 4)
+            ),
+            context_compaction_group_chunks=int(
+                getattr(settings, "context_compaction_group_chunks", 4)
+            ),
+            context_compaction_chunk_chars=int(
+                getattr(settings, "context_compaction_chunk_chars", 1200)
+            ),
         )
         if task_mode == "correct":
-            return self.context_assembler.build_correction_prompt(bundle_input)
-        return self.context_assembler.build_generation_prompt(bundle_input)
+            bundle = self.context_assembler.build_correction_prompt(bundle_input)
+        else:
+            bundle = self.context_assembler.build_generation_prompt(bundle_input)
+        bundle.cache_monitor = self._record_prompt_cache_monitor(
+            project_id=project_id,
+            node_id=str(node.id),
+            task_type=task_type,
+            task_mode=task_mode,
+            prompt=bundle.final_prompt,
+        )
+        return bundle
 
     def _chapter_prompt(
         self,
@@ -1366,11 +1395,21 @@ class AIService:
             "ai_prompt_dropped_sections": final_bundle.dropped_sections if final_bundle is not None else [],
             "ai_prompt_constraints": final_bundle.key_constraints if final_bundle is not None else [],
             "ai_last_prompt": final_bundle.final_prompt if final_bundle is not None else "",
+            "ai_prompt_token_counter_backend": (
+                final_bundle.token_counter_backend if final_bundle is not None else ""
+            ),
+            "ai_prompt_cache_monitor": final_bundle.cache_monitor if final_bundle is not None else {},
             "ai_prompt_sections_by_agent": {
                 name: bundle.sections_payload() for name, bundle in agent_bundles.items()
             },
             "ai_last_prompt_by_agent": {
                 name: bundle.final_prompt for name, bundle in agent_bundles.items()
+            },
+            "ai_prompt_token_counter_by_agent": {
+                name: bundle.token_counter_backend for name, bundle in agent_bundles.items()
+            },
+            "ai_prompt_cache_by_agent": {
+                name: bundle.cache_monitor for name, bundle in agent_bundles.items()
             },
         }
 
@@ -2515,6 +2554,77 @@ class AIService:
         adapter = create_llm_adapter(normalized, platform_config={})
         self._adapter_cache[normalized] = adapter
         return adapter
+
+    def _resolve_tokenizer_model_hint(self) -> str:
+        direct = str(self._default_platform_config.get("model_name", "") or "").strip()
+        if direct:
+            return direct
+        return str(os.getenv("ELYHA_MODEL_NAME", "") or "").strip()
+
+    def _record_prompt_cache_monitor(
+        self,
+        *,
+        project_id: str,
+        node_id: str,
+        task_type: str,
+        task_mode: str,
+        prompt: str,
+    ) -> dict[str, Any]:
+        key = f"{project_id}:{node_id}:{task_type}:{task_mode}"
+        current_prompt = str(prompt or "")
+        current_hash = hashlib.sha256(current_prompt.encode("utf-8")).hexdigest()
+        entry = self._prompt_cache_monitor.get(key)
+        if entry is None:
+            entry = {
+                "total": 0,
+                "hits": 0,
+                "misses": 0,
+                "last_prompt": "",
+                "last_prompt_hash": "",
+            }
+        total = int(entry.get("total", 0))
+        hits = int(entry.get("hits", 0))
+        misses = int(entry.get("misses", 0))
+        last_prompt = str(entry.get("last_prompt", "") or "")
+
+        status = "warmup"
+        prefix_hit: bool | None = None
+        if total > 0 and last_prompt:
+            prefix_hit = current_prompt.startswith(last_prompt)
+            if prefix_hit:
+                hits += 1
+                status = "hit"
+            else:
+                misses += 1
+                status = "miss"
+        elif total > 0:
+            status = "miss"
+            misses += 1
+
+        total += 1
+        hit_rate_base = hits + misses
+        hit_rate = float(hits / hit_rate_base) if hit_rate_base > 0 else 0.0
+
+        entry.update(
+            {
+                "total": total,
+                "hits": hits,
+                "misses": misses,
+                "last_prompt": current_prompt,
+                "last_prompt_hash": current_hash,
+            }
+        )
+        self._prompt_cache_monitor[key] = entry
+        return {
+            "cache_key": key,
+            "status": status,
+            "prefix_hit": prefix_hit,
+            "total": total,
+            "hits": hits,
+            "misses": misses,
+            "hit_rate": round(hit_rate, 4),
+            "prompt_hash": current_hash,
+        }
 
     def _resolve_node_llm_route(self, node: Any) -> dict[str, Any]:
         metadata = getattr(node, "metadata", {})

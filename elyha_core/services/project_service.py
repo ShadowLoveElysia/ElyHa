@@ -28,6 +28,11 @@ class ProjectSettingsPatch:
     context_sentence_safe_expand_chars: int | None = None
     context_soft_max_tokens: int | None = None
     strict_json_fence_output: bool | None = None
+    context_compaction_enabled: bool | None = None
+    context_compaction_trigger_ratio: int | None = None
+    context_compaction_keep_recent_chunks: int | None = None
+    context_compaction_group_chunks: int | None = None
+    context_compaction_chunk_chars: int | None = None
 
 
 class ProjectService:
@@ -159,6 +164,31 @@ class ProjectService:
                 if patch.strict_json_fence_output is None
                 else patch.strict_json_fence_output
             ),
+            context_compaction_enabled=(
+                current.context_compaction_enabled
+                if patch.context_compaction_enabled is None
+                else patch.context_compaction_enabled
+            ),
+            context_compaction_trigger_ratio=(
+                current.context_compaction_trigger_ratio
+                if patch.context_compaction_trigger_ratio is None
+                else patch.context_compaction_trigger_ratio
+            ),
+            context_compaction_keep_recent_chunks=(
+                current.context_compaction_keep_recent_chunks
+                if patch.context_compaction_keep_recent_chunks is None
+                else patch.context_compaction_keep_recent_chunks
+            ),
+            context_compaction_group_chunks=(
+                current.context_compaction_group_chunks
+                if patch.context_compaction_group_chunks is None
+                else patch.context_compaction_group_chunks
+            ),
+            context_compaction_chunk_chars=(
+                current.context_compaction_chunk_chars
+                if patch.context_compaction_chunk_chars is None
+                else patch.context_compaction_chunk_chars
+            ),
         )
         project.settings = updated
         self._record_project_operation(
@@ -177,6 +207,11 @@ class ProjectService:
                 "context_sentence_safe_expand_chars": updated.context_sentence_safe_expand_chars,
                 "context_soft_max_tokens": updated.context_soft_max_tokens,
                 "strict_json_fence_output": updated.strict_json_fence_output,
+                "context_compaction_enabled": updated.context_compaction_enabled,
+                "context_compaction_trigger_ratio": updated.context_compaction_trigger_ratio,
+                "context_compaction_keep_recent_chunks": updated.context_compaction_keep_recent_chunks,
+                "context_compaction_group_chunks": updated.context_compaction_group_chunks,
+                "context_compaction_chunk_chars": updated.context_compaction_chunk_chars,
             },
         )
         return self.load_project(project_id)
