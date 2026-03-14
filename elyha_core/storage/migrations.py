@@ -7,7 +7,7 @@ import sqlite3
 
 from elyha_core.i18n import tr
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 8
 
 
 def _now_iso() -> str:
@@ -408,6 +408,96 @@ MIGRATIONS: dict[int, str] = {
         ON state_update_outbox(project_id, status, next_retry_at, created_at, id);
     CREATE INDEX IF NOT EXISTS idx_state_update_outbox_thread_status_retry
         ON state_update_outbox(thread_id, status, next_retry_at, created_at, id);
+    """,
+    6: """
+    CREATE TABLE IF NOT EXISTS agent_loop_rounds (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        thread_id TEXT NOT NULL,
+        round_no INTEGER NOT NULL,
+        task_type TEXT NOT NULL DEFAULT '',
+        agent TEXT NOT NULL DEFAULT '',
+        prompt_hash TEXT NOT NULL DEFAULT '',
+        prompt_tokens INTEGER NOT NULL DEFAULT 0,
+        completion_tokens INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(thread_id) REFERENCES agent_sessions(thread_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_loop_rounds_thread_round
+        ON agent_loop_rounds(thread_id, round_no, id);
+    CREATE INDEX IF NOT EXISTS idx_agent_loop_rounds_thread_created
+        ON agent_loop_rounds(thread_id, created_at, id);
+
+    CREATE TABLE IF NOT EXISTS agent_tool_calls (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        thread_id TEXT NOT NULL,
+        round_no INTEGER NOT NULL,
+        task_type TEXT NOT NULL DEFAULT '',
+        agent TEXT NOT NULL DEFAULT '',
+        tool_name TEXT NOT NULL,
+        args_json TEXT NOT NULL DEFAULT '{}',
+        result_meta_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(thread_id) REFERENCES agent_sessions(thread_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_tool_calls_thread_round
+        ON agent_tool_calls(thread_id, round_no, id);
+    CREATE INDEX IF NOT EXISTS idx_agent_tool_calls_thread_created
+        ON agent_tool_calls(thread_id, created_at, id);
+    """,
+    7: """
+    CREATE TABLE IF NOT EXISTS agent_loop_metrics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        thread_id TEXT NOT NULL,
+        task_type TEXT NOT NULL DEFAULT '',
+        agent TEXT NOT NULL DEFAULT '',
+        metrics_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(thread_id) REFERENCES agent_sessions(thread_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_loop_metrics_thread_created
+        ON agent_loop_metrics(thread_id, created_at, id);
+    """,
+    8: """
+    CREATE TABLE IF NOT EXISTS workflow_doc_states (
+        project_id TEXT PRIMARY KEY,
+        workflow_mode TEXT NOT NULL DEFAULT 'original',
+        workflow_stage TEXT NOT NULL DEFAULT 'idle',
+        workflow_initialized INTEGER NOT NULL DEFAULT 0,
+        round_number INTEGER NOT NULL DEFAULT 0,
+        assistant_message TEXT NOT NULL DEFAULT '',
+        collected_inputs_json TEXT NOT NULL DEFAULT '{}',
+        clarify_questions_json TEXT NOT NULL DEFAULT '[]',
+        pending_docs_json TEXT NOT NULL DEFAULT '{}',
+        published_docs_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_workflow_doc_states_stage
+        ON workflow_doc_states(workflow_stage, updated_at, project_id);
+
+    CREATE TABLE IF NOT EXISTS chat_threads (
+        thread_id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        node_id TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_chat_threads_project_updated
+        ON chat_threads(project_id, updated_at, thread_id);
+
+    CREATE TABLE IF NOT EXISTS chat_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        thread_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(thread_id) REFERENCES chat_threads(thread_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_chat_messages_thread_created
+        ON chat_messages(thread_id, created_at, id);
     """,
 }
 

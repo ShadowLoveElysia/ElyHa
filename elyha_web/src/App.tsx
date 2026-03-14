@@ -7,6 +7,7 @@ import {KnowledgeGraph} from './components/KnowledgeGraph';
 import {WindowDialog, type WindowDialogState} from './components/window';
 import {SUPPORTED_LOCALES, loadLocaleDict, tFrom, type TranslationVars} from './i18n';
 import {
+  ApiTimeoutError,
   createRuntimeProfile,
   createEdge,
   createNode,
@@ -42,7 +43,14 @@ import type {
   WorkflowMode,
 } from './types';
 
-function errorToText(error: unknown, fallback = 'Unknown error'): string {
+function errorToText(
+  error: unknown,
+  translate: (key: string, vars?: TranslationVars) => string,
+  fallback: string,
+): string {
+  if (error instanceof ApiTimeoutError) {
+    return translate('web.error.request_timeout', {seconds: error.timeoutSeconds});
+  }
   if (error instanceof Error) {
     return error.message;
   }
@@ -98,9 +106,101 @@ function toRuntimeDraft(config: RuntimeConfigPayload): RuntimeDraft {
   };
 }
 
+type GuideDocKey = 'clarify' | 'constitution' | 'plan' | 'specification';
+
+const GUIDE_DOC_ORDER: GuideDocKey[] = ['clarify', 'constitution', 'plan', 'specification'];
+
+const GUIDE_DOC_TITLES: Record<GuideDocKey, string> = {
+  clarify: 'clarify.md',
+  constitution: 'constitution.md',
+  plan: 'plan.md',
+  specification: 'specification.md',
+};
+
+const GUIDE_DOC_TITLE_SET = new Set(Object.values(GUIDE_DOC_TITLES).map((item) => item.toLowerCase()));
+
+function normalizeText(value: unknown): string {
+  if (typeof value === 'string') {
+    return value.trim();
+  }
+  return '';
+}
+
+function shortenText(text: string, max = 140): string {
+  const normalized = String(text || '').trim();
+  if (!normalized) {
+    return '';
+  }
+  if (normalized.length <= max) {
+    return normalized;
+  }
+  return `${normalized.slice(0, max)}...`;
+}
+
+function nodePrimaryText(metadata: unknown): string {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+    return '';
+  }
+  const record = metadata as Record<string, unknown>;
+  const content = normalizeText(record.content);
+  if (content) {
+    return content;
+  }
+  const outline = normalizeText(record.outline_markdown);
+  if (outline) {
+    return outline;
+  }
+  return normalizeText(record.summary);
+}
+
+function parseGuideDocsFromReply(rawReply: string): Record<GuideDocKey, string> | null {
+  const raw = String(rawReply || '').trim();
+  if (!raw) {
+    return null;
+  }
+
+  const candidates: string[] = [];
+  const jsonFence = raw.match(/```json\s*([\s\S]*?)```/i);
+  const anyFence = raw.match(/```\s*([\s\S]*?)```/i);
+  if (jsonFence?.[1]) {
+    candidates.push(jsonFence[1].trim());
+  }
+  if (anyFence?.[1]) {
+    candidates.push(anyFence[1].trim());
+  }
+  candidates.push(raw);
+  const firstBrace = raw.indexOf('{');
+  const lastBrace = raw.lastIndexOf('}');
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    candidates.push(raw.slice(firstBrace, lastBrace + 1).trim());
+  }
+
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        continue;
+      }
+      const record = parsed as Record<string, unknown>;
+      const clarify = normalizeText(record.clarify ?? record['clarify.md']);
+      const constitution = normalizeText(record.constitution ?? record['constitution.md']);
+      const plan = normalizeText(record.plan ?? record['plan.md']);
+      const specification = normalizeText(record.specification ?? record['specification.md']);
+      if (!clarify && !constitution && !plan && !specification) {
+        continue;
+      }
+      return {clarify, constitution, plan, specification};
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState('workspace');
   const [isChatOpen, setIsChatOpen] = useState(false);
+  const [chatResetVersion, setChatResetVersion] = useState(0);
 
   const [projects, setProjects] = useState<ProjectPayload[]>([]);
   const [projectId, setProjectId] = useState('');
@@ -108,6 +208,7 @@ export default function App() {
   const [nodes, setNodes] = useState<GraphNodePayload[]>([]);
   const [edges, setEdges] = useState<GraphEdgePayload[]>([]);
   const [selectedNodeId, setSelectedNodeId] = useState('');
+  const [outlinePreviewTarget, setOutlinePreviewTarget] = useState<'selected' | 'global' | GuideDocKey>('global');
   const [linkMode, setLinkMode] = useState(false);
   const [linkSourceNodeId, setLinkSourceNodeId] = useState('');
 
@@ -188,6 +289,30 @@ export default function App() {
     [t],
   );
 
+  const handleWorkflowModeDraftChange = useCallback(
+    async (nextMode: WorkflowMode) => {
+      const currentMode = settingsDraft.default_workflow_mode;
+      if (nextMode === currentMode) {
+        return;
+      }
+      const currentLabel = workflowModeOptions.find((item) => item.value === currentMode)?.label || currentMode;
+      const nextLabel = workflowModeOptions.find((item) => item.value === nextMode)?.label || nextMode;
+      const confirmed = await askConfirm(
+        t('web.modal.workflow_mode_switch_title'),
+        t('web.modal.workflow_mode_switch_body', {from: currentLabel, to: nextLabel}),
+      );
+      if (!confirmed) {
+        return;
+      }
+      setSettingsDraft((prev) => ({
+        ...prev,
+        default_workflow_mode: nextMode,
+      }));
+      setChatResetVersion((value) => value + 1);
+    },
+    [askConfirm, settingsDraft.default_workflow_mode, t, workflowModeOptions],
+  );
+
   const askPrompt = useCallback(
     async (options: {
       title: string;
@@ -259,7 +384,7 @@ export default function App() {
       try {
         await task();
       } catch (error) {
-        setStatus(`${failPrefix}: ${errorToText(error, t('web.error.unknown'))}`, true);
+        setStatus(`${failPrefix}: ${errorToText(error, t, t('web.error.unknown'))}`, true);
       } finally {
         setBusyCount((value) => Math.max(0, value - 1));
       }
@@ -368,6 +493,117 @@ export default function App() {
     }
     return nodes.find((item) => item.id === linkSourceNodeId)?.title || '';
   }, [linkSourceNodeId, nodes]);
+
+  const guideDocNodes = useMemo(() => {
+    const map = new Map<GuideDocKey, GraphNodePayload>();
+    for (const node of nodes) {
+      const lowered = String(node.title || '').trim().toLowerCase();
+      if (lowered === GUIDE_DOC_TITLES.clarify.toLowerCase()) {
+        map.set('clarify', node);
+      } else if (lowered === GUIDE_DOC_TITLES.constitution.toLowerCase()) {
+        map.set('constitution', node);
+      } else if (lowered === GUIDE_DOC_TITLES.plan.toLowerCase()) {
+        map.set('plan', node);
+      } else if (lowered === GUIDE_DOC_TITLES.specification.toLowerCase()) {
+        map.set('specification', node);
+      }
+    }
+    return map;
+  }, [nodes]);
+
+  const guideDocStatus = useMemo(
+    () =>
+      GUIDE_DOC_ORDER.map((key) => {
+        const node = guideDocNodes.get(key);
+        return {
+          key,
+          title: GUIDE_DOC_TITLES[key],
+          filled: !!node && !!nodePrimaryText(node.metadata),
+        };
+      }),
+    [guideDocNodes],
+  );
+
+  const guideOutlineCards = useMemo(
+    () =>
+      GUIDE_DOC_ORDER.map((key) => {
+        const node = guideDocNodes.get(key);
+        const content = node ? nodePrimaryText(node.metadata).trim() : '';
+        return {
+          key,
+          title: GUIDE_DOC_TITLES[key],
+          content,
+          filled: Boolean(content),
+        };
+      }),
+    [guideDocNodes],
+  );
+
+  const globalOutlineText = useMemo(() => normalizeText(project?.settings?.global_directives), [project]);
+
+  const outlinePreviewContent = useMemo(() => {
+    if (outlinePreviewTarget === 'global') {
+      return {
+        title: t('web.chat.context_global'),
+        content: globalOutlineText || t('web.outline.node_empty'),
+      };
+    }
+    if (outlinePreviewTarget === 'selected') {
+      return {
+        title: selectedNode ? selectedNode.title : t('web.outline.select_node_hint'),
+        content: selectedNode ? nodeMainText(selectedNode.metadata, t('web.outline.node_empty')) : t('web.outline.select_node_hint'),
+      };
+    }
+    const card = guideOutlineCards.find((item) => item.key === outlinePreviewTarget);
+    if (!card) {
+      return {
+        title: t('web.outline.select_node_hint'),
+        content: t('web.outline.select_node_hint'),
+      };
+    }
+    return {
+      title: card.title,
+      content: card.content || t('web.guide.docs_empty_fallback', {name: card.title}),
+    };
+  }, [globalOutlineText, guideOutlineCards, outlinePreviewTarget, selectedNode, t]);
+
+  useEffect(() => {
+    if (outlinePreviewTarget === 'selected' && !selectedNode) {
+      setOutlinePreviewTarget('global');
+    }
+  }, [outlinePreviewTarget, selectedNode]);
+
+  const guideDocsComplete = useMemo(() => guideDocStatus.every((item) => item.filled), [guideDocStatus]);
+
+  const hasStoryProgress = useMemo(() => {
+    if (edges.length > 0) {
+      return true;
+    }
+    return nodes.some((node) => {
+      const lowered = String(node.title || '').trim().toLowerCase();
+      if (!GUIDE_DOC_TITLE_SET.has(lowered)) {
+        return true;
+      }
+      return false;
+    });
+  }, [edges.length, nodes]);
+
+  const shouldShowGuideWorkspace = useMemo(() => {
+    if (activeTab !== 'workspace') {
+      return false;
+    }
+    if (!projectId) {
+      return false;
+    }
+    return !guideDocsComplete && !hasStoryProgress;
+  }, [activeTab, guideDocsComplete, hasStoryProgress, projectId]);
+
+  useEffect(() => {
+    if (!shouldShowGuideWorkspace) {
+      return;
+    }
+    setIsChatOpen(true);
+  }, [shouldShowGuideWorkspace]);
 
   const handleCreateProject = useCallback(
     async (title: string) => {
@@ -703,6 +939,76 @@ export default function App() {
     [execute, loadProjectBundle, projectId, setStatus, t],
   );
 
+  const handleGuideDocReply = useCallback(
+    async (reply: string) => {
+      if (!projectId) {
+        return;
+      }
+      try {
+        const parsed = parseGuideDocsFromReply(reply);
+        if (!parsed) {
+          return;
+        }
+
+        let changedCount = 0;
+        for (let index = 0; index < GUIDE_DOC_ORDER.length; index += 1) {
+          const key = GUIDE_DOC_ORDER[index];
+          const title = GUIDE_DOC_TITLES[key];
+          const nextContent = (parsed[key] || '').trim();
+          if (!nextContent) {
+            continue;
+          }
+
+          const existing = guideDocNodes.get(key);
+          const currentContent = existing ? nodePrimaryText(existing.metadata).trim() : '';
+          if (currentContent === nextContent) {
+            continue;
+          }
+
+          const preview = nextContent.slice(0, 600);
+          const warning = hasStoryProgress ? t('web.guide.modify_after_progress_inline_warning') : '';
+          const confirmed = await askConfirm(
+            t('web.guide.doc_update_confirm_title', {name: title}),
+            t('web.guide.doc_update_confirm_body', {name: title, preview, warning}),
+          );
+          if (!confirmed) {
+            continue;
+          }
+
+          const metadata: Record<string, unknown> = {
+            content: nextContent,
+            outline_markdown: nextContent,
+            summary: nextContent.slice(0, 200),
+          };
+          if (existing) {
+            await updateNode(projectId, existing.id, {
+              title,
+              type: 'chapter',
+              metadata,
+            });
+          } else {
+            await createNode(projectId, {
+              title,
+              type: 'chapter',
+              pos_x: 120 + (index % 2) * 460,
+              pos_y: 120 + Math.floor(index / 2) * 220,
+              metadata,
+            });
+          }
+          changedCount += 1;
+        }
+
+        if (changedCount > 0) {
+          await loadProjectBundle(projectId);
+          setStatus(t('web.guide.docs_written_count', {count: changedCount}));
+        }
+      } catch (error) {
+        setStatus(`${t('web.error.guide_docs_write_failed')}: ${errorToText(error, t, t('web.error.unknown'))}`, true);
+      }
+    },
+    [askConfirm, guideDocNodes, hasStoryProgress, loadProjectBundle, projectId, setStatus, t],
+  );
+
   const refreshInsights = useCallback(async () => {
     if (!projectId) {
       setInsights(null);
@@ -713,7 +1019,7 @@ export default function App() {
       const payload = await fetchProjectInsights(projectId);
       setInsights(payload);
     } catch (error) {
-      setStatus(`${t('web.error.graph_load_failed')}: ${errorToText(error, t('web.error.unknown'))}`, true);
+      setStatus(`${t('web.error.graph_load_failed')}: ${errorToText(error, t, t('web.error.unknown'))}`, true);
     } finally {
       setInsightsLoading(false);
     }
@@ -946,10 +1252,79 @@ export default function App() {
               <div className="max-w-5xl mx-auto bg-white rounded-2xl border border-slate-200 shadow-sm p-6">
                 <h2 className="text-xl font-bold text-slate-800">{t('web.outline.view_title')}</h2>
                 <p className="text-sm text-slate-500 mt-1">{t('web.outline.view_description')}</p>
-                <div className="mt-5 rounded-xl bg-slate-50 border border-slate-200 p-4 min-h-[320px] whitespace-pre-wrap text-sm leading-relaxed text-slate-700">
-                  {selectedNode
-                    ? nodeMainText(selectedNode.metadata, t('web.outline.node_empty'))
-                    : t('web.outline.select_node_hint')}
+                <div className="mt-5 grid grid-cols-1 xl:grid-cols-2 gap-4 items-start">
+                  <div className="space-y-4">
+                    <button
+                      type="button"
+                      onClick={() => setOutlinePreviewTarget('global')}
+                      className={[
+                        'w-full text-left rounded-xl border p-4 transition-colors',
+                        outlinePreviewTarget === 'global'
+                          ? 'border-pink-300 bg-pink-50/70'
+                          : 'border-slate-200 bg-slate-50 hover:border-slate-300',
+                      ].join(' ')}
+                    >
+                      <h3 className="text-sm font-semibold text-slate-800">{t('web.chat.context_global')}</h3>
+                      <div className="mt-2 whitespace-pre-wrap text-sm leading-relaxed text-slate-700">
+                        {shortenText(globalOutlineText) || t('web.outline.node_empty')}
+                      </div>
+                    </button>
+
+                    <div className="space-y-3">
+                      {guideOutlineCards.map((item) => (
+                        <button
+                          key={item.key}
+                          type="button"
+                          onClick={() => setOutlinePreviewTarget(item.key)}
+                          className={[
+                            'w-full text-left rounded-xl border p-4 transition-colors',
+                            outlinePreviewTarget === item.key
+                              ? 'border-pink-300 bg-pink-50/70'
+                              : 'border-slate-200 bg-white hover:border-slate-300',
+                          ].join(' ')}
+                        >
+                          <div className="flex items-center justify-between gap-3">
+                            <h4 className="text-sm font-semibold text-slate-800">{item.title}</h4>
+                            <span
+                              className={
+                                item.filled
+                                  ? 'inline-flex items-center rounded-full px-2 py-0.5 text-[11px] border border-emerald-200 bg-emerald-50 text-emerald-700'
+                                  : 'inline-flex items-center rounded-full px-2 py-0.5 text-[11px] border border-amber-200 bg-amber-50 text-amber-700'
+                              }
+                            >
+                              {item.filled ? t('web.chat.guide_status_done') : t('web.chat.guide_status_pending')}
+                            </span>
+                          </div>
+                          <div className="mt-2 whitespace-pre-wrap text-sm leading-relaxed text-slate-700">
+                            {shortenText(item.content) || t('web.guide.docs_empty_fallback', {name: item.title})}
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <section className="rounded-xl bg-slate-50 border border-slate-200 p-4 min-h-[320px]">
+                    <div className="flex items-center justify-between gap-3">
+                      <h3 className="text-sm font-semibold text-slate-800">{outlinePreviewContent.title}</h3>
+                      {selectedNode ? (
+                        <button
+                          type="button"
+                          onClick={() => setOutlinePreviewTarget('selected')}
+                          className={[
+                            'text-xs px-2 py-1 rounded-md border transition-colors',
+                            outlinePreviewTarget === 'selected'
+                              ? 'border-pink-300 bg-pink-50 text-pink-700'
+                              : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-100',
+                          ].join(' ')}
+                        >
+                          {selectedNode.title}
+                        </button>
+                      ) : null}
+                    </div>
+                    <div className="mt-2 whitespace-pre-wrap text-sm leading-relaxed text-slate-700">
+                      {outlinePreviewContent.content}
+                    </div>
+                  </section>
                 </div>
               </div>
             </div>
@@ -1035,12 +1410,7 @@ export default function App() {
                     <FormRow label={t('web.ai.workflow_mode')}>
                       <select
                         value={settingsDraft.default_workflow_mode}
-                        onChange={(event) =>
-                          setSettingsDraft((prev) => ({
-                            ...prev,
-                            default_workflow_mode: event.target.value as WorkflowMode,
-                          }))
-                        }
+                        onChange={(event) => void handleWorkflowModeDraftChange(event.target.value as WorkflowMode)}
                         className="w-full h-10 rounded-lg border border-slate-200 px-3 text-sm bg-white"
                       >
                         {workflowModeOptions.map((option) => (
@@ -1091,18 +1461,23 @@ export default function App() {
               </div>
             </div>
           )}
-        </main>
 
-        <AIChat
-          isOpen={isChatOpen}
-          onClose={() => setIsChatOpen(false)}
-          projectId={projectId}
-          selectedNodeId={selectedNodeId}
-          onCreateSuggestionNode={handleCreateSuggestionNode}
-          onRefreshProject={refreshCurrentProject}
-          onStatus={setStatus}
-          t={t}
-        />
+          <AIChat
+            isOpen={isChatOpen}
+            onClose={() => setIsChatOpen(false)}
+            projectId={projectId}
+            selectedNodeId={selectedNodeId}
+            resetVersion={chatResetVersion}
+            fullScreen={shouldShowGuideWorkspace}
+            guideMode={shouldShowGuideWorkspace}
+            guideDocStatus={guideDocStatus}
+            onGuideDocReply={handleGuideDocReply}
+            onCreateSuggestionNode={handleCreateSuggestionNode}
+            onRefreshProject={refreshCurrentProject}
+            onStatus={setStatus}
+            t={t}
+          />
+        </main>
 
         <WindowDialog
           dialog={dialog}

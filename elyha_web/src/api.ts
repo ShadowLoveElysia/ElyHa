@@ -30,6 +30,17 @@ import type {
 
 const DEFAULT_TIMEOUT_MS = 95_000;
 
+export class ApiTimeoutError extends Error {
+  timeoutSeconds: number;
+
+  constructor(timeoutMs: number) {
+    const timeoutSeconds = Math.max(1, Math.round(timeoutMs / 1000));
+    super(`API_TIMEOUT:${timeoutSeconds}`);
+    this.name = 'ApiTimeoutError';
+    this.timeoutSeconds = timeoutSeconds;
+  }
+}
+
 function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/, '');
 }
@@ -136,7 +147,7 @@ export async function apiRequest<T>(path: string, options: ApiRequestOptions = {
     return payload as T;
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') {
-      throw new Error(`request timeout after ${Math.round(timeoutMs / 1000)}s`);
+      throw new ApiTimeoutError(timeoutMs);
     }
     throw error;
   } finally {

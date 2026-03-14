@@ -22,6 +22,10 @@ class ProjectSettingsPatch:
     system_prompt_style: str | None = None
     system_prompt_forbidden: str | None = None
     system_prompt_notes: str | None = None
+    constitution_markdown: str | None = None
+    clarify_markdown: str | None = None
+    specification_markdown: str | None = None
+    plan_markdown: str | None = None
     global_directives: str | None = None
     context_soft_min_chars: int | None = None
     context_soft_max_chars: int | None = None
@@ -33,6 +37,13 @@ class ProjectSettingsPatch:
     context_compaction_keep_recent_chunks: int | None = None
     context_compaction_group_chunks: int | None = None
     context_compaction_chunk_chars: int | None = None
+    agent_tool_loop_enabled: bool | None = None
+    agent_tool_loop_max_rounds: int | None = None
+    agent_tool_loop_max_calls_per_round: int | None = None
+    agent_tool_loop_single_read_char_limit: int | None = None
+    agent_tool_loop_total_read_char_limit: int | None = None
+    agent_tool_loop_no_progress_limit: int | None = None
+    agent_tool_write_proposal_enabled: bool | None = None
 
 
 class ProjectService:
@@ -134,6 +145,26 @@ class ProjectService:
                 if patch.system_prompt_notes is None
                 else patch.system_prompt_notes
             ),
+            constitution_markdown=(
+                current.constitution_markdown
+                if patch.constitution_markdown is None
+                else patch.constitution_markdown
+            ),
+            clarify_markdown=(
+                current.clarify_markdown
+                if patch.clarify_markdown is None
+                else patch.clarify_markdown
+            ),
+            specification_markdown=(
+                current.specification_markdown
+                if patch.specification_markdown is None
+                else patch.specification_markdown
+            ),
+            plan_markdown=(
+                current.plan_markdown
+                if patch.plan_markdown is None
+                else patch.plan_markdown
+            ),
             global_directives=(
                 current.global_directives
                 if patch.global_directives is None
@@ -189,6 +220,41 @@ class ProjectService:
                 if patch.context_compaction_chunk_chars is None
                 else patch.context_compaction_chunk_chars
             ),
+            agent_tool_loop_enabled=(
+                current.agent_tool_loop_enabled
+                if patch.agent_tool_loop_enabled is None
+                else patch.agent_tool_loop_enabled
+            ),
+            agent_tool_loop_max_rounds=(
+                current.agent_tool_loop_max_rounds
+                if patch.agent_tool_loop_max_rounds is None
+                else patch.agent_tool_loop_max_rounds
+            ),
+            agent_tool_loop_max_calls_per_round=(
+                current.agent_tool_loop_max_calls_per_round
+                if patch.agent_tool_loop_max_calls_per_round is None
+                else patch.agent_tool_loop_max_calls_per_round
+            ),
+            agent_tool_loop_single_read_char_limit=(
+                current.agent_tool_loop_single_read_char_limit
+                if patch.agent_tool_loop_single_read_char_limit is None
+                else patch.agent_tool_loop_single_read_char_limit
+            ),
+            agent_tool_loop_total_read_char_limit=(
+                current.agent_tool_loop_total_read_char_limit
+                if patch.agent_tool_loop_total_read_char_limit is None
+                else patch.agent_tool_loop_total_read_char_limit
+            ),
+            agent_tool_loop_no_progress_limit=(
+                current.agent_tool_loop_no_progress_limit
+                if patch.agent_tool_loop_no_progress_limit is None
+                else patch.agent_tool_loop_no_progress_limit
+            ),
+            agent_tool_write_proposal_enabled=(
+                current.agent_tool_write_proposal_enabled
+                if patch.agent_tool_write_proposal_enabled is None
+                else patch.agent_tool_write_proposal_enabled
+            ),
         )
         project.settings = updated
         self._record_project_operation(
@@ -201,6 +267,10 @@ class ProjectService:
                 "system_prompt_style": updated.system_prompt_style,
                 "system_prompt_forbidden": updated.system_prompt_forbidden,
                 "system_prompt_notes": updated.system_prompt_notes,
+                "constitution_markdown": updated.constitution_markdown,
+                "clarify_markdown": updated.clarify_markdown,
+                "specification_markdown": updated.specification_markdown,
+                "plan_markdown": updated.plan_markdown,
                 "global_directives": updated.global_directives,
                 "context_soft_min_chars": updated.context_soft_min_chars,
                 "context_soft_max_chars": updated.context_soft_max_chars,
@@ -212,6 +282,13 @@ class ProjectService:
                 "context_compaction_keep_recent_chunks": updated.context_compaction_keep_recent_chunks,
                 "context_compaction_group_chunks": updated.context_compaction_group_chunks,
                 "context_compaction_chunk_chars": updated.context_compaction_chunk_chars,
+                "agent_tool_loop_enabled": updated.agent_tool_loop_enabled,
+                "agent_tool_loop_max_rounds": updated.agent_tool_loop_max_rounds,
+                "agent_tool_loop_max_calls_per_round": updated.agent_tool_loop_max_calls_per_round,
+                "agent_tool_loop_single_read_char_limit": updated.agent_tool_loop_single_read_char_limit,
+                "agent_tool_loop_total_read_char_limit": updated.agent_tool_loop_total_read_char_limit,
+                "agent_tool_loop_no_progress_limit": updated.agent_tool_loop_no_progress_limit,
+                "agent_tool_write_proposal_enabled": updated.agent_tool_write_proposal_enabled,
             },
         )
         return self.load_project(project_id)

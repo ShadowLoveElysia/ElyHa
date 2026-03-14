@@ -10,6 +10,10 @@ export interface ProjectSettings {
   system_prompt_style: string;
   system_prompt_forbidden: string;
   system_prompt_notes: string;
+  constitution_markdown: string;
+  clarify_markdown: string;
+  specification_markdown: string;
+  plan_markdown: string;
   global_directives: string;
   context_soft_min_chars: number;
   context_soft_max_chars: number;
@@ -21,6 +25,13 @@ export interface ProjectSettings {
   context_compaction_keep_recent_chunks: number;
   context_compaction_group_chunks: number;
   context_compaction_chunk_chars: number;
+  agent_tool_loop_enabled: boolean;
+  agent_tool_loop_max_rounds: number;
+  agent_tool_loop_max_calls_per_round: number;
+  agent_tool_loop_single_read_char_limit: number;
+  agent_tool_loop_total_read_char_limit: number;
+  agent_tool_loop_no_progress_limit: number;
+  agent_tool_write_proposal_enabled: boolean;
 }
 
 export interface ProjectPayload {
@@ -142,6 +153,7 @@ export interface AiChatPayload {
   project_id: string;
   message: string;
   node_id?: string;
+  thread_id?: string;
   token_budget?: number;
 }
 
@@ -158,6 +170,7 @@ export interface AiSuggestedOption {
 export interface AiChatResponse {
   project_id: string;
   node_id: string | null;
+  thread_id: string;
   route: string;
   reply: string;
   review_bypassed: boolean;

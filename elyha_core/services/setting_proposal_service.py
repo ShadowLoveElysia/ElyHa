@@ -91,6 +91,73 @@ class SettingProposalService:
             )
         return self.get_proposal(proposal_id)
 
+    def create_from_agent_tool(
+        self,
+        *,
+        project_id: str,
+        node_id: str,
+        thread_id: str,
+        proposal_type: str,
+        target_scope: str,
+        directive_text: str,
+        note: str = "",
+    ) -> dict[str, Any]:
+        clean_thread_id = str(thread_id or "").strip()
+        if not clean_thread_id:
+            raise ValueError("thread_id cannot be empty")
+        clean_project_id = str(project_id or "").strip()
+        if not clean_project_id:
+            raise ValueError("project_id cannot be empty")
+        clean_node_id = str(node_id or "").strip()
+        if not clean_node_id:
+            raise ValueError("node_id cannot be empty")
+        clean_directive = str(directive_text or "").strip()
+        if not clean_directive:
+            raise ValueError("directive_text cannot be empty")
+        clean_scope = str(target_scope or "project").strip().lower()
+        if clean_scope not in {"project", "global"}:
+            clean_scope = "project"
+        clean_type = str(proposal_type or "").strip().lower() or "global_directive"
+        effective_revision = self._project_revision(clean_project_id)
+        supersedes_id = self._latest_applied_proposal_id(
+            project_id=clean_project_id,
+            thread_id=clean_thread_id,
+            target_scope=clean_scope,
+            proposal_type=clean_type,
+        )
+        proposal_id = generate_id("sp")
+        payload = {
+            "source": "agent_tool",
+            "directive_text": clean_directive,
+            "note": str(note or "").strip(),
+            "requires_human_review": True,
+        }
+        now_iso = utc_now().isoformat()
+        with self.repository.store.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO setting_proposals(
+                    id, thread_id, project_id, node_id, clarification_id,
+                    proposal_type, target_scope, effective_from_revision,
+                    supersedes_proposal_id, proposal_json, status,
+                    reviewer, review_note, created_at, reviewed_at, applied_at, applied_revision
+                ) VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, 'pending_review', '', '', ?, '', '', 0)
+                """,
+                (
+                    proposal_id,
+                    clean_thread_id,
+                    clean_project_id,
+                    clean_node_id,
+                    clean_type,
+                    clean_scope,
+                    int(effective_revision),
+                    supersedes_id,
+                    self._dump_json(payload),
+                    now_iso,
+                ),
+            )
+        return self.get_proposal(proposal_id)
+
     def get_proposal(self, proposal_id: str) -> dict[str, Any]:
         clean_id = str(proposal_id or "").strip()
         if not clean_id:

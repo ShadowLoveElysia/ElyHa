@@ -16,6 +16,7 @@ from elyha_core.models.project import Project, project_settings_from_payload
 from elyha_core.models.snapshot import Snapshot
 from elyha_core.models.task import Task, TaskStatus
 from elyha_core.storage.sqlite_store import SQLiteStore
+from elyha_core.utils.clock import utc_now
 
 
 def _dump_time(value: datetime) -> str:
@@ -509,6 +510,60 @@ class SQLiteRepository:
             ).fetchall()
         return [str(row["content"]) for row in rows]
 
+    def list_node_chunk_records(self, node_id: str) -> list[dict[str, Any]]:
+        with self.store.read_only() as conn:
+            rows = conn.execute(
+                """
+                SELECT chunk_index, content, token_estimate, summary
+                FROM node_chunks
+                WHERE node_id = ?
+                ORDER BY chunk_index ASC
+                """,
+                (node_id,),
+            ).fetchall()
+        return [
+            {
+                "node_id": str(node_id),
+                "chunk_index": int(row["chunk_index"]),
+                "content": str(row["content"]),
+                "token_estimate": int(row["token_estimate"]),
+                "summary": str(row["summary"]),
+            }
+            for row in rows
+        ]
+
+    def list_project_chunk_records(
+        self,
+        project_id: str,
+        *,
+        node_ids: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        clean_node_ids = [str(item).strip() for item in (node_ids or []) if str(item).strip()]
+        params: list[Any] = [project_id]
+        sql = """
+            SELECT n.id AS node_id, c.chunk_index, c.content, c.token_estimate, c.summary
+            FROM node_chunks AS c
+            INNER JOIN nodes AS n ON n.id = c.node_id
+            WHERE n.project_id = ?
+        """
+        if clean_node_ids:
+            placeholders = ",".join("?" for _ in clean_node_ids)
+            sql += f" AND n.id IN ({placeholders})"
+            params.extend(clean_node_ids)
+        sql += " ORDER BY n.updated_at DESC, n.id ASC, c.chunk_index ASC"
+        with self.store.read_only() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return [
+            {
+                "node_id": str(row["node_id"]),
+                "chunk_index": int(row["chunk_index"]),
+                "content": str(row["content"]),
+                "token_estimate": int(row["token_estimate"]),
+                "summary": str(row["summary"]),
+            }
+            for row in rows
+        ]
+
     def replace_node_chunks(self, node_id: str, chunks: list[str]) -> None:
         with self.store.transaction() as conn:
             conn.execute("DELETE FROM node_chunks WHERE node_id = ?", (node_id,))
@@ -602,3 +657,383 @@ class SQLiteRepository:
         with self.store.read_only() as conn:
             rows = conn.execute(sql, tuple(params)).fetchall()
         return [self._decode_task(row) for row in rows]
+
+    def create_agent_loop_rounds(self, thread_id: str, rounds: list[dict[str, Any]]) -> None:
+        clean_thread = str(thread_id or "").strip()
+        if not clean_thread or not rounds:
+            return
+        with self.store.transaction() as conn:
+            for item in rounds:
+                round_no = max(1, int(item.get("round_no", 1)))
+                conn.execute(
+                    """
+                    INSERT INTO agent_loop_rounds(
+                        thread_id, round_no, task_type, agent,
+                        prompt_hash, prompt_tokens, completion_tokens, status, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        clean_thread,
+                        round_no,
+                        str(item.get("task_type", "") or ""),
+                        str(item.get("agent", "") or ""),
+                        str(item.get("prompt_hash", "") or ""),
+                        max(0, int(item.get("prompt_tokens", 0))),
+                        max(0, int(item.get("completion_tokens", 0))),
+                        str(item.get("status", "") or ""),
+                        str(item.get("created_at", "") or ""),
+                    ),
+                )
+
+    def create_agent_tool_calls(self, thread_id: str, calls: list[dict[str, Any]]) -> None:
+        clean_thread = str(thread_id or "").strip()
+        if not clean_thread or not calls:
+            return
+        with self.store.transaction() as conn:
+            for item in calls:
+                round_no = max(1, int(item.get("round_no", 1)))
+                args = item.get("args")
+                if not isinstance(args, dict):
+                    args = {}
+                result_meta = item.get("result_meta")
+                if not isinstance(result_meta, dict):
+                    result_meta = {}
+                conn.execute(
+                    """
+                    INSERT INTO agent_tool_calls(
+                        thread_id, round_no, task_type, agent,
+                        tool_name, args_json, result_meta_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        clean_thread,
+                        round_no,
+                        str(item.get("task_type", "") or ""),
+                        str(item.get("agent", "") or ""),
+                        str(item.get("tool_name", "") or ""),
+                        json.dumps(args, ensure_ascii=False, sort_keys=True),
+                        json.dumps(result_meta, ensure_ascii=False, sort_keys=True),
+                        str(item.get("created_at", "") or ""),
+                    ),
+                )
+
+    def create_agent_loop_metrics(self, thread_id: str, metrics: list[dict[str, Any]]) -> None:
+        clean_thread = str(thread_id or "").strip()
+        if not clean_thread or not metrics:
+            return
+        with self.store.transaction() as conn:
+            for item in metrics:
+                payload = item.get("metrics")
+                if not isinstance(payload, dict):
+                    payload = {}
+                conn.execute(
+                    """
+                    INSERT INTO agent_loop_metrics(
+                        thread_id, task_type, agent, metrics_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        clean_thread,
+                        str(item.get("task_type", "") or ""),
+                        str(item.get("agent", "") or ""),
+                        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                        str(item.get("created_at", "") or ""),
+                    ),
+                )
+
+    def list_agent_loop_rounds(self, thread_id: str) -> list[dict[str, Any]]:
+        clean_thread = str(thread_id or "").strip()
+        if not clean_thread:
+            return []
+        with self.store.read_only() as conn:
+            rows = conn.execute(
+                """
+                SELECT thread_id, round_no, task_type, agent, prompt_hash,
+                       prompt_tokens, completion_tokens, status, created_at
+                FROM agent_loop_rounds
+                WHERE thread_id = ?
+                ORDER BY id ASC
+                """,
+                (clean_thread,),
+            ).fetchall()
+        return [
+            {
+                "thread_id": str(row["thread_id"]),
+                "round_no": int(row["round_no"]),
+                "task_type": str(row["task_type"]),
+                "agent": str(row["agent"]),
+                "prompt_hash": str(row["prompt_hash"]),
+                "prompt_tokens": int(row["prompt_tokens"]),
+                "completion_tokens": int(row["completion_tokens"]),
+                "status": str(row["status"]),
+                "created_at": str(row["created_at"]),
+            }
+            for row in rows
+        ]
+
+    def list_agent_loop_metrics(self, thread_id: str) -> list[dict[str, Any]]:
+        clean_thread = str(thread_id or "").strip()
+        if not clean_thread:
+            return []
+        with self.store.read_only() as conn:
+            rows = conn.execute(
+                """
+                SELECT thread_id, task_type, agent, metrics_json, created_at
+                FROM agent_loop_metrics
+                WHERE thread_id = ?
+                ORDER BY id ASC
+                """,
+                (clean_thread,),
+            ).fetchall()
+        return [
+            {
+                "thread_id": str(row["thread_id"]),
+                "task_type": str(row["task_type"]),
+                "agent": str(row["agent"]),
+                "metrics": json.loads(str(row["metrics_json"])),
+                "created_at": str(row["created_at"]),
+            }
+            for row in rows
+        ]
+
+    def list_agent_tool_calls(self, thread_id: str) -> list[dict[str, Any]]:
+        clean_thread = str(thread_id or "").strip()
+        if not clean_thread:
+            return []
+        with self.store.read_only() as conn:
+            rows = conn.execute(
+                """
+                SELECT thread_id, round_no, task_type, agent, tool_name, args_json, result_meta_json, created_at
+                FROM agent_tool_calls
+                WHERE thread_id = ?
+                ORDER BY id ASC
+                """,
+                (clean_thread,),
+            ).fetchall()
+        return [
+            {
+                "thread_id": str(row["thread_id"]),
+                "round_no": int(row["round_no"]),
+                "task_type": str(row["task_type"]),
+                "agent": str(row["agent"]),
+                "tool_name": str(row["tool_name"]),
+                "args": json.loads(str(row["args_json"])),
+                "result_meta": json.loads(str(row["result_meta_json"])),
+                "created_at": str(row["created_at"]),
+            }
+            for row in rows
+        ]
+
+    def get_workflow_doc_state(self, project_id: str) -> dict[str, Any] | None:
+        clean_project = str(project_id or "").strip()
+        if not clean_project:
+            return None
+        with self.store.read_only() as conn:
+            row = conn.execute(
+                """
+                SELECT project_id, workflow_mode, workflow_stage, workflow_initialized, round_number,
+                       assistant_message, collected_inputs_json, clarify_questions_json,
+                       pending_docs_json, published_docs_json, created_at, updated_at
+                FROM workflow_doc_states
+                WHERE project_id = ?
+                LIMIT 1
+                """,
+                (clean_project,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            collected_inputs = json.loads(str(row["collected_inputs_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            collected_inputs = {}
+        if not isinstance(collected_inputs, dict):
+            collected_inputs = {}
+        try:
+            clarify_questions = json.loads(str(row["clarify_questions_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            clarify_questions = []
+        if not isinstance(clarify_questions, list):
+            clarify_questions = []
+        try:
+            pending_docs = json.loads(str(row["pending_docs_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pending_docs = {}
+        if not isinstance(pending_docs, dict):
+            pending_docs = {}
+        try:
+            published_docs = json.loads(str(row["published_docs_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            published_docs = {}
+        if not isinstance(published_docs, dict):
+            published_docs = {}
+        return {
+            "project_id": str(row["project_id"]),
+            "workflow_mode": str(row["workflow_mode"]),
+            "workflow_stage": str(row["workflow_stage"]),
+            "workflow_initialized": bool(int(row["workflow_initialized"])),
+            "round_number": int(row["round_number"]),
+            "assistant_message": str(row["assistant_message"]),
+            "collected_inputs": {str(k): str(v or "") for k, v in collected_inputs.items()},
+            "clarify_questions": [str(item) for item in clarify_questions if str(item or "").strip()],
+            "pending_docs": {str(k): str(v or "") for k, v in pending_docs.items()},
+            "published_docs": {str(k): str(v or "") for k, v in published_docs.items()},
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def upsert_workflow_doc_state(
+        self,
+        project_id: str,
+        *,
+        workflow_mode: str,
+        workflow_stage: str,
+        workflow_initialized: bool,
+        round_number: int,
+        assistant_message: str,
+        collected_inputs: dict[str, str],
+        clarify_questions: list[str],
+        pending_docs: dict[str, str],
+        published_docs: dict[str, str],
+    ) -> dict[str, Any]:
+        clean_project = str(project_id or "").strip()
+        if not clean_project:
+            raise ValueError("project_id cannot be empty")
+        now_iso = _dump_time(utc_now())
+        created_at = now_iso
+        with self.store.transaction() as conn:
+            existing = conn.execute(
+                "SELECT created_at FROM workflow_doc_states WHERE project_id = ? LIMIT 1",
+                (clean_project,),
+            ).fetchone()
+            if existing is not None:
+                created_at = str(existing["created_at"])
+                conn.execute(
+                    """
+                    UPDATE workflow_doc_states
+                    SET workflow_mode = ?, workflow_stage = ?, workflow_initialized = ?, round_number = ?,
+                        assistant_message = ?, collected_inputs_json = ?, clarify_questions_json = ?,
+                        pending_docs_json = ?, published_docs_json = ?, updated_at = ?
+                    WHERE project_id = ?
+                    """,
+                    (
+                        str(workflow_mode or "").strip() or "original",
+                        str(workflow_stage or "").strip() or "idle",
+                        1 if workflow_initialized else 0,
+                        max(0, int(round_number)),
+                        str(assistant_message or ""),
+                        json.dumps(collected_inputs or {}, ensure_ascii=False, sort_keys=True),
+                        json.dumps(list(clarify_questions or []), ensure_ascii=False),
+                        json.dumps(pending_docs or {}, ensure_ascii=False, sort_keys=True),
+                        json.dumps(published_docs or {}, ensure_ascii=False, sort_keys=True),
+                        now_iso,
+                        clean_project,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO workflow_doc_states(
+                        project_id, workflow_mode, workflow_stage, workflow_initialized, round_number,
+                        assistant_message, collected_inputs_json, clarify_questions_json,
+                        pending_docs_json, published_docs_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        clean_project,
+                        str(workflow_mode or "").strip() or "original",
+                        str(workflow_stage or "").strip() or "idle",
+                        1 if workflow_initialized else 0,
+                        max(0, int(round_number)),
+                        str(assistant_message or ""),
+                        json.dumps(collected_inputs or {}, ensure_ascii=False, sort_keys=True),
+                        json.dumps(list(clarify_questions or []), ensure_ascii=False),
+                        json.dumps(pending_docs or {}, ensure_ascii=False, sort_keys=True),
+                        json.dumps(published_docs or {}, ensure_ascii=False, sort_keys=True),
+                        now_iso,
+                        now_iso,
+                    ),
+                )
+        state = self.get_workflow_doc_state(clean_project)
+        if state is None:
+            raise RuntimeError("failed to persist workflow doc state")
+        state["created_at"] = created_at
+        return state
+
+    def upsert_chat_thread(self, thread_id: str, *, project_id: str, node_id: str = "") -> str:
+        clean_thread = str(thread_id or "").strip()
+        clean_project = str(project_id or "").strip()
+        clean_node = str(node_id or "").strip()
+        if not clean_thread:
+            raise ValueError("thread_id cannot be empty")
+        if not clean_project:
+            raise ValueError("project_id cannot be empty")
+        now_iso = _dump_time(utc_now())
+        with self.store.transaction() as conn:
+            existing = conn.execute(
+                "SELECT thread_id FROM chat_threads WHERE thread_id = ? LIMIT 1",
+                (clean_thread,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO chat_threads(thread_id, project_id, node_id, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (clean_thread, clean_project, clean_node, now_iso, now_iso),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE chat_threads
+                    SET project_id = ?, node_id = ?, updated_at = ?
+                    WHERE thread_id = ?
+                    """,
+                    (clean_project, clean_node, now_iso, clean_thread),
+                )
+        return clean_thread
+
+    def append_chat_message(self, thread_id: str, *, role: str, content: str) -> None:
+        clean_thread = str(thread_id or "").strip()
+        clean_role = str(role or "").strip() or "user"
+        text = str(content or "").strip()
+        if not clean_thread or not text:
+            return
+        now_iso = _dump_time(utc_now())
+        with self.store.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO chat_messages(thread_id, role, content, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (clean_thread, clean_role, text, now_iso),
+            )
+            conn.execute(
+                "UPDATE chat_threads SET updated_at = ? WHERE thread_id = ?",
+                (now_iso, clean_thread),
+            )
+
+    def list_chat_messages(self, thread_id: str, *, limit: int = 20) -> list[dict[str, str]]:
+        clean_thread = str(thread_id or "").strip()
+        if not clean_thread:
+            return []
+        safe_limit = max(1, min(int(limit), 200))
+        with self.store.read_only() as conn:
+            rows = conn.execute(
+                """
+                SELECT role, content, created_at
+                FROM chat_messages
+                WHERE thread_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (clean_thread, safe_limit),
+            ).fetchall()
+        rows = list(reversed(rows))
+        return [
+            {
+                "role": str(row["role"] or ""),
+                "content": str(row["content"] or ""),
+                "created_at": str(row["created_at"] or ""),
+            }
+            for row in rows
+        ]

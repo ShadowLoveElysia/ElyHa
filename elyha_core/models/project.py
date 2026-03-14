@@ -66,6 +66,10 @@ class ProjectSettings:
     system_prompt_style: str = ""
     system_prompt_forbidden: str = ""
     system_prompt_notes: str = ""
+    constitution_markdown: str = ""
+    clarify_markdown: str = ""
+    specification_markdown: str = ""
+    plan_markdown: str = ""
     global_directives: str = ""
     context_soft_min_chars: int = 3000
     context_soft_max_chars: int = 5000
@@ -77,6 +81,13 @@ class ProjectSettings:
     context_compaction_keep_recent_chunks: int = 4
     context_compaction_group_chunks: int = 4
     context_compaction_chunk_chars: int = 1200
+    agent_tool_loop_enabled: bool = True
+    agent_tool_loop_max_rounds: int = 6
+    agent_tool_loop_max_calls_per_round: int = 10
+    agent_tool_loop_single_read_char_limit: int = 4000
+    agent_tool_loop_total_read_char_limit: int = 20000
+    agent_tool_loop_no_progress_limit: int = 2
+    agent_tool_write_proposal_enabled: bool = False
 
     def __post_init__(self) -> None:
         if self.auto_snapshot_minutes <= 0:
@@ -101,9 +112,27 @@ class ProjectSettings:
             raise ValueError("context_compaction_group_chunks must be positive")
         if self.context_compaction_chunk_chars <= 0:
             raise ValueError("context_compaction_chunk_chars must be positive")
+        if self.agent_tool_loop_max_rounds <= 0:
+            raise ValueError("agent_tool_loop_max_rounds must be positive")
+        if self.agent_tool_loop_max_calls_per_round <= 0:
+            raise ValueError("agent_tool_loop_max_calls_per_round must be positive")
+        if self.agent_tool_loop_single_read_char_limit <= 0:
+            raise ValueError("agent_tool_loop_single_read_char_limit must be positive")
+        if self.agent_tool_loop_total_read_char_limit <= 0:
+            raise ValueError("agent_tool_loop_total_read_char_limit must be positive")
+        if self.agent_tool_loop_no_progress_limit <= 0:
+            raise ValueError("agent_tool_loop_no_progress_limit must be positive")
+        if self.agent_tool_loop_total_read_char_limit < self.agent_tool_loop_single_read_char_limit:
+            raise ValueError(
+                "agent_tool_loop_total_read_char_limit must be >= agent_tool_loop_single_read_char_limit"
+            )
         self.system_prompt_style = _normalize_prompt_text(self.system_prompt_style)
         self.system_prompt_forbidden = _normalize_prompt_text(self.system_prompt_forbidden)
         self.system_prompt_notes = _normalize_prompt_text(self.system_prompt_notes)
+        self.constitution_markdown = _normalize_prompt_text(self.constitution_markdown, limit=12000)
+        self.clarify_markdown = _normalize_prompt_text(self.clarify_markdown, limit=12000)
+        self.specification_markdown = _normalize_prompt_text(self.specification_markdown, limit=12000)
+        self.plan_markdown = _normalize_prompt_text(self.plan_markdown, limit=12000)
         self.global_directives = _normalize_prompt_text(self.global_directives, limit=12000)
 
 
@@ -142,6 +171,10 @@ def project_settings_from_payload(raw: Any) -> ProjectSettings:
         system_prompt_style=system_prompt_style,
         system_prompt_forbidden=system_prompt_forbidden,
         system_prompt_notes=system_prompt_notes,
+        constitution_markdown=legacy_constitution,
+        clarify_markdown=legacy_clarify,
+        specification_markdown=legacy_specification,
+        plan_markdown=legacy_plan,
         global_directives=global_directives,
         context_soft_min_chars=_coerce_positive_int(payload.get("context_soft_min_chars"), 3000),
         context_soft_max_chars=_coerce_positive_int(payload.get("context_soft_max_chars"), 5000),
@@ -162,6 +195,28 @@ def project_settings_from_payload(raw: Any) -> ProjectSettings:
         ),
         context_compaction_chunk_chars=_coerce_positive_int(
             payload.get("context_compaction_chunk_chars"), 1200
+        ),
+        agent_tool_loop_enabled=_coerce_bool(payload.get("agent_tool_loop_enabled"), True),
+        agent_tool_loop_max_rounds=_coerce_positive_int(payload.get("agent_tool_loop_max_rounds"), 6),
+        agent_tool_loop_max_calls_per_round=_coerce_positive_int(
+            payload.get("agent_tool_loop_max_calls_per_round"),
+            10,
+        ),
+        agent_tool_loop_single_read_char_limit=_coerce_positive_int(
+            payload.get("agent_tool_loop_single_read_char_limit"),
+            4000,
+        ),
+        agent_tool_loop_total_read_char_limit=_coerce_positive_int(
+            payload.get("agent_tool_loop_total_read_char_limit"),
+            20000,
+        ),
+        agent_tool_loop_no_progress_limit=_coerce_positive_int(
+            payload.get("agent_tool_loop_no_progress_limit"),
+            2,
+        ),
+        agent_tool_write_proposal_enabled=_coerce_bool(
+            payload.get("agent_tool_write_proposal_enabled"),
+            False,
         ),
     )
 

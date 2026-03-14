@@ -1,7 +1,8 @@
-import React, {useEffect, useRef, useState} from 'react';
-import {Send, Bot, User, X, Sparkles, MoreHorizontal, PlusCircle, ShieldCheck} from 'lucide-react';
+import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
+import {Send, Bot, User, X, Sparkles, PlusCircle, ShieldCheck, Trash2} from 'lucide-react';
 import {cn} from '../utils';
 import {
+  ApiTimeoutError,
   getAgentSession,
   listAgentSettingProposals,
   reviewAgentSettingProposalsBatch,
@@ -20,18 +21,88 @@ interface ChatMessage {
   suggestions?: AiSuggestedOption[];
 }
 
+interface GuideDocStatusItem {
+  key: string;
+  title: string;
+  filled: boolean;
+}
+
 interface AIChatProps {
   isOpen: boolean;
   onClose: () => void;
   projectId?: string;
   selectedNodeId?: string;
+  resetVersion?: number;
+  fullScreen?: boolean;
+  guideMode?: boolean;
+  guideDocStatus?: GuideDocStatusItem[];
+  onGuideDocReply?: (reply: string) => Promise<void>;
   onCreateSuggestionNode?: (option: AiSuggestedOption) => Promise<void>;
   onRefreshProject?: () => Promise<void>;
   onStatus?: (text: string, isError?: boolean) => void;
   t: (key: string, vars?: TranslationVars) => string;
 }
 
-function errorToText(error: unknown, fallback = 'Unknown error'): string {
+interface ChatWindowRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+interface DragState {
+  startX: number;
+  startY: number;
+  originX: number;
+  originY: number;
+}
+
+interface ResizeState {
+  startX: number;
+  startY: number;
+  originWidth: number;
+  originHeight: number;
+}
+
+const CHAT_MIN_WIDTH = 360;
+const CHAT_MIN_HEIGHT = 420;
+const CHAT_MARGIN = 12;
+const CHAT_MIN_TOP = 56;
+
+function clampNumber(value: number, min: number, max: number): number {
+  if (max <= min) {
+    return min;
+  }
+  return Math.min(max, Math.max(min, value));
+}
+
+function readViewportSize(): {width: number; height: number} {
+  if (typeof window === 'undefined') {
+    return {width: 1400, height: 900};
+  }
+  return {width: window.innerWidth, height: window.innerHeight};
+}
+
+function getDefaultChatRect(): ChatWindowRect {
+  const viewport = readViewportSize();
+  const width = Math.round(Math.min(560, Math.max(420, viewport.width * 0.34)));
+  const height = Math.round(Math.min(820, Math.max(520, viewport.height * 0.78)));
+  return {
+    x: Math.max(CHAT_MARGIN, viewport.width - width - 20),
+    y: Math.max(CHAT_MIN_TOP, Math.round(viewport.height * 0.08)),
+    width,
+    height,
+  };
+}
+
+function errorToText(
+  error: unknown,
+  t: (key: string, vars?: TranslationVars) => string,
+  fallback: string,
+): string {
+  if (error instanceof ApiTimeoutError) {
+    return t('web.error.request_timeout', {seconds: error.timeoutSeconds});
+  }
   if (error instanceof Error) {
     return error.message;
   }
@@ -54,15 +125,21 @@ export function AIChat({
   onClose,
   projectId = '',
   selectedNodeId = '',
+  resetVersion,
+  fullScreen = false,
+  guideMode = false,
+  guideDocStatus = [],
+  onGuideDocReply,
   onCreateSuggestionNode,
   onRefreshProject,
   onStatus,
   t,
 }: AIChatProps) {
-  const bootMessage = t('web.chat.boot_message');
+  const bootMessage = guideMode ? t('web.chat.guide_boot_message') : t('web.chat.boot_message');
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
+  const [chatThreadId, setChatThreadId] = useState('');
   const [allowNodeWrite, setAllowNodeWrite] = useState(false);
   const [agentThreadId, setAgentThreadId] = useState('');
   const [agentSession, setAgentSession] = useState<AgentSessionPayload | null>(null);
@@ -73,7 +150,146 @@ export function AIChat({
   const [proposalQueue, setProposalQueue] = useState<Array<Record<string, unknown>>>([]);
   const [selectedProposalIds, setSelectedProposalIds] = useState<string[]>([]);
   const [deferReviewEnabled, setDeferReviewEnabled] = useState(true);
+  const [windowRect, setWindowRect] = useState<ChatWindowRect>(() => getDefaultChatRect());
+
+  const dragStateRef = useRef<DragState | null>(null);
+  const resizeStateRef = useRef<ResizeState | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  const clampWindowRect = useCallback((next: ChatWindowRect): ChatWindowRect => {
+    const viewport = readViewportSize();
+    const maxWidth = Math.max(240, viewport.width - CHAT_MARGIN * 2);
+    const maxHeight = Math.max(260, viewport.height - CHAT_MARGIN * 2);
+    const minWidth = Math.min(CHAT_MIN_WIDTH, maxWidth);
+    const minHeight = Math.min(CHAT_MIN_HEIGHT, maxHeight);
+
+    const width = clampNumber(next.width, minWidth, maxWidth);
+    const height = clampNumber(next.height, minHeight, maxHeight);
+    const maxX = Math.max(CHAT_MARGIN, viewport.width - width - CHAT_MARGIN);
+    const maxY = Math.max(CHAT_MIN_TOP, viewport.height - height - CHAT_MARGIN);
+
+    return {
+      x: clampNumber(next.x, CHAT_MARGIN, maxX),
+      y: clampNumber(next.y, CHAT_MIN_TOP, maxY),
+      width,
+      height,
+    };
+  }, []);
+
+  const contentScale = useMemo(() => {
+    if (fullScreen) {
+      return 1;
+    }
+    const widthScale = windowRect.width / 460;
+    const heightScale = windowRect.height / 760;
+    return clampNumber(Math.min(widthScale, heightScale), 0.82, 1.08);
+  }, [fullScreen, windowRect.height, windowRect.width]);
+
+  const handlePointerMove = useCallback(
+    (event: PointerEvent) => {
+      if (dragStateRef.current) {
+        const drag = dragStateRef.current;
+        const nextX = drag.originX + (event.clientX - drag.startX);
+        const nextY = drag.originY + (event.clientY - drag.startY);
+        setWindowRect((prev) => clampWindowRect({...prev, x: nextX, y: nextY}));
+        return;
+      }
+      if (resizeStateRef.current) {
+        const resize = resizeStateRef.current;
+        const nextWidth = resize.originWidth + (event.clientX - resize.startX);
+        const nextHeight = resize.originHeight + (event.clientY - resize.startY);
+        setWindowRect((prev) => clampWindowRect({...prev, width: nextWidth, height: nextHeight}));
+      }
+    },
+    [clampWindowRect],
+  );
+
+  const stopPointerInteraction = useCallback(() => {
+    dragStateRef.current = null;
+    resizeStateRef.current = null;
+    window.removeEventListener('pointermove', handlePointerMove);
+    window.removeEventListener('pointerup', stopPointerInteraction);
+  }, [handlePointerMove]);
+
+  const beginPointerInteraction = useCallback(() => {
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', stopPointerInteraction);
+  }, [handlePointerMove, stopPointerInteraction]);
+
+  const startDrag = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      if (fullScreen) {
+        return;
+      }
+      if (event.pointerType === 'mouse' && event.button !== 0) {
+        return;
+      }
+      const target = event.target as HTMLElement;
+      if (target.closest('[data-chat-no-drag="true"]')) {
+        return;
+      }
+      event.preventDefault();
+      stopPointerInteraction();
+      dragStateRef.current = {
+        startX: event.clientX,
+        startY: event.clientY,
+        originX: windowRect.x,
+        originY: windowRect.y,
+      };
+      beginPointerInteraction();
+    },
+    [beginPointerInteraction, fullScreen, stopPointerInteraction, windowRect.x, windowRect.y],
+  );
+
+  const startResize = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      if (fullScreen) {
+        return;
+      }
+      if (event.pointerType === 'mouse' && event.button !== 0) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      stopPointerInteraction();
+      resizeStateRef.current = {
+        startX: event.clientX,
+        startY: event.clientY,
+        originWidth: windowRect.width,
+        originHeight: windowRect.height,
+      };
+      beginPointerInteraction();
+    },
+    [beginPointerInteraction, fullScreen, stopPointerInteraction, windowRect.height, windowRect.width],
+  );
+
+  const lastResetVersionRef = useRef<number | undefined>(resetVersion);
+  const guideKickoffRef = useRef('');
+
+  const clearCurrentSession = useCallback(
+    (notify = true) => {
+      setMessages([{id: 'boot', role: 'assistant', content: bootMessage}]);
+      setInput('');
+      setBusy(false);
+      setChatThreadId('');
+      setAllowNodeWrite(false);
+      setAgentThreadId('');
+      setAgentSession(null);
+      setSessionBusy(false);
+      setCorrectionInput('');
+      setPersistDirective('');
+      setProposalBusy(false);
+      setProposalQueue([]);
+      setSelectedProposalIds([]);
+      if (guideMode) {
+        guideKickoffRef.current = '';
+      }
+      if (notify) {
+        onStatus?.(t('web.chat.session_cleared'), false);
+      }
+    },
+    [bootMessage, guideMode, onStatus, t],
+  );
 
   useEffect(() => {
     setMessages((prev) => {
@@ -100,6 +316,95 @@ export function AIChat({
       void loadProposalQueue();
     }
   }, [agentSession?.status]);
+
+  useEffect(() => {
+    return () => {
+      stopPointerInteraction();
+    };
+  }, [stopPointerInteraction]);
+
+  useEffect(() => {
+    if (fullScreen) {
+      return;
+    }
+    const onResize = () => {
+      setWindowRect((prev) => clampWindowRect(prev));
+    };
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, [clampWindowRect, fullScreen]);
+
+  useEffect(() => {
+    if (fullScreen) {
+      return;
+    }
+    if (!isOpen) {
+      return;
+    }
+    setWindowRect((prev) => clampWindowRect(prev));
+  }, [clampWindowRect, fullScreen, isOpen]);
+
+  useEffect(() => {
+    if (resetVersion === undefined) {
+      return;
+    }
+    if (lastResetVersionRef.current === resetVersion) {
+      return;
+    }
+    lastResetVersionRef.current = resetVersion;
+    clearCurrentSession(true);
+  }, [clearCurrentSession, resetVersion]);
+
+  useEffect(() => {
+    if (!guideMode || !isOpen || !projectId) {
+      return;
+    }
+    if (messages.length > 1) {
+      return;
+    }
+    if (guideKickoffRef.current === projectId) {
+      return;
+    }
+    guideKickoffRef.current = projectId;
+    setBusy(true);
+    void (async () => {
+      try {
+        const response = await sendAiChat({
+          project_id: projectId,
+          message: t('web.chat.guide_kickoff_request'),
+          thread_id: chatThreadId.trim() || undefined,
+          token_budget: 1400,
+        });
+        if (response.thread_id) {
+          setChatThreadId(response.thread_id);
+        }
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `${Date.now()}-guide-assistant`,
+            role: 'assistant',
+            content: response.reply || t('web.chat.empty_reply'),
+          },
+        ]);
+        if (onGuideDocReply) {
+          await onGuideDocReply(response.reply || '');
+        }
+      } catch (error) {
+        const text = errorToText(error, t, t('web.error.unknown'));
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `${Date.now()}-guide-error`,
+            role: 'system',
+            content: t('web.chat.request_failed', {message: text}),
+          },
+        ]);
+        onStatus?.(text, true);
+      } finally {
+        setBusy(false);
+      }
+    })();
+  }, [chatThreadId, guideMode, isOpen, messages.length, onGuideDocReply, onStatus, projectId, t]);
 
   const appendMessage = (message: ChatMessage) => {
     setMessages((prev) => [...prev, message]);
@@ -129,8 +434,12 @@ export function AIChat({
         project_id: projectId,
         message,
         node_id: allowNodeWrite && selectedNodeId ? selectedNodeId : undefined,
+        thread_id: chatThreadId.trim() || undefined,
         token_budget: 1800,
       });
+      if (response.thread_id) {
+        setChatThreadId(response.thread_id);
+      }
 
       appendMessage({
         id: `${Date.now()}-assistant`,
@@ -139,6 +448,10 @@ export function AIChat({
         suggestions: response.suggested_options || [],
       });
 
+      if (onGuideDocReply) {
+        await onGuideDocReply(response.reply || '');
+      }
+
       if (response.updated_node_id) {
         onStatus?.(t('web.toast.ai_node_updated', {node: response.updated_node_id}), false);
         if (onRefreshProject) {
@@ -146,7 +459,7 @@ export function AIChat({
         }
       }
     } catch (error) {
-      const text = errorToText(error, t('web.error.unknown'));
+      const text = errorToText(error, t, t('web.error.unknown'));
       appendMessage({
         id: `${Date.now()}-error`,
         role: 'system',
@@ -166,7 +479,7 @@ export function AIChat({
       await onCreateSuggestionNode(option);
       onStatus?.(t('web.chat.suggestion_adopted', {title: option.title || t('web.node.untitled')}), false);
     } catch (error) {
-      onStatus?.(t('web.chat.suggestion_create_failed', {message: errorToText(error, t('web.error.unknown'))}), true);
+      onStatus?.(t('web.chat.suggestion_create_failed', {message: errorToText(error, t, t('web.error.unknown'))}), true);
     }
   };
 
@@ -184,7 +497,7 @@ export function AIChat({
       return;
     }
     if (!selectedNodeId) {
-      onStatus?.('selected node required', true);
+      onStatus?.(t('web.chat.agent.selected_node_required'), true);
       return;
     }
     setSessionBusy(true);
@@ -197,12 +510,12 @@ export function AIChat({
         thread_id: agentThreadId.trim() || undefined,
       });
       applySessionPayload(payload);
-      onStatus?.(`agent session started: ${payload.thread_id}`, false);
+      onStatus?.(t('web.chat.agent.session_started', {thread_id: payload.thread_id}), false);
       if (onRefreshProject) {
         await onRefreshProject();
       }
     } catch (error) {
-      onStatus?.(errorToText(error, t('web.error.unknown')), true);
+      onStatus?.(errorToText(error, t, t('web.error.unknown')), true);
     } finally {
       setSessionBusy(false);
     }
@@ -211,16 +524,16 @@ export function AIChat({
   const refreshSession = async () => {
     const threadId = agentThreadId.trim();
     if (!threadId) {
-      onStatus?.('agent thread_id required', true);
+      onStatus?.(t('web.chat.agent.thread_required'), true);
       return;
     }
     setSessionBusy(true);
     try {
       const payload = await getAgentSession(threadId);
       applySessionPayload(payload);
-      onStatus?.(`session status: ${payload.session.status}`, false);
+      onStatus?.(t('web.chat.agent.session_status', {status: payload.session.status}), false);
     } catch (error) {
-      onStatus?.(errorToText(error, t('web.error.unknown')), true);
+      onStatus?.(errorToText(error, t, t('web.error.unknown')), true);
     } finally {
       setSessionBusy(false);
     }
@@ -229,7 +542,7 @@ export function AIChat({
   const submitSessionDecision = async (action: string, payload: Record<string, unknown> = {}) => {
     const threadId = agentThreadId.trim();
     if (!threadId) {
-      onStatus?.('agent thread_id required', true);
+      onStatus?.(t('web.chat.agent.thread_required'), true);
       return;
     }
     setSessionBusy(true);
@@ -242,7 +555,7 @@ export function AIChat({
         payload,
       });
       applySessionPayload(response);
-      onStatus?.(`decision applied: ${action} -> ${response.session.status}`, false);
+      onStatus?.(t('web.chat.agent.decision_applied', {action, status: response.session.status}), false);
       if (response.session.status === 'AWAITING_SETTING_PROPOSAL_CONFIRM') {
         void loadProposalQueue();
       }
@@ -252,7 +565,7 @@ export function AIChat({
         }
       }
     } catch (error) {
-      onStatus?.(errorToText(error, t('web.error.unknown')), true);
+      onStatus?.(errorToText(error, t, t('web.error.unknown')), true);
     } finally {
       setSessionBusy(false);
     }
@@ -261,18 +574,18 @@ export function AIChat({
   const applyDiffReview = async (rejectAll: boolean) => {
     const threadId = agentThreadId.trim();
     if (!threadId) {
-      onStatus?.('agent thread_id required', true);
+      onStatus?.(t('web.chat.agent.thread_required'), true);
       return;
     }
     if (!agentSession) {
-      onStatus?.('session not loaded', true);
+      onStatus?.(t('web.chat.agent.session_not_loaded'), true);
       return;
     }
     const pendingMeta = asRecord(agentSession.pending_meta);
     const diffPatch = asRecord(pendingMeta.diff_patch);
     const diffId = String(diffPatch.diff_id || '').trim();
     if (!diffId) {
-      onStatus?.('diff_patch missing', true);
+      onStatus?.(t('web.chat.agent.diff_patch_missing'), true);
       return;
     }
     const hunks = Array.isArray(diffPatch.hunks)
@@ -295,11 +608,11 @@ export function AIChat({
       });
       applySessionPayload(payload);
       onStatus?.(
-        rejectAll ? 'diff review done: rejected all hunks' : 'diff review done: applied selected hunks',
+        rejectAll ? t('web.chat.agent.diff_review_rejected_all') : t('web.chat.agent.diff_review_applied'),
         false,
       );
     } catch (error) {
-      onStatus?.(errorToText(error, t('web.error.unknown')), true);
+      onStatus?.(errorToText(error, t, t('web.error.unknown')), true);
     } finally {
       setSessionBusy(false);
     }
@@ -308,7 +621,7 @@ export function AIChat({
   const loadProposalQueue = async () => {
     const threadId = (agentThreadId || agentSession?.thread_id || '').trim();
     if (!threadId) {
-      onStatus?.('agent thread_id required', true);
+      onStatus?.(t('web.chat.agent.thread_required'), true);
       return;
     }
     setProposalBusy(true);
@@ -319,9 +632,9 @@ export function AIChat({
         .map((item) => String(item.id || '').trim())
         .filter(Boolean);
       setSelectedProposalIds(ids);
-      onStatus?.(`pending proposals: ${payload.count}`, false);
+      onStatus?.(t('web.chat.agent.pending_proposals', {count: payload.count}), false);
     } catch (error) {
-      onStatus?.(errorToText(error, t('web.error.unknown')), true);
+      onStatus?.(errorToText(error, t, t('web.error.unknown')), true);
     } finally {
       setProposalBusy(false);
     }
@@ -330,11 +643,11 @@ export function AIChat({
   const reviewProposalBatch = async (action: 'approve' | 'reject') => {
     const threadId = (agentThreadId || agentSession?.thread_id || '').trim();
     if (!threadId) {
-      onStatus?.('agent thread_id required', true);
+      onStatus?.(t('web.chat.agent.thread_required'), true);
       return;
     }
     if (selectedProposalIds.length === 0) {
-      onStatus?.('no proposal selected', true);
+      onStatus?.(t('web.chat.agent.no_proposal_selected'), true);
       return;
     }
     setProposalBusy(true);
@@ -348,9 +661,9 @@ export function AIChat({
       });
       applySessionPayload(payload);
       await loadProposalQueue();
-      onStatus?.(`batch ${action} done: ${selectedProposalIds.length}`, false);
+      onStatus?.(t('web.chat.agent.batch_review_done', {action, count: selectedProposalIds.length}), false);
     } catch (error) {
-      onStatus?.(errorToText(error, t('web.error.unknown')), true);
+      onStatus?.(errorToText(error, t, t('web.error.unknown')), true);
     } finally {
       setProposalBusy(false);
     }
@@ -359,7 +672,7 @@ export function AIChat({
   const deferCurrentProposal = async () => {
     const threadId = (agentThreadId || agentSession?.thread_id || '').trim();
     if (!threadId) {
-      onStatus?.('agent thread_id required', true);
+      onStatus?.(t('web.chat.agent.thread_required'), true);
       return;
     }
     await submitSessionDecision('defer_setting_update');
@@ -393,51 +706,117 @@ export function AIChat({
   return (
     <div
       className={cn(
-        'fixed inset-y-0 right-0 w-96 bg-white border-l border-slate-200 shadow-2xl flex flex-col transform transition-transform duration-300 ease-in-out z-50',
-        isOpen ? 'translate-x-0' : 'translate-x-full',
+        fullScreen
+          ? 'absolute inset-0 z-40 border-0 rounded-none bg-white shadow-none overflow-hidden transition-[opacity,transform] duration-200 ease-out'
+          : 'fixed z-50 rounded-xl border border-slate-200 bg-white shadow-2xl overflow-hidden transition-[opacity,transform] duration-200 ease-out',
+        isOpen ? 'opacity-100 translate-y-0 pointer-events-auto' : 'opacity-0 translate-y-2 pointer-events-none',
       )}
+      style={
+        fullScreen
+          ? undefined
+          : {
+              left: windowRect.x,
+              top: windowRect.y,
+              width: windowRect.width,
+              height: windowRect.height,
+            }
+      }
     >
-      <div className="h-14 border-b border-slate-200 flex items-center justify-between px-4 shrink-0 bg-white/95 backdrop-blur">
+      <div
+        className="h-full w-full flex flex-col"
+        style={
+          fullScreen
+            ? undefined
+            : {
+                transform: `scale(${contentScale})`,
+                transformOrigin: 'top left',
+                width: `${100 / contentScale}%`,
+                height: `${100 / contentScale}%`,
+              }
+        }
+      >
+      <div
+        onPointerDown={startDrag}
+        className={cn(
+          'h-14 border-b border-slate-200 flex items-center justify-between px-4 shrink-0 bg-white/95 backdrop-blur select-none',
+          fullScreen ? 'cursor-default' : 'cursor-move',
+        )}
+      >
         <div className="flex items-center gap-2 text-slate-800">
           <Sparkles size={18} className="text-pink-500" />
-          <span className="font-bold">{t('web.chat.drawer_title')}</span>
+          <span className="font-bold">{guideMode ? t('web.chat.guide_title') : t('web.chat.drawer_title')}</span>
         </div>
         <div className="flex items-center gap-2">
-          <button className="p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-md transition-colors">
-            <MoreHorizontal size={18} />
-          </button>
           <button
-            onClick={onClose}
+            data-chat-no-drag="true"
+            onClick={() => clearCurrentSession(true)}
+            title={t('web.chat.clear_session')}
             className="p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-md transition-colors"
           >
-            <X size={18} />
+            <Trash2 size={18} />
           </button>
+          {!guideMode ? (
+            <button
+              data-chat-no-drag="true"
+              onClick={onClose}
+              className="p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-md transition-colors"
+            >
+              <X size={18} />
+            </button>
+          ) : null}
         </div>
       </div>
+
+      {guideMode ? (
+        <div className="px-4 py-3 border-b border-rose-100 bg-rose-50/70 text-xs text-slate-700 space-y-2">
+          <div className="font-semibold text-rose-700">{t('web.chat.guide_panel_hint')}</div>
+          <div className="flex flex-wrap items-center gap-2">
+            {guideDocStatus.map((item) => (
+              <span
+                key={item.key}
+                className={cn(
+                  'inline-flex items-center rounded-full px-2 py-0.5 text-[11px] border',
+                  item.filled
+                    ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                    : 'border-amber-200 bg-amber-50 text-amber-700',
+                )}
+              >
+                {item.title} · {item.filled ? t('web.chat.guide_status_done') : t('web.chat.guide_status_pending')}
+              </span>
+            ))}
+          </div>
+          <div className="text-[11px] text-amber-700">{t('web.chat.guide_modify_notice')}</div>
+        </div>
+      ) : null}
 
       <div className="px-4 py-2 border-b border-slate-100 bg-slate-50 text-xs text-slate-600">
         <div className="flex items-center justify-between gap-3">
           <span className="truncate">{t('web.chat.project_label', {project: projectId || t('web.top.project_unselected')})}</span>
-          <label className="flex items-center gap-1.5 cursor-pointer select-none">
-            <input
-              type="checkbox"
-              checked={allowNodeWrite}
-              onChange={(event) => setAllowNodeWrite(event.target.checked)}
-            />
-            <span className="inline-flex items-center gap-1">
-              <ShieldCheck size={12} />
-              {t('web.chat.allow_node_write')}
-            </span>
-          </label>
+          {!guideMode ? (
+            <label className="flex items-center gap-1.5 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={allowNodeWrite}
+                onChange={(event) => setAllowNodeWrite(event.target.checked)}
+              />
+              <span className="inline-flex items-center gap-1">
+                <ShieldCheck size={12} />
+                {t('web.chat.allow_node_write')}
+              </span>
+            </label>
+          ) : (
+            <span className="text-[11px] text-slate-500">{t('web.chat.guide_step_hint')}</span>
+          )}
         </div>
       </div>
 
+      {!guideMode ? (
       <div className="px-4 py-2 border-b border-slate-100 bg-slate-50/70 text-[11px] text-slate-600 space-y-2">
         <div className="flex items-center gap-2">
           <input
             value={agentThreadId}
             onChange={(event) => setAgentThreadId(event.target.value)}
-            placeholder="agent thread_id"
+            placeholder={t('web.chat.agent.placeholder_thread_id')}
             className="flex-1 h-8 rounded-md border border-slate-200 bg-white px-2 text-xs"
           />
           <button
@@ -445,7 +824,7 @@ export function AIChat({
             disabled={sessionBusy || !agentThreadId.trim()}
             className="h-8 px-2 rounded-md border border-slate-200 bg-white hover:bg-slate-100 disabled:opacity-60"
           >
-            Refresh
+            {t('web.chat.agent.refresh')}
           </button>
         </div>
 
@@ -455,14 +834,14 @@ export function AIChat({
             disabled={sessionBusy || !projectId || !selectedNodeId}
             className="h-8 px-3 rounded-md bg-indigo-50 text-indigo-700 border border-indigo-200 hover:bg-indigo-100 disabled:opacity-60"
           >
-            Start Session
+            {t('web.chat.agent.start_session')}
           </button>
           <button
             onClick={() => void loadProposalQueue()}
             disabled={proposalBusy || !agentThreadId.trim()}
             className="h-8 px-3 rounded-md border border-slate-200 bg-white hover:bg-slate-100 disabled:opacity-60"
           >
-            Load Proposals
+            {t('web.chat.agent.load_proposals')}
           </button>
         </div>
 
@@ -470,30 +849,38 @@ export function AIChat({
           {agentSession ? (
             <div className="space-y-1">
               <div>
-                status=<span className="font-semibold text-slate-800">{agentSession.status}</span>, version=
-                {agentSession.state_version}
+                {t('web.chat.agent.session_status_line', {
+                  status: agentSession.status,
+                  version: agentSession.state_version,
+                })}
               </div>
               <div>
-                pending_content_chars={String(agentSession.pending_content || '').length}, pending_state_update=
-                {pendingStateUpdateCount}
+                {t('web.chat.agent.session_pending_line', {
+                  chars: String(agentSession.pending_content || '').length,
+                  count: pendingStateUpdateCount,
+                })}
               </div>
-              <div>latest_setting_proposal_id={agentSession.latest_setting_proposal_id || '-'}</div>
+              <div>
+                {t('web.chat.agent.session_latest_proposal', {
+                  id: agentSession.latest_setting_proposal_id || '-',
+                })}
+              </div>
             </div>
           ) : (
-            <div className="text-slate-400">Session not loaded.</div>
+            <div className="text-slate-400">{t('web.chat.agent.session_not_loaded')}</div>
           )}
         </div>
 
         <input
           value={correctionInput}
           onChange={(event) => setCorrectionInput(event.target.value)}
-          placeholder="correction / unsatisfied note"
+          placeholder={t('web.chat.agent.placeholder_correction')}
           className="w-full h-8 rounded-md border border-slate-200 bg-white px-2 text-xs"
         />
         <input
           value={persistDirective}
           onChange={(event) => setPersistDirective(event.target.value)}
-          placeholder="directive for confirm_yes_persist_rule"
+          placeholder={t('web.chat.agent.placeholder_persist')}
           className="w-full h-8 rounded-md border border-slate-200 bg-white px-2 text-xs"
         />
 
@@ -504,7 +891,7 @@ export function AIChat({
               disabled={sessionBusy || !agentThreadId.trim()}
               className="h-8 px-3 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100 disabled:opacity-60"
             >
-              Confirm Yes
+              {t('web.chat.agent.confirm_yes')}
             </button>
             <button
               onClick={() =>
@@ -513,25 +900,25 @@ export function AIChat({
               disabled={sessionBusy || !agentThreadId.trim() || !persistDirective.trim()}
               className="h-8 px-3 rounded-md bg-cyan-50 text-cyan-700 border border-cyan-200 hover:bg-cyan-100 disabled:opacity-60"
             >
-              Confirm + Persist
+              {t('web.chat.agent.confirm_persist')}
             </button>
             <button
               onClick={() =>
                 void submitSessionDecision('correct', {
-                  correction: correctionInput.trim() || '请继续修订并提高一致性。',
+                  correction: correctionInput.trim() || t('web.chat.agent.default_correction_confirm'),
                 })
               }
               disabled={sessionBusy || !agentThreadId.trim()}
               className="h-8 px-3 rounded-md bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100 disabled:opacity-60"
             >
-              Correct
+              {t('web.chat.agent.correct')}
             </button>
             <button
               onClick={() => void submitSessionDecision('stop')}
               disabled={sessionBusy || !agentThreadId.trim()}
               className="h-8 px-3 rounded-md bg-rose-50 text-rose-700 border border-rose-200 hover:bg-rose-100 disabled:opacity-60"
             >
-              Stop
+              {t('web.chat.agent.stop')}
             </button>
           </div>
         )}
@@ -543,18 +930,18 @@ export function AIChat({
               disabled={sessionBusy || !agentThreadId.trim()}
               className="h-8 px-3 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100 disabled:opacity-60"
             >
-              Chapter Satisfied
+              {t('web.chat.agent.chapter_satisfied')}
             </button>
             <button
               onClick={() =>
                 void submitSessionDecision('unsatisfied', {
-                  correction: correctionInput.trim() || '继续修订章节完成度。',
+                  correction: correctionInput.trim() || t('web.chat.agent.default_correction_chapter'),
                 })
               }
               disabled={sessionBusy || !agentThreadId.trim()}
               className="h-8 px-3 rounded-md bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100 disabled:opacity-60"
             >
-              Chapter Unsatisfied
+              {t('web.chat.agent.chapter_unsatisfied')}
             </button>
           </div>
         )}
@@ -570,7 +957,7 @@ export function AIChat({
               disabled={sessionBusy || !agentThreadId.trim()}
               className="h-8 px-3 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100 disabled:opacity-60"
             >
-              Approve Proposal
+              {t('web.chat.agent.approve_proposal')}
             </button>
             <button
               onClick={() =>
@@ -581,34 +968,34 @@ export function AIChat({
               disabled={sessionBusy || !agentThreadId.trim()}
               className="h-8 px-3 rounded-md bg-rose-50 text-rose-700 border border-rose-200 hover:bg-rose-100 disabled:opacity-60"
             >
-              Reject Proposal
+              {t('web.chat.agent.reject_proposal')}
             </button>
             <button
               onClick={() => void deferCurrentProposal()}
               disabled={sessionBusy || !agentThreadId.trim() || !deferReviewEnabled}
               className="h-8 px-3 rounded-md border border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100 disabled:opacity-60"
             >
-              Defer Current
+              {t('web.chat.agent.defer_current')}
             </button>
           </div>
         )}
 
         {sessionStatus === 'AWAITING_CORRECTION_CONFIRM' && sessionDiffHunks.length > 0 && (
           <div className="flex flex-wrap items-center gap-2">
-            <span className="text-slate-500">Diff hunks: {sessionDiffHunks.length}</span>
+            <span className="text-slate-500">{t('web.chat.agent.diff_hunks', {count: sessionDiffHunks.length})}</span>
             <button
               onClick={() => void applyDiffReview(false)}
               disabled={sessionBusy || !agentThreadId.trim()}
               className="h-8 px-3 rounded-md bg-violet-50 text-violet-700 border border-violet-200 hover:bg-violet-100 disabled:opacity-60"
             >
-              Apply Diff Hunks
+              {t('web.chat.agent.apply_diff_hunks')}
             </button>
             <button
               onClick={() => void applyDiffReview(true)}
               disabled={sessionBusy || !agentThreadId.trim()}
               className="h-8 px-3 rounded-md bg-slate-100 text-slate-700 border border-slate-200 hover:bg-slate-200 disabled:opacity-60"
             >
-              Reject All Hunks
+              {t('web.chat.agent.reject_all_hunks')}
             </button>
           </div>
         )}
@@ -620,7 +1007,7 @@ export function AIChat({
               checked={deferReviewEnabled}
               onChange={(event) => setDeferReviewEnabled(event.target.checked)}
             />
-            <span>Enable defer-review shortcut</span>
+            <span>{t('web.chat.agent.defer_shortcut')}</span>
           </label>
         </div>
 
@@ -639,14 +1026,14 @@ export function AIChat({
                     onChange={(event) => toggleProposalSelected(proposalId, event.target.checked)}
                   />
                   <span className="truncate">
-                    {proposalId} [{proposalType || 'unknown'} / {proposalStatus || 'pending'}]
+                    {proposalId} [{proposalType || t('web.chat.agent.proposal_unknown')} / {proposalStatus || t('web.chat.agent.proposal_pending')}]
                   </span>
                 </label>
               );
             })}
           </div>
         ) : (
-          <div className="text-slate-400">No pending setting proposals.</div>
+          <div className="text-slate-400">{t('web.chat.agent.no_pending_proposals')}</div>
         )}
 
         <div className="flex items-center gap-2">
@@ -655,17 +1042,18 @@ export function AIChat({
             disabled={proposalBusy || selectedProposalIds.length === 0}
             className="h-8 px-3 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100 disabled:opacity-60"
           >
-            Approve Selected
+            {t('web.chat.agent.approve_selected')}
           </button>
           <button
             onClick={() => void reviewProposalBatch('reject')}
             disabled={proposalBusy || selectedProposalIds.length === 0}
             className="h-8 px-3 rounded-md bg-rose-50 text-rose-700 border border-rose-200 hover:bg-rose-100 disabled:opacity-60"
           >
-            Reject Selected
+            {t('web.chat.agent.reject_selected')}
           </button>
         </div>
       </div>
+      ) : null}
 
       <div className="flex-1 overflow-y-auto p-4 space-y-6">
         {messages.map((msg) => (
@@ -752,6 +1140,16 @@ export function AIChat({
           <span>{busy ? t('web.chat.processing') : t('web.chat.endpoint_hint')}</span>
         </div>
       </div>
+      </div>
+      {!fullScreen ? (
+        <div
+          data-chat-no-drag="true"
+          onPointerDown={startResize}
+          className="absolute right-0 bottom-0 z-[60] h-5 w-5 cursor-nwse-resize touch-none"
+        >
+          <div className="absolute inset-0 bg-gradient-to-br from-transparent via-transparent to-slate-300/80" />
+        </div>
+      ) : null}
     </div>
   );
 }

@@ -52,9 +52,13 @@ class SessionOrchestratorService:
         self.ai_service = ai_service
         self.state_service = state_service
         self.setting_proposal_service = setting_proposal_service
+        if hasattr(self.ai_service, "set_setting_proposal_service"):
+            self.ai_service.set_setting_proposal_service(self.setting_proposal_service)
 
     def set_ai_service(self, ai_service: AIService) -> None:
         self.ai_service = ai_service
+        if hasattr(self.ai_service, "set_setting_proposal_service"):
+            self.ai_service.set_setting_proposal_service(self.setting_proposal_service)
 
     def start_session(
         self,
@@ -798,6 +802,7 @@ class SessionOrchestratorService:
                     user_correction=correction_text,
                     base_content=str(base_content or ""),
                     token_budget=max(1, int(running.get("token_budget", 2200))),
+                    tool_thread_id=thread_id,
                 )
             else:
                 draft = self.ai_service.generate_chapter_draft(
@@ -806,15 +811,30 @@ class SessionOrchestratorService:
                     token_budget=max(1, int(running.get("token_budget", 2200))),
                     style_hint=str(running.get("style_hint", "")),
                     workflow_mode=str(running.get("mode", "single_agent")),
+                    tool_thread_id=thread_id,
                 )
+            self._persist_agent_loop_audits(
+                thread_id=thread_id,
+                draft=draft,
+            )
             pending_meta = self._draft_to_meta(draft)
+            pending_meta["agent_loop_rounds_count"] = len(getattr(draft, "agent_loop_rounds", []) or [])
+            pending_meta["agent_tool_calls_count"] = len(getattr(draft, "agent_tool_calls", []) or [])
             pending_meta["chapter_done_evaluation"] = self._build_chapter_done_evaluation(
                 session=running,
                 draft=draft,
                 correction_mode=bool(correction_text.strip()),
             )
             pending_meta["state_update_retry_summary"] = retry_summary
+            tool_setting_proposal_ids = self._extract_tool_setting_proposal_ids(draft)
+            if tool_setting_proposal_ids:
+                pending_meta["tool_setting_proposal_ids"] = tool_setting_proposal_ids
             target_wait_status = wait_status
+            latest_setting_proposal_id: str | None = None
+            if tool_setting_proposal_ids:
+                latest_setting_proposal_id = tool_setting_proposal_ids[-1]
+                if not correction_text.strip():
+                    target_wait_status = self.STATUS_AWAITING_SETTING_PROPOSAL_CONFIRM
             if correction_text.strip():
                 llm_diff_patch = getattr(draft, "diff_patch", None)
                 if isinstance(llm_diff_patch, dict) and llm_diff_patch.get("hunks"):
@@ -850,6 +870,7 @@ class SessionOrchestratorService:
                 pending_meta=pending_meta,
                 pending_clarification={},
                 latest_clarification_id="",
+                latest_setting_proposal_id=latest_setting_proposal_id,
                 last_error="",
             )
             return updated
@@ -862,6 +883,39 @@ class SessionOrchestratorService:
                 last_error=str(exc),
             )
             raise
+
+    def _persist_agent_loop_audits(self, *, thread_id: str, draft: ChapterDraftResult) -> None:
+        rounds = getattr(draft, "agent_loop_rounds", [])
+        calls = getattr(draft, "agent_tool_calls", [])
+        metrics_payload = getattr(draft, "agent_loop_metrics", {})
+        if not isinstance(rounds, list):
+            rounds = []
+        if not isinstance(calls, list):
+            calls = []
+        if not isinstance(metrics_payload, dict):
+            metrics_payload = {}
+        if rounds:
+            self.repository.create_agent_loop_rounds(thread_id, rounds)
+        if calls:
+            self.repository.create_agent_tool_calls(thread_id, calls)
+        if metrics_payload:
+            task_type = "generate_chapter_correction_draft" if bool(getattr(draft, "diff_patch", {})) else "generate_chapter"
+            agent = "single"
+            if rounds:
+                first_round = rounds[0] if isinstance(rounds[0], dict) else {}
+                task_type = str(first_round.get("task_type") or task_type)
+                agent = str(first_round.get("agent") or agent)
+            self.repository.create_agent_loop_metrics(
+                thread_id,
+                [
+                    {
+                        "task_type": task_type,
+                        "agent": agent,
+                        "metrics": metrics_payload,
+                        "created_at": utc_now().isoformat(),
+                    }
+                ],
+            )
 
     def _commit_pending_draft(
         self,
@@ -1763,6 +1817,25 @@ class SessionOrchestratorService:
         except (TypeError, ValueError):
             return fallback
 
+    def _extract_tool_setting_proposal_ids(self, draft: ChapterDraftResult) -> list[str]:
+        calls = getattr(draft, "agent_tool_calls", [])
+        if not isinstance(calls, list):
+            return []
+        proposal_ids: list[str] = []
+        seen: set[str] = set()
+        for item in calls:
+            if not isinstance(item, dict):
+                continue
+            result_meta = item.get("result_meta")
+            if not isinstance(result_meta, dict):
+                continue
+            proposal_id = str(result_meta.get("proposal_id") or "").strip()
+            if not proposal_id or proposal_id in seen:
+                continue
+            seen.add(proposal_id)
+            proposal_ids.append(proposal_id)
+        return proposal_ids
+
     def _draft_to_meta(self, draft: ChapterDraftResult) -> dict[str, Any]:
         return {
             "provider": draft.provider,
@@ -1774,6 +1847,8 @@ class SessionOrchestratorService:
             "task_id": draft.task_id,
             "prompt_version": draft.prompt_version,
             "llm_diff_patch": dict(getattr(draft, "diff_patch", {}) or {}),
+            "agent_loop_metrics": dict(getattr(draft, "agent_loop_metrics", {}) or {}),
+            "tool_evidence_chunk_ids": list(getattr(draft, "tool_evidence_chunk_ids", []) or []),
         }
 
     def _dump_json(self, value: Any) -> str:

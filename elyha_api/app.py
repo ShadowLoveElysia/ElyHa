@@ -36,6 +36,7 @@ from elyha_core.services.setting_proposal_service import SettingProposalService
 from elyha_core.services.snapshot_service import SnapshotService
 from elyha_core.services.state_service import StateService
 from elyha_core.services.validation_service import ValidationService
+from elyha_core.services.workflow_doc_service import WorkflowDocumentService
 from elyha_core.storage.repository import SQLiteRepository
 from elyha_core.storage.sqlite_store import SQLiteStore
 
@@ -52,6 +53,7 @@ class ServiceContainer:
     state_service: StateService
     context_service: ContextService
     ai_service: AIService
+    workflow_doc_service: WorkflowDocumentService
     setting_proposal_service: SettingProposalService
     session_orchestrator_service: SessionOrchestratorService
     insight_service: InsightService
@@ -70,6 +72,10 @@ class UpdateSettingsRequest(BaseModel):
     system_prompt_style: str | None = Field(default=None, max_length=4000)
     system_prompt_forbidden: str | None = Field(default=None, max_length=4000)
     system_prompt_notes: str | None = Field(default=None, max_length=4000)
+    constitution_markdown: str | None = Field(default=None, max_length=12000)
+    clarify_markdown: str | None = Field(default=None, max_length=12000)
+    specification_markdown: str | None = Field(default=None, max_length=12000)
+    plan_markdown: str | None = Field(default=None, max_length=12000)
     global_directives: str | None = Field(default=None, max_length=12000)
     context_soft_min_chars: int | None = Field(default=None, ge=1)
     context_soft_max_chars: int | None = Field(default=None, ge=1)
@@ -81,6 +87,13 @@ class UpdateSettingsRequest(BaseModel):
     context_compaction_keep_recent_chunks: int | None = Field(default=None, ge=1)
     context_compaction_group_chunks: int | None = Field(default=None, ge=1)
     context_compaction_chunk_chars: int | None = Field(default=None, ge=1)
+    agent_tool_loop_enabled: bool | None = None
+    agent_tool_loop_max_rounds: int | None = Field(default=None, ge=1, le=20)
+    agent_tool_loop_max_calls_per_round: int | None = Field(default=None, ge=1, le=20)
+    agent_tool_loop_single_read_char_limit: int | None = Field(default=None, ge=200, le=50000)
+    agent_tool_loop_total_read_char_limit: int | None = Field(default=None, ge=1000, le=200000)
+    agent_tool_loop_no_progress_limit: int | None = Field(default=None, ge=1, le=10)
+    agent_tool_write_proposal_enabled: bool | None = None
 
 
 class CreateNodeRequest(BaseModel):
@@ -206,6 +219,7 @@ class ChatAssistRequest(BaseModel):
     project_id: str
     message: str = Field(min_length=1, max_length=4000)
     node_id: str | None = None
+    thread_id: str | None = Field(default=None, min_length=1, max_length=128)
     token_budget: int = Field(default=1800, ge=1)
 
 
@@ -249,6 +263,25 @@ class WorkflowSyncRequest(BaseModel):
     constraints: str = ""
     tone: str = ""
     token_budget: int = Field(default=1400, ge=1)
+
+
+class StartWorkflowRequest(BaseModel):
+    mode: str = "original"
+    token_budget: int = Field(default=1000, ge=1)
+
+
+class AutoStartWorkflowRequest(BaseModel):
+    user_input: str = Field(min_length=1, max_length=4000)
+    token_budget: int = Field(default=400, ge=1)
+
+
+class SubmitWorkflowStageInputRequest(BaseModel):
+    user_input: str = Field(min_length=1, max_length=12000)
+    token_budget: int = Field(default=1000, ge=1)
+
+
+class ConfirmWorkflowRoundRequest(BaseModel):
+    round_number: int = Field(ge=1, le=2)
 
 
 class ClarificationQuestionRequest(BaseModel):
@@ -374,6 +407,10 @@ def _to_project_payload(project) -> dict[str, Any]:
             "system_prompt_style": project.settings.system_prompt_style,
             "system_prompt_forbidden": project.settings.system_prompt_forbidden,
             "system_prompt_notes": project.settings.system_prompt_notes,
+            "constitution_markdown": project.settings.constitution_markdown,
+            "clarify_markdown": project.settings.clarify_markdown,
+            "specification_markdown": project.settings.specification_markdown,
+            "plan_markdown": project.settings.plan_markdown,
             "global_directives": project.settings.global_directives,
             "context_soft_min_chars": project.settings.context_soft_min_chars,
             "context_soft_max_chars": project.settings.context_soft_max_chars,
@@ -385,6 +422,13 @@ def _to_project_payload(project) -> dict[str, Any]:
             "context_compaction_keep_recent_chunks": project.settings.context_compaction_keep_recent_chunks,
             "context_compaction_group_chunks": project.settings.context_compaction_group_chunks,
             "context_compaction_chunk_chars": project.settings.context_compaction_chunk_chars,
+            "agent_tool_loop_enabled": project.settings.agent_tool_loop_enabled,
+            "agent_tool_loop_max_rounds": project.settings.agent_tool_loop_max_rounds,
+            "agent_tool_loop_max_calls_per_round": project.settings.agent_tool_loop_max_calls_per_round,
+            "agent_tool_loop_single_read_char_limit": project.settings.agent_tool_loop_single_read_char_limit,
+            "agent_tool_loop_total_read_char_limit": project.settings.agent_tool_loop_total_read_char_limit,
+            "agent_tool_loop_no_progress_limit": project.settings.agent_tool_loop_no_progress_limit,
+            "agent_tool_write_proposal_enabled": project.settings.agent_tool_write_proposal_enabled,
         },
     }
 
@@ -440,6 +484,23 @@ def _to_task_payload(task) -> dict[str, Any]:
         "finished_at": task.finished_at.isoformat() if task.finished_at else None,
         "revision": task.revision,
         "created_at": task.created_at.isoformat(),
+    }
+
+
+def _to_workflow_doc_payload(state: Any) -> dict[str, Any]:
+    return {
+        "project_id": str(getattr(state, "project_id", "")),
+        "workflow_mode": str(getattr(state, "workflow_mode", "")),
+        "workflow_stage": str(getattr(state, "workflow_stage", "")),
+        "workflow_initialized": bool(getattr(state, "workflow_initialized", False)),
+        "round_number": int(getattr(state, "round_number", 0) or 0),
+        "assistant_message": str(getattr(state, "assistant_message", "") or ""),
+        "collected_inputs": dict(getattr(state, "collected_inputs", {}) or {}),
+        "clarify_questions": list(getattr(state, "clarify_questions", []) or []),
+        "pending_docs": dict(getattr(state, "pending_docs", {}) or {}),
+        "published_docs": dict(getattr(state, "published_docs", {}) or {}),
+        "created_at": str(getattr(state, "created_at", "") or ""),
+        "updated_at": str(getattr(state, "updated_at", "") or ""),
     }
 
 
@@ -543,6 +604,7 @@ def _build_ai_service(
     context_service: ContextService,
     validation_service: ValidationService,
     state_service: StateService,
+    setting_proposal_service: SettingProposalService,
     runtime_config: CoreRuntimeConfig,
     llm_presets: dict[str, LLMPreset],
 ) -> AIService:
@@ -555,6 +617,7 @@ def _build_ai_service(
         llm_platform_config=_to_llm_platform_config(runtime_config),
         llm_presets=llm_presets,
         state_service=state_service,
+        setting_proposal_service=setting_proposal_service,
     )
 
 
@@ -580,9 +643,11 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         context_service,
         validation_service,
         state_service,
+        setting_proposal_service,
         runtime_config,
         llm_presets,
     )
+    workflow_doc_service = WorkflowDocumentService(repository, ai_service)
     session_orchestrator_service = SessionOrchestratorService(
         repository,
         graph_service,
@@ -599,6 +664,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         state_service=state_service,
         context_service=context_service,
         ai_service=ai_service,
+        workflow_doc_service=workflow_doc_service,
         setting_proposal_service=setting_proposal_service,
         session_orchestrator_service=session_orchestrator_service,
         insight_service=InsightService(repository),
@@ -650,10 +716,12 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             context_service,
             validation_service,
             state_service,
+            setting_proposal_service,
             config,
             services.llm_presets,
         )
         services.session_orchestrator_service.set_ai_service(services.ai_service)
+        services.workflow_doc_service.set_ai_service(services.ai_service)
 
     @api.get("/api/llm/presets")
     def list_llm_presets() -> list[dict[str, Any]]:
@@ -816,6 +884,10 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             system_prompt_style=payload.system_prompt_style,
             system_prompt_forbidden=payload.system_prompt_forbidden,
             system_prompt_notes=payload.system_prompt_notes,
+            constitution_markdown=payload.constitution_markdown,
+            clarify_markdown=payload.clarify_markdown,
+            specification_markdown=payload.specification_markdown,
+            plan_markdown=payload.plan_markdown,
             global_directives=payload.global_directives,
             context_soft_min_chars=payload.context_soft_min_chars,
             context_soft_max_chars=payload.context_soft_max_chars,
@@ -827,6 +899,13 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             context_compaction_keep_recent_chunks=payload.context_compaction_keep_recent_chunks,
             context_compaction_group_chunks=payload.context_compaction_group_chunks,
             context_compaction_chunk_chars=payload.context_compaction_chunk_chars,
+            agent_tool_loop_enabled=payload.agent_tool_loop_enabled,
+            agent_tool_loop_max_rounds=payload.agent_tool_loop_max_rounds,
+            agent_tool_loop_max_calls_per_round=payload.agent_tool_loop_max_calls_per_round,
+            agent_tool_loop_single_read_char_limit=payload.agent_tool_loop_single_read_char_limit,
+            agent_tool_loop_total_read_char_limit=payload.agent_tool_loop_total_read_char_limit,
+            agent_tool_loop_no_progress_limit=payload.agent_tool_loop_no_progress_limit,
+            agent_tool_write_proposal_enabled=payload.agent_tool_write_proposal_enabled,
         )
         try:
             project = services.project_service.update_project_settings(project_id, patch)
@@ -844,6 +923,84 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     def patch_project_settings_compat(project_id: str, payload: UpdateSettingsRequest) -> dict[str, Any]:
         # Compatibility endpoint for older Web clients that PATCH /api/projects/{id}.
         return _update_project_settings(project_id, payload)
+
+    @api.post("/api/projects/{project_id}/workflow-docs/start")
+    def start_workflow_docs(project_id: str, payload: StartWorkflowRequest) -> dict[str, Any]:
+        try:
+            state = services.workflow_doc_service.start_workflow(
+                project_id,
+                mode=payload.mode,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _to_workflow_doc_payload(state)
+
+    @api.post("/api/projects/{project_id}/workflow-docs/auto-start")
+    def auto_start_workflow_docs(project_id: str, payload: AutoStartWorkflowRequest) -> dict[str, Any]:
+        try:
+            state = services.workflow_doc_service.start_workflow_auto(
+                project_id,
+                user_input=payload.user_input,
+                token_budget=payload.token_budget,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _to_workflow_doc_payload(state)
+
+    @api.post("/api/projects/{project_id}/workflow-docs/input")
+    def submit_workflow_docs_stage_input(
+        project_id: str,
+        payload: SubmitWorkflowStageInputRequest,
+    ) -> dict[str, Any]:
+        try:
+            state = services.workflow_doc_service.submit_stage_input(
+                project_id,
+                user_input=payload.user_input,
+                token_budget=payload.token_budget,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _to_workflow_doc_payload(state)
+
+    @api.post("/api/projects/{project_id}/workflow-docs/confirm")
+    def confirm_workflow_docs_round(
+        project_id: str,
+        payload: ConfirmWorkflowRoundRequest,
+    ) -> dict[str, Any]:
+        try:
+            state = services.workflow_doc_service.confirm_round(
+                project_id,
+                round_number=payload.round_number,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _to_workflow_doc_payload(state)
+
+    @api.post("/api/projects/{project_id}/workflow-docs/publish")
+    def publish_workflow_docs(project_id: str) -> dict[str, Any]:
+        try:
+            state = services.workflow_doc_service.publish_pending_docs(project_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _to_workflow_doc_payload(state)
+
+    @api.get("/api/projects/{project_id}/workflow-docs")
+    def get_workflow_docs_state(project_id: str) -> dict[str, Any]:
+        try:
+            state = services.workflow_doc_service.get_state(project_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return _to_workflow_doc_payload(state)
 
     @api.get("/api/projects/{project_id}/nodes")
     def list_nodes(project_id: str) -> list[dict[str, Any]]:
@@ -1364,6 +1521,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 payload.project_id,
                 message=payload.message,
                 node_id=payload.node_id,
+                thread_id=payload.thread_id,
                 token_budget=payload.token_budget,
             )
         except KeyError as exc:
@@ -1375,6 +1533,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         return {
             "project_id": result.project_id,
             "node_id": result.node_id,
+            "thread_id": result.thread_id,
             "route": result.route,
             "reply": result.reply,
             "review_bypassed": result.review_bypassed,
@@ -1578,6 +1737,27 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         return {
             "thread_id": thread_id,
             "session": session,
+        }
+
+    @api.get("/api/agent/session/{thread_id}/audits")
+    def get_agent_session_audits(thread_id: str) -> dict[str, Any]:
+        try:
+            _ = services.session_orchestrator_service.get_session_state(thread_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        rounds = repository.list_agent_loop_rounds(thread_id)
+        tool_calls = repository.list_agent_tool_calls(thread_id)
+        metrics = repository.list_agent_loop_metrics(thread_id)
+        return {
+            "thread_id": thread_id,
+            "agent_loop_rounds": rounds,
+            "agent_tool_calls": tool_calls,
+            "agent_loop_metrics": metrics,
+            "round_count": len(rounds),
+            "tool_call_count": len(tool_calls),
+            "metrics_count": len(metrics),
         }
 
     @api.post("/api/agent/session/decision")

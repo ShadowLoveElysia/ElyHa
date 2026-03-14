@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from typing import TYPE_CHECKING, Any, NoReturn, TypedDict, cast
 
 from elyha_core.adapters.llm_adapter import (
@@ -26,6 +27,7 @@ from elyha_core.services.context_assembler import (
 from elyha_core.services.context_service import ContextPack, ContextService
 from elyha_core.services.graph_service import GraphService, NodeCreate
 from elyha_core.services.prompt_template_service import PromptTemplateService
+from elyha_core.services.readable_content_tool_service import ReadableContentToolService
 from elyha_core.services.validation_service import ValidationService
 from elyha_core.models.node import NodeType
 from elyha_core.storage.repository import SQLiteRepository
@@ -35,6 +37,7 @@ from elyha_core.utils.text_splitter import split_text_by_chars
 from langgraph.graph import END, StateGraph
 
 if TYPE_CHECKING:
+    from elyha_core.services.setting_proposal_service import SettingProposalService
     from elyha_core.services.state_service import StateService
 
 _STRICT_JSON_FENCE_PATTERN = re.compile(
@@ -80,6 +83,10 @@ class ChapterDraftResult:
     node_metadata_patch: dict[str, Any] = field(default_factory=dict)
     prompt_version: str = ""
     diff_patch: dict[str, Any] = field(default_factory=dict)
+    agent_loop_rounds: list[dict[str, Any]] = field(default_factory=list)
+    agent_tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    agent_loop_metrics: dict[str, Any] = field(default_factory=dict)
+    tool_evidence_chunk_ids: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -98,6 +105,7 @@ class ReviewReport:
 class ChatAssistResult:
     project_id: str
     node_id: str | None
+    thread_id: str
     route: str
     reply: str
     review_bypassed: bool = False
@@ -159,6 +167,19 @@ class OutlineDetailNodesResult:
 
 
 @dataclass(slots=True)
+class WorkflowDocsDraftResult:
+    project_id: str
+    assistant_message: str = ""
+    constitution_markdown: str = ""
+    clarify_markdown: str = ""
+    specification_markdown: str = ""
+    plan_markdown: str = ""
+    diff_summary: str = ""
+    written_keys: list[str] = field(default_factory=list)
+    ignored_keys: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class ClarificationQuestionResult:
     project_id: str
     clarification_id: str
@@ -182,6 +203,7 @@ class WorkflowState(TypedDict, total=False):
     style_hint: str
     branch_count: int
     workflow_mode: str
+    tool_thread_id: str
     node: Any
     context_pack: ContextPack
     llm_route: dict[str, Any]
@@ -217,24 +239,40 @@ class AIService:
         llm_presets: dict[str, LLMPreset] | None = None,
         prompt_template_dir: str | None = None,
         state_service: StateService | None = None,
+        setting_proposal_service: SettingProposalService | None = None,
     ) -> None:
         self.repository = repository
         self.graph_service = graph_service
         self.context_service = context_service
         self.validation_service = validation_service
         self.state_service = state_service
+        self.setting_proposal_service = setting_proposal_service
         self.prompt_templates = PromptTemplateService(prompt_template_dir)
         self.context_assembler = ContextAssembler()
+        self.readable_tool_service = ReadableContentToolService(
+            repository,
+            graph_service,
+            state_service=state_service,
+        )
         self._default_platform_config = (llm_platform_config or {}).copy()
         self._llm_presets = dict(llm_presets or {})
         self._adapter_cache: dict[str, Any] = {}
         self._prompt_cache_monitor: dict[str, dict[str, Any]] = {}
+        self._tool_loop_max_rounds = 6
+        self._tool_loop_max_calls_per_round = 10
+        self._tool_loop_single_read_char_limit = 4000
+        self._tool_loop_total_read_char_limit = 20000
+        self._tool_loop_no_progress_limit = 2
+        self._tool_write_proposal_enabled = False
         self.llm_adapter = create_llm_adapter(
             llm_provider,
             platform_config=self._default_platform_config,
         )
         self._single_workflow = self._build_single_workflow()
         self._chapter_multi_workflow = self._build_chapter_multi_workflow()
+
+    def set_setting_proposal_service(self, service: Any | None) -> None:
+        self.setting_proposal_service = service
 
     def generate_chapter_draft(
         self,
@@ -244,6 +282,7 @@ class AIService:
         token_budget: int = 2200,
         style_hint: str = "",
         workflow_mode: str = "multi_agent",
+        tool_thread_id: str = "",
     ) -> ChapterDraftResult:
         normalized_mode = self._normalize_workflow_mode(workflow_mode)
         task = self._create_task(project_id, node_id, task_type="generate_chapter")
@@ -262,6 +301,7 @@ class AIService:
                 style_hint=style_hint,
                 workflow_mode=normalized_mode,
                 task_id=task.id,
+                tool_thread_id=tool_thread_id,
             )
             if self._is_task_cancelled(task.id):
                 self._set_task_cancelled(task, message="task cancelled")
@@ -286,6 +326,14 @@ class AIService:
                     if bundle is None:
                         continue
                     agent_bundles[agent_name] = bundle
+            loop_rounds, loop_tool_calls = self._collect_flow_agent_loop_audits(
+                flow_state,
+                workflow_mode=normalized_mode,
+            )
+            loop_metrics, evidence_chunk_ids = self._collect_flow_agent_loop_meta(
+                flow_state,
+                workflow_mode=normalized_mode,
+            )
             content = response.content.strip()
             if not content:
                 raise RuntimeError(tr("ai.error.empty_response"))
@@ -312,6 +360,10 @@ class AIService:
                 agent_trace=agent_trace,
                 node_metadata_patch=metadata_patch,
                 prompt_version=str(metadata_patch.get("ai_prompt_version", "")),
+                agent_loop_rounds=loop_rounds,
+                agent_tool_calls=loop_tool_calls,
+                agent_loop_metrics=loop_metrics,
+                tool_evidence_chunk_ids=evidence_chunk_ids,
             )
         except Exception as exc:
             if self._is_task_cancelled(task.id):
@@ -328,6 +380,7 @@ class AIService:
         user_correction: str,
         base_content: str = "",
         token_budget: int = 2200,
+        tool_thread_id: str = "",
     ) -> ChapterDraftResult:
         correction_text = str(user_correction or "").strip()
         if not correction_text:
@@ -353,7 +406,11 @@ class AIService:
             response = self._generate(
                 task_type="chapter_correction",
                 prompt=prompt,
-                platform_config={"token_budget": max(400, int(token_budget))},
+                platform_config={
+                    "token_budget": max(400, int(token_budget)),
+                    "tool_context_node_id": str(node_id),
+                    "tool_thread_id": str(tool_thread_id or "").strip(),
+                },
                 llm_route=self._resolve_node_llm_route(node),
                 project_id=project_id,
             )
@@ -383,6 +440,12 @@ class AIService:
                 final_bundle=bundle,
                 agent_bundles={},
             )
+            loop_rounds, loop_tool_calls = self._extract_agent_loop_audits(
+                response,
+                default_task_type="chapter_correction",
+                default_agent="correction",
+            )
+            loop_metrics, evidence_chunk_ids = self._extract_agent_loop_meta(response)
             self._set_task_success(task, revision=self._project_revision(project_id))
             return ChapterDraftResult(
                 task_id=task.id,
@@ -397,6 +460,10 @@ class AIService:
                 node_metadata_patch=metadata_patch,
                 prompt_version=str(metadata_patch.get("ai_prompt_version", "")),
                 diff_patch=normalized_diff_patch,
+                agent_loop_rounds=loop_rounds,
+                agent_tool_calls=loop_tool_calls,
+                agent_loop_metrics=loop_metrics,
+                tool_evidence_chunk_ids=evidence_chunk_ids,
             )
         except Exception as exc:
             if self._is_task_cancelled(task.id):
@@ -523,6 +590,7 @@ class AIService:
         *,
         message: str,
         node_id: str | None = None,
+        thread_id: str | None = None,
         token_budget: int = 1800,
     ) -> ChatAssistResult:
         cleaned_message, explicit_route = self._extract_chat_route(message)
@@ -541,18 +609,49 @@ class AIService:
             else:
                 route = "writer"
         review_bypassed = node is not None and auto_review_passed and route == "writer"
+        clean_thread_id = str(thread_id or "").strip() or generate_id("chat")
+        self.repository.upsert_chat_thread(
+            clean_thread_id,
+            project_id=project_id,
+            node_id=node.id if node is not None else "",
+        )
+        thread_history = self.repository.list_chat_messages(clean_thread_id, limit=16)
+        history_block = self._format_chat_history_for_prompt(thread_history)
+        workflow_docs_block = self._build_workflow_docs_prompt_context(project_id)
+        chat_context = self._combine_chat_prompt_context(
+            history_block=history_block,
+            workflow_docs_block=workflow_docs_block,
+        )
+        self.repository.append_chat_message(
+            clean_thread_id,
+            role="user",
+            content=cleaned_message,
+        )
+        prompt_user_message = cleaned_message
+        if chat_context:
+            prompt_user_message = f"{cleaned_message}\n\n{chat_context}"
 
         if node is None:
             response = self._generate(
                 task_type="chat_global_" + route,
-                prompt=self._chat_global_prompt(project_id, cleaned_message, route=route),
+                prompt=self._chat_global_prompt(
+                    project_id,
+                    prompt_user_message,
+                    route=route,
+                ),
                 platform_config={"token_budget": token_budget},
                 project_id=project_id,
             )
             content = response.content.strip() or tr("ai.chat.empty_fallback")
+            self.repository.append_chat_message(
+                clean_thread_id,
+                role="assistant",
+                content=content,
+            )
             return ChatAssistResult(
                 project_id=project_id,
                 node_id=None,
+                thread_id=clean_thread_id,
                 route=route,
                 reply=content,
                 review_bypassed=False,
@@ -572,6 +671,7 @@ class AIService:
                 node,
                 context,
                 cleaned_message,
+                conversation_context=chat_context,
                 token_budget=max(600, token_budget // 2),
             )
             response = self._generate(
@@ -597,9 +697,15 @@ class AIService:
                 raw=response.content.strip() or tr("ai.chat.empty_fallback"),
                 count=len(options),
             )
+            self.repository.append_chat_message(
+                clean_thread_id,
+                role="assistant",
+                content=reply,
+            )
             return ChatAssistResult(
                 project_id=project_id,
                 node_id=node.id,
+                thread_id=clean_thread_id,
                 route="planner",
                 reply=reply,
                 review_bypassed=False,
@@ -627,11 +733,18 @@ class AIService:
         if route == "writer":
             current_outline = str(node_metadata.get("outline_markdown", "")).strip()
             if not current_outline:
+                guard_reply = tr("ai.chat.writer_outline_required")
+                self.repository.append_chat_message(
+                    clean_thread_id,
+                    role="assistant",
+                    content=guard_reply,
+                )
                 return ChatAssistResult(
                     project_id=project_id,
                     node_id=node.id,
+                    thread_id=clean_thread_id,
                     route="guard",
-                    reply=tr("ai.chat.writer_outline_required"),
+                    reply=guard_reply,
                     review_bypassed=False,
                     revision=self._project_revision(project_id),
                 )
@@ -642,12 +755,13 @@ class AIService:
             context,
             cleaned_message,
             node_metadata,
+            conversation_context=chat_context,
             token_budget=token_budget,
         )
         response = self._generate(
             task_type="chat_writer",
             prompt=writer_prompt,
-            platform_config={"token_budget": token_budget},
+            platform_config={"token_budget": token_budget, "tool_context_node_id": str(node.id)},
             llm_route=llm_route,
             project_id=project_id,
         )
@@ -677,9 +791,15 @@ class AIService:
             },
         )
         self.repository.replace_node_chunks(node.id, split_text_by_chars(content))
+        self.repository.append_chat_message(
+            clean_thread_id,
+            role="assistant",
+            content=content,
+        )
         return ChatAssistResult(
             project_id=project_id,
             node_id=node.id,
+            thread_id=clean_thread_id,
             route="writer",
             reply=content,
             review_bypassed=review_bypassed,
@@ -893,6 +1013,220 @@ class AIService:
             prompt_tokens=response.prompt_tokens,
             completion_tokens=response.completion_tokens,
         )
+
+    def generate_workflow_stage_reply(
+        self,
+        project_id: str,
+        *,
+        mode: str,
+        stage: str,
+        collected_inputs: dict[str, str] | None = None,
+        clarify_questions: list[str] | None = None,
+        token_budget: int = 1000,
+    ) -> str:
+        if self.repository.get_project(project_id) is None:
+            self._raise_project_missing(project_id)
+        clean_stage = str(stage or "").strip() or "collect_constitution"
+        inputs = {
+            str(k): str(v or "").strip()
+            for k, v in dict(collected_inputs or {}).items()
+            if str(v or "").strip()
+        }
+        questions = [str(item).strip() for item in list(clarify_questions or []) if str(item or "").strip()]
+        prompt = self._workflow_stage_prompt(
+            project_id,
+            mode=mode,
+            stage=clean_stage,
+            collected_inputs=inputs,
+            clarify_questions=questions,
+        )
+        response = self._generate(
+            task_type="workflow_stage_reply",
+            prompt=prompt,
+            platform_config={"token_budget": max(500, token_budget)},
+            project_id=project_id,
+        )
+        reply = self._parse_workflow_stage_assistant_message(response.content)
+        if self._should_repair_workflow_stage_reply(
+            stage=clean_stage,
+            reply=reply,
+            collected_inputs=inputs,
+            clarify_questions=questions,
+        ):
+            repair_prompt = self._workflow_stage_repair_prompt(
+                project_id,
+                mode=mode,
+                stage=clean_stage,
+                collected_inputs=inputs,
+                clarify_questions=questions,
+                bad_reply=reply,
+            )
+            repaired = self._generate(
+                task_type="workflow_stage_reply_repair",
+                prompt=repair_prompt,
+                platform_config={"token_budget": max(500, token_budget)},
+                project_id=project_id,
+            )
+            reply = self._parse_workflow_stage_assistant_message(repaired.content)
+        if not reply:
+            reply = self._workflow_stage_default_message(clean_stage)
+        return reply
+
+    def generate_workflow_documents(
+        self,
+        project_id: str,
+        *,
+        mode: str,
+        collected_inputs: dict[str, str] | None = None,
+        clarify_questions: list[str] | None = None,
+        token_budget: int = 1800,
+    ) -> WorkflowDocsDraftResult:
+        if self.repository.get_project(project_id) is None:
+            self._raise_project_missing(project_id)
+        inputs = {
+            str(k): str(v or "").strip()
+            for k, v in dict(collected_inputs or {}).items()
+            if str(v or "").strip()
+        }
+        questions = [str(item).strip() for item in list(clarify_questions or []) if str(item or "").strip()]
+        conversation = self._workflow_inputs_to_conversation(
+            mode=mode,
+            collected_inputs=inputs,
+            clarify_questions=questions,
+        )
+        prompt = self._render_prompt_template(
+            "guide_four_docs_prompt",
+            fallback_key="ai.workflow.four_docs_prompt",
+            conversation=conversation,
+        )
+        response = self._generate(
+            task_type="workflow_docs_draft",
+            prompt=prompt,
+            platform_config={"token_budget": max(1000, token_budget)},
+            project_id=project_id,
+        )
+        docs = self._parse_workflow_docs_payload(response.content)
+        written_keys = [str(item) for item in list(docs.get("written_keys", []) or []) if str(item).strip()]
+        ignored_keys = [str(item) for item in list(docs.get("ignored_keys", []) or []) if str(item).strip()]
+        assistant_message = str(docs.get("assistant_message", "")).strip()
+        if not assistant_message:
+            assistant_message = response.content.strip() or tr("ai.chat.empty_fallback")
+        return WorkflowDocsDraftResult(
+            project_id=project_id,
+            assistant_message=assistant_message,
+            constitution_markdown=str(docs.get("constitution_markdown", "")).strip(),
+            clarify_markdown=str(docs.get("clarify_markdown", "")).strip(),
+            specification_markdown=str(docs.get("specification_markdown", "")).strip(),
+            plan_markdown=str(docs.get("plan_markdown", "")).strip(),
+            diff_summary=str(docs.get("diff_summary", "")).strip(),
+            written_keys=written_keys,
+            ignored_keys=ignored_keys,
+        )
+
+    def revise_workflow_documents(
+        self,
+        project_id: str,
+        *,
+        mode: str,
+        collected_inputs: dict[str, str] | None = None,
+        clarify_questions: list[str] | None = None,
+        pending_docs: dict[str, str] | None = None,
+        user_feedback: str = "",
+        token_budget: int = 1800,
+    ) -> WorkflowDocsDraftResult:
+        if self.repository.get_project(project_id) is None:
+            self._raise_project_missing(project_id)
+        inputs = {
+            str(k): str(v or "").strip()
+            for k, v in dict(collected_inputs or {}).items()
+            if str(v or "").strip()
+        }
+        questions = [str(item).strip() for item in list(clarify_questions or []) if str(item or "").strip()]
+        pending = {
+            "constitution_markdown": str(dict(pending_docs or {}).get("constitution_markdown", "") or "").strip(),
+            "clarify_markdown": str(dict(pending_docs or {}).get("clarify_markdown", "") or "").strip(),
+            "specification_markdown": str(dict(pending_docs or {}).get("specification_markdown", "") or "").strip(),
+            "plan_markdown": str(dict(pending_docs or {}).get("plan_markdown", "") or "").strip(),
+        }
+        conversation = self._workflow_inputs_to_conversation(
+            mode=mode,
+            collected_inputs=inputs,
+            clarify_questions=questions,
+        )
+        pending_text = (
+            "[Constitution]\n"
+            f"{pending['constitution_markdown'] or '-'}\n\n"
+            "[Clarify]\n"
+            f"{pending['clarify_markdown'] or '-'}\n\n"
+            "[Specification]\n"
+            f"{pending['specification_markdown'] or '-'}\n\n"
+            "[Plan]\n"
+            f"{pending['plan_markdown'] or '-'}"
+        )
+        feedback = str(user_feedback or "").strip() or "无新增修改。请仅修正表达并保持结构完整。"
+        prompt = self._render_prompt_template(
+            "workflow_docs_revise_prompt",
+            fallback_key="ai.workflow.docs_revise_prompt",
+            conversation=conversation,
+            pending_docs=pending_text,
+            user_feedback=feedback,
+        )
+        response = self._generate(
+            task_type="workflow_docs_revise",
+            prompt=prompt,
+            platform_config={"token_budget": max(1000, token_budget)},
+            project_id=project_id,
+        )
+        docs = self._parse_workflow_docs_payload(response.content)
+        written_keys = [str(item) for item in list(docs.get("written_keys", []) or []) if str(item).strip()]
+        ignored_keys = [str(item) for item in list(docs.get("ignored_keys", []) or []) if str(item).strip()]
+        assistant_message = str(docs.get("assistant_message", "")).strip()
+        if not assistant_message:
+            assistant_message = response.content.strip() or tr("ai.chat.empty_fallback")
+        return WorkflowDocsDraftResult(
+            project_id=project_id,
+            assistant_message=assistant_message,
+            constitution_markdown=str(docs.get("constitution_markdown", "")).strip(),
+            clarify_markdown=str(docs.get("clarify_markdown", "")).strip(),
+            specification_markdown=str(docs.get("specification_markdown", "")).strip(),
+            plan_markdown=str(docs.get("plan_markdown", "")).strip(),
+            diff_summary=str(docs.get("diff_summary", "")).strip(),
+            written_keys=written_keys,
+            ignored_keys=ignored_keys,
+        )
+
+    def judge_workflow_mode(
+        self,
+        project_id: str,
+        *,
+        user_input: str,
+        token_budget: int = 400,
+    ) -> str:
+        if self.repository.get_project(project_id) is None:
+            self._raise_project_missing(project_id)
+        raw = str(user_input or "").strip()
+        if not raw:
+            return "original"
+        lowered = raw.lower()
+        sequel_hints = ("续写", "后日谈", "同人", "fanfic", "sequel", "二创", "外传")
+        if any(hint in lowered for hint in sequel_hints):
+            return "sequel"
+        prompt = self._render_prompt_template(
+            "workflow_mode_judge_prompt",
+            fallback_key="ai.workflow.mode_judge_prompt",
+            user_input=raw,
+        )
+        response = self._generate(
+            task_type="workflow_mode_judge",
+            prompt=prompt,
+            platform_config={"token_budget": max(200, token_budget)},
+            project_id=project_id,
+        )
+        parsed = self._parse_outline_guide_payload(response.content, strict_json_fence=False)
+        mode = str(parsed.get("mode", "") or "").strip().lower()
+        if mode in {"sequel", "续写"}:
+            return "sequel"
+        return "original"
 
     def generate_clarification_question(
         self,
@@ -1596,6 +1930,386 @@ class AIService:
         )
         return bundle.final_prompt, bundle
 
+    def _format_chat_history_for_prompt(self, history: list[dict[str, str]]) -> str:
+        if not history:
+            return ""
+        lines: list[str] = []
+        for item in history[-12:]:
+            role = str(item.get("role", "") or "").strip().lower()
+            content = str(item.get("content", "") or "").strip()
+            if not content:
+                continue
+            role_label = "assistant" if role == "assistant" else "user"
+            preview = content if len(content) <= 600 else content[:600] + "..."
+            lines.append(f"{role_label}: {preview}")
+        return "\n".join(lines).strip()
+
+    def _build_workflow_docs_prompt_context(self, project_id: str) -> str:
+        project = self.repository.get_project(project_id)
+        if project is None:
+            return ""
+        settings = project.settings
+        parts: list[str] = []
+        constitution = str(getattr(settings, "constitution_markdown", "") or "").strip()
+        clarify = str(getattr(settings, "clarify_markdown", "") or "").strip()
+        specification = str(getattr(settings, "specification_markdown", "") or "").strip()
+        plan = str(getattr(settings, "plan_markdown", "") or "").strip()
+        if constitution:
+            parts.append("[Constitution]\n" + constitution)
+        if clarify:
+            parts.append("[Clarify]\n" + clarify)
+        if specification:
+            parts.append("[Specification]\n" + specification)
+        if plan:
+            parts.append("[Plan]\n" + plan)
+        state = self.repository.get_workflow_doc_state(project_id)
+        if state is not None:
+            stage = str(state.get("workflow_stage", "") or "").strip()
+            mode = str(state.get("workflow_mode", "") or "").strip()
+            if stage:
+                parts.append(f"[Workflow Stage]\n{stage}")
+            if mode:
+                parts.append(f"[Workflow Mode]\n{mode}")
+            pending_docs = state.get("pending_docs", {})
+            if isinstance(pending_docs, dict):
+                pending_constitution = str(pending_docs.get("constitution_markdown", "") or "").strip()
+                pending_clarify = str(pending_docs.get("clarify_markdown", "") or "").strip()
+                pending_specification = str(pending_docs.get("specification_markdown", "") or "").strip()
+                pending_plan = str(pending_docs.get("plan_markdown", "") or "").strip()
+                if pending_constitution:
+                    parts.append("[Pending Constitution]\n" + pending_constitution)
+                if pending_clarify:
+                    parts.append("[Pending Clarify]\n" + pending_clarify)
+                if pending_specification:
+                    parts.append("[Pending Specification]\n" + pending_specification)
+                if pending_plan:
+                    parts.append("[Pending Plan]\n" + pending_plan)
+        return "\n\n".join(parts).strip()
+
+    def _combine_chat_prompt_context(
+        self,
+        *,
+        history_block: str,
+        workflow_docs_block: str,
+    ) -> str:
+        sections: list[str] = []
+        if history_block:
+            sections.append("[Recent Thread History]\n" + history_block)
+        if workflow_docs_block:
+            sections.append("[Workflow Doc Context]\n" + workflow_docs_block)
+        return "\n\n".join(sections).strip()
+
+    def _workflow_stage_prompt(
+        self,
+        project_id: str,
+        *,
+        mode: str,
+        stage: str,
+        collected_inputs: dict[str, str],
+        clarify_questions: list[str],
+    ) -> str:
+        project = self.repository.get_project(project_id)
+        project_title = project.title if project is not None else project_id
+        input_lines = "\n".join(f"- {k}: {v}" for k, v in collected_inputs.items()) or "-"
+        question_lines = "\n".join(f"- {q}" for q in clarify_questions) or "-"
+        return self._render_prompt_template(
+            "workflow_stage_reply_prompt",
+            fallback_key="ai.workflow.stage_reply_prompt",
+            project_title=project_title,
+            mode=str(mode or "").strip() or "original",
+            stage=str(stage or "").strip() or "collect_constitution",
+            collected_inputs=input_lines,
+            clarify_questions=question_lines,
+        )
+
+    def _workflow_stage_repair_prompt(
+        self,
+        project_id: str,
+        *,
+        mode: str,
+        stage: str,
+        collected_inputs: dict[str, str],
+        clarify_questions: list[str],
+        bad_reply: str,
+    ) -> str:
+        project = self.repository.get_project(project_id)
+        project_title = project.title if project is not None else project_id
+        input_lines = "\n".join(f"- {k}: {v}" for k, v in collected_inputs.items()) or "-"
+        question_lines = "\n".join(f"- {q}" for q in clarify_questions) or "-"
+        return self._render_prompt_template(
+            "workflow_stage_repair_prompt",
+            fallback_key="ai.workflow.stage_repair_prompt",
+            project_title=project_title,
+            mode=str(mode or "").strip() or "original",
+            stage=str(stage or "").strip() or "collect_constitution",
+            collected_inputs=input_lines,
+            clarify_questions=question_lines,
+            bad_reply=str(bad_reply or "").strip() or "-",
+        )
+
+    def _parse_workflow_stage_assistant_message(self, text: str) -> str:
+        parsed = self._parse_outline_guide_payload(text, strict_json_fence=False)
+        message = str(parsed.get("assistant_message", "") or "").strip()
+        if message:
+            return message
+        return str(text or "").strip()
+
+    def _should_repair_workflow_stage_reply(
+        self,
+        *,
+        stage: str,
+        reply: str,
+        collected_inputs: dict[str, str],
+        clarify_questions: list[str],
+    ) -> bool:
+        text = str(reply or "").strip()
+        if not text:
+            return True
+        lowered = text.lower()
+        if "请告诉我你的项目名称" in text or "我是elyha写作助手" in lowered:
+            return True
+        input_text = "\n".join(collected_inputs.values())
+        has_story_signal = any(token in input_text for token in ("小说", "故事", "续写", "同人"))
+        if has_story_signal and ("手册" in text) and ("手册" not in input_text):
+            return True
+        if str(stage or "").strip() == "collect_clarify" and clarify_questions:
+            probes = ("套路", "角色", "第四面墙", "冲突", "结局", "视角")
+            if not any((probe in text) for probe in probes):
+                return True
+        return False
+
+    def _workflow_stage_default_message(self, stage: str) -> str:
+        defaults = {
+            "collect_constitution": "请先说明项目核心目标与基调，我会据此推进下一步。",
+            "collect_specification": "请补充可执行规格（篇幅、节奏、结局方向、约束项）。",
+            "collect_clarify": "请按澄清问题逐条回答，我将据此收敛方案。",
+            "collect_plan": "请给出计划偏好（章节节奏/推进方式），随后生成四份文档草案。",
+            "revise": "请补充修订意见，我会给出第二轮草案。",
+            "modal_confirm": "若无异议，请确认并发布四份文档。",
+            "published": "四份文档已发布并写入项目设置。",
+        }
+        return defaults.get(str(stage or "").strip(), "请继续提供可执行信息。")
+
+    def _workflow_inputs_to_conversation(
+        self,
+        *,
+        mode: str,
+        collected_inputs: dict[str, str],
+        clarify_questions: list[str],
+    ) -> str:
+        lines: list[str] = [f"[mode] {str(mode or '').strip() or 'original'}"]
+        for key in ("constitution_input", "specification_input", "clarify_input", "plan_input", "revise_input"):
+            value = str(collected_inputs.get(key, "")).strip()
+            if value:
+                lines.append(f"[{key}] {value}")
+        if clarify_questions:
+            lines.append("[clarify_questions]")
+            lines.extend(f"- {item}" for item in clarify_questions)
+        return "\n".join(lines).strip()
+
+    def _parse_workflow_docs_payload(self, text: str) -> dict[str, Any]:
+        raw = str(text or "").strip()
+        result: dict[str, Any] = {
+            "assistant_message": "",
+            "constitution_markdown": "",
+            "clarify_markdown": "",
+            "specification_markdown": "",
+            "plan_markdown": "",
+            "diff_summary": "",
+            "written_keys": [],
+            "ignored_keys": [],
+        }
+        if not raw:
+            return result
+
+        ignored_keys: list[str] = []
+        parsed = self._parse_outline_guide_payload(raw, strict_json_fence=False)
+        if parsed:
+            for key, value in parsed.items():
+                clean_key = str(key or "").strip()
+                if not clean_key:
+                    continue
+                slot = self._workflow_doc_slot_from_key(clean_key)
+                if not slot:
+                    ignored_keys.append(clean_key)
+                    continue
+                text_value = self._coerce_markdown_text(value)
+                if slot in {"assistant_message", "diff_summary"}:
+                    result[slot] = text_value
+                    continue
+                if text_value:
+                    result[slot] = text_value
+                    cast(list[str], result["written_keys"]).append(slot)
+
+        if not cast(list[str], result["written_keys"]):
+            section_docs, section_ignored = self._parse_workflow_docs_sections_from_text(raw)
+            for slot, value in section_docs.items():
+                if not value:
+                    continue
+                result[slot] = value
+                cast(list[str], result["written_keys"]).append(slot)
+            ignored_keys.extend(section_ignored)
+
+        dedup_written: list[str] = []
+        for key in cast(list[str], result["written_keys"]):
+            if key in dedup_written:
+                continue
+            dedup_written.append(key)
+        result["written_keys"] = dedup_written
+
+        dedup_ignored: list[str] = []
+        for key in ignored_keys:
+            clean = str(key or "").strip()
+            if not clean:
+                continue
+            if self._workflow_doc_slot_from_key(clean):
+                continue
+            if clean in dedup_ignored:
+                continue
+            dedup_ignored.append(clean)
+        if not dedup_written and not dedup_ignored and raw:
+            dedup_ignored.append("unstructured_output")
+        result["ignored_keys"] = dedup_ignored
+
+        if not str(result.get("assistant_message", "")).strip():
+            result["assistant_message"] = str(text or "").strip()
+
+        return result
+
+    def _workflow_doc_slot_from_key(self, raw_key: str) -> str:
+        key = str(raw_key or "").strip().lower()
+        if not key:
+            return ""
+        if key.endswith(".md"):
+            key = key[:-3].strip()
+        compact = (
+            key.replace(" ", "")
+            .replace("-", "")
+            .replace("_", "")
+            .replace("/", "")
+            .replace("\\", "")
+            .replace(".", "")
+        )
+        mapping = {
+            "assistantmessage": "assistant_message",
+            "assistant": "assistant_message",
+            "message": "assistant_message",
+            "reply": "assistant_message",
+            "diffsummary": "diff_summary",
+            "changesummary": "diff_summary",
+            "constitution": "constitution_markdown",
+            "constitutionmarkdown": "constitution_markdown",
+            "宪法": "constitution_markdown",
+            "clarify": "clarify_markdown",
+            "clarifymarkdown": "clarify_markdown",
+            "澄清": "clarify_markdown",
+            "specification": "specification_markdown",
+            "specificationmarkdown": "specification_markdown",
+            "规格": "specification_markdown",
+            "规范": "specification_markdown",
+            "plan": "plan_markdown",
+            "planmarkdown": "plan_markdown",
+            "计划": "plan_markdown",
+        }
+        return mapping.get(compact, "")
+
+    def _coerce_markdown_text(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, list):
+            lines: list[str] = []
+            for item in value:
+                text = str(item or "").strip()
+                if not text:
+                    continue
+                lines.append(f"- {text}")
+            return "\n".join(lines).strip()
+        if isinstance(value, dict):
+            try:
+                return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True).strip()
+            except Exception:
+                return str(value).strip()
+        return str(value).strip()
+
+    def _parse_workflow_docs_sections_from_text(self, text: str) -> tuple[dict[str, str], list[str]]:
+        docs = {
+            "constitution_markdown": "",
+            "clarify_markdown": "",
+            "specification_markdown": "",
+            "plan_markdown": "",
+        }
+        ignored: list[str] = []
+        current_slot = ""
+        buckets: dict[str, list[str]] = {
+            "constitution_markdown": [],
+            "clarify_markdown": [],
+            "specification_markdown": [],
+            "plan_markdown": [],
+        }
+
+        for raw_line in str(text or "").splitlines():
+            line = raw_line.rstrip("\n")
+            stripped = line.strip()
+            if not stripped and not current_slot:
+                continue
+
+            heading_label = ""
+            markdown_heading = re.match(r"^\s{0,3}#{1,6}\s*(.+?)\s*$", line)
+            bracket_heading = re.match(r"^\s*\[(.+?)\]\s*$", line)
+            colon_heading = re.match(r"^\s*([A-Za-z\u4e00-\u9fff][A-Za-z0-9_.\-/\u4e00-\u9fff ]{0,80})\s*:\s*$", line)
+            if markdown_heading:
+                heading_label = str(markdown_heading.group(1) or "").strip()
+            elif bracket_heading:
+                heading_label = str(bracket_heading.group(1) or "").strip()
+            elif colon_heading:
+                heading_label = str(colon_heading.group(1) or "").strip()
+
+            if heading_label:
+                slot = self._workflow_doc_slot_from_key(heading_label)
+                if slot in buckets:
+                    current_slot = slot
+                    continue
+                ignored.append(heading_label)
+                current_slot = ""
+                continue
+
+            if current_slot:
+                buckets[current_slot].append(line)
+
+        for slot, lines in buckets.items():
+            content = "\n".join(lines).strip()
+            if content:
+                docs[slot] = content
+        return docs, ignored
+
+    def _fallback_workflow_docs(
+        self,
+        collected_inputs: dict[str, str],
+        clarify_questions: list[str],
+    ) -> dict[str, str]:
+        constitution = str(collected_inputs.get("constitution_input", "")).strip()
+        specification = str(collected_inputs.get("specification_input", "")).strip()
+        clarify_answer = str(collected_inputs.get("clarify_input", "")).strip()
+        plan = str(collected_inputs.get("plan_input", "")).strip()
+        clarify_sections: list[str] = []
+        if clarify_questions:
+            clarify_sections.append("## 待确认问题")
+            clarify_sections.extend(f"- {item}" for item in clarify_questions)
+        if clarify_answer:
+            clarify_sections.append("")
+            clarify_sections.append("## 用户回答")
+            clarify_sections.append(clarify_answer)
+        return {
+            "assistant_message": "已根据现有输入生成四份基础文档，请确认并补充待确认项。",
+            "constitution_markdown": constitution or "## 待确认项\n- 核心目标与基调待补充。",
+            "clarify_markdown": "\n".join(clarify_sections).strip() or "## 待确认项\n- 澄清信息不足。",
+            "specification_markdown": specification or "## 待确认项\n- 规格约束（篇幅/节奏/结局）待补充。",
+            "plan_markdown": plan or "## 待确认项\n- 执行计划与里程碑待补充。",
+            "diff_summary": "",
+        }
+
     def _chat_global_prompt(self, project_id: str, message: str, *, route: str) -> str:
         nodes = self.graph_service.list_nodes(project_id)
         edges = self.graph_service.list_edges(project_id)
@@ -1609,7 +2323,7 @@ class AIService:
             edge_lines.append(
                 f"{index}. {edge.source_id} -> {edge.target_id} label={edge.label or '-'}"
             )
-        return self._render_prompt_template(
+        prompt = self._render_prompt_template(
             "chat_global_prompt",
             fallback_key="ai.chat.global_prompt",
             route=route,
@@ -1619,6 +2333,7 @@ class AIService:
             nodes="\n".join(node_lines) if node_lines else "-",
             edges="\n".join(edge_lines) if edge_lines else "-",
         )
+        return prompt
 
     def _chat_planner_prompt(
         self,
@@ -1627,13 +2342,18 @@ class AIService:
         context: ContextPack,
         user_message: str,
         *,
+        conversation_context: str = "",
         token_budget: int,
     ) -> tuple[str, PromptBundle]:
+        request_text = str(user_message or "").strip()
+        context_text = str(conversation_context or "").strip()
+        if context_text:
+            request_text = f"{request_text}\n\n{context_text}"
         instruction = self._render_prompt_template(
             "chat_planner_prompt",
             fallback_key="ai.chat.planner_prompt",
             title=node.title,
-            request=user_message,
+            request=request_text,
             context="(see structured context sections below)",
         )
         bundle = self._build_prompt_bundle(
@@ -1644,7 +2364,10 @@ class AIService:
             task_mode="generate",
             task_type="chat_plan",
             task_instruction=instruction,
-            extra_node_context={"user_request": user_message},
+            extra_node_context={
+                "user_request": str(user_message or ""),
+                "conversation_context": context_text,
+            },
         )
         return bundle.final_prompt, bundle
 
@@ -1815,15 +2538,20 @@ class AIService:
         user_message: str,
         metadata: dict[str, Any],
         *,
+        conversation_context: str = "",
         token_budget: int,
     ) -> tuple[str, PromptBundle]:
         current_content = str(metadata.get("content", "")).strip() or tr("ai.chat.empty_fallback")
         current_outline = str(metadata.get("outline_markdown", "")).strip() or tr("ai.chat.empty_fallback")
+        request_text = str(user_message or "").strip()
+        context_text = str(conversation_context or "").strip()
+        if context_text:
+            request_text = f"{request_text}\n\n{context_text}"
         instruction = self._render_prompt_template(
             "chat_writer_prompt",
             fallback_key="ai.chat.writer_prompt",
             title=node.title,
-            request=user_message,
+            request=request_text,
             current_outline=current_outline,
             current_content=current_content,
             context="(see structured context sections below)",
@@ -1836,10 +2564,11 @@ class AIService:
             task_mode="correct",
             task_type="chat_writer",
             task_instruction=instruction,
-            user_correction=user_message,
+            user_correction=str(user_message or ""),
             extra_node_context={
                 "current_outline": current_outline,
                 "current_content_excerpt": current_content[:1000],
+                "conversation_context": context_text,
             },
         )
         return bundle.final_prompt, bundle
@@ -2254,18 +2983,1049 @@ class AIService:
             if route_provider:
                 adapter = self._adapter_for_provider(route_provider)
         merged_platform_config.update(platform_config)
-        request = LLMRequest(
+        if self._tool_loop_enabled(
             task_type=task_type,
-            system_prompt=self._build_system_prompt(project_id),
-            messages=[LLMMessage(role="user", content=prompt)],
+            project_id=project_id,
             platform_config=merged_platform_config,
-        )
-        response = adapter.generate(request)
+        ):
+            response = self._generate_with_tool_loop(
+                adapter=adapter,
+                task_type=task_type,
+                prompt=prompt,
+                platform_config=merged_platform_config,
+                project_id=project_id,
+            )
+        else:
+            request = LLMRequest(
+                task_type=task_type,
+                system_prompt=self._build_system_prompt(project_id),
+                messages=[LLMMessage(role="user", content=prompt)],
+                platform_config=merged_platform_config,
+            )
+            response = adapter.generate(request)
         if not response.ok:
             code = response.error_code or "generic"
             detail = response.error_message or tr("ai.error.llm_request_failed")
             raise RuntimeError(tr("ai.error.llm_request_failed_with_code", code=code, detail=detail))
         return response
+
+    def _tool_loop_enabled(
+        self,
+        *,
+        task_type: str,
+        project_id: str | None,
+        platform_config: dict[str, Any],
+    ) -> bool:
+        limits = self._tool_loop_limits(project_id=project_id, platform_config=platform_config)
+        if not bool(limits.get("enabled", True)):
+            return False
+        if bool(platform_config.get("disable_tool_loop", False)):
+            return False
+        if bool(platform_config.get("enable_tool_loop", False)):
+            return True
+        if project_id and self._strict_json_fence_output_enabled(project_id):
+            return False
+        enabled_tasks = {"generate_chapter", "chapter_write", "chapter_correction", "chat_writer"}
+        return task_type in enabled_tasks
+
+    def _tool_loop_limits(
+        self,
+        *,
+        project_id: str | None,
+        platform_config: dict[str, Any],
+    ) -> dict[str, Any]:
+        def _as_bool(value: Any, fallback: bool) -> bool:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return bool(value)
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {"1", "true", "yes", "on"}:
+                    return True
+                if normalized in {"0", "false", "no", "off"}:
+                    return False
+            return fallback
+
+        def _as_int(value: Any, fallback: int, *, lower: int, upper: int) -> int:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                parsed = fallback
+            if parsed < lower:
+                return lower
+            if parsed > upper:
+                return upper
+            return parsed
+
+        enabled = True
+        max_rounds = self._tool_loop_max_rounds
+        max_calls_per_round = self._tool_loop_max_calls_per_round
+        single_read_char_limit = self._tool_loop_single_read_char_limit
+        total_read_char_limit = self._tool_loop_total_read_char_limit
+        no_progress_limit = self._tool_loop_no_progress_limit
+        write_proposal_enabled = self._tool_write_proposal_enabled
+        if project_id:
+            settings = self._project_settings(project_id)
+            enabled = bool(getattr(settings, "agent_tool_loop_enabled", enabled))
+            max_rounds = int(getattr(settings, "agent_tool_loop_max_rounds", max_rounds))
+            max_calls_per_round = int(
+                getattr(settings, "agent_tool_loop_max_calls_per_round", max_calls_per_round)
+            )
+            single_read_char_limit = int(
+                getattr(settings, "agent_tool_loop_single_read_char_limit", single_read_char_limit)
+            )
+            total_read_char_limit = int(
+                getattr(settings, "agent_tool_loop_total_read_char_limit", total_read_char_limit)
+            )
+            no_progress_limit = int(
+                getattr(settings, "agent_tool_loop_no_progress_limit", no_progress_limit)
+            )
+            write_proposal_enabled = bool(
+                getattr(settings, "agent_tool_write_proposal_enabled", write_proposal_enabled)
+            )
+        max_rounds = _as_int(
+            platform_config.get("tool_loop_max_rounds", max_rounds),
+            max_rounds,
+            lower=1,
+            upper=20,
+        )
+        max_calls_per_round = _as_int(
+            platform_config.get("tool_loop_max_calls_per_round", max_calls_per_round),
+            max_calls_per_round,
+            lower=1,
+            upper=20,
+        )
+        single_read_char_limit = _as_int(
+            platform_config.get("tool_loop_single_read_char_limit", single_read_char_limit),
+            single_read_char_limit,
+            lower=200,
+            upper=50000,
+        )
+        total_read_char_limit = _as_int(
+            platform_config.get("tool_loop_total_read_char_limit", total_read_char_limit),
+            total_read_char_limit,
+            lower=1000,
+            upper=200000,
+        )
+        no_progress_limit = _as_int(
+            platform_config.get("tool_loop_no_progress_limit", no_progress_limit),
+            no_progress_limit,
+            lower=1,
+            upper=10,
+        )
+        write_proposal_enabled = _as_bool(
+            platform_config.get("tool_write_proposal_enabled", write_proposal_enabled),
+            write_proposal_enabled,
+        )
+        enabled = _as_bool(platform_config.get("tool_loop_enabled", enabled), enabled)
+        if total_read_char_limit < single_read_char_limit:
+            total_read_char_limit = single_read_char_limit
+        return {
+            "enabled": enabled,
+            "max_rounds": max_rounds,
+            "max_calls_per_round": max_calls_per_round,
+            "single_read_char_limit": single_read_char_limit,
+            "total_read_char_limit": total_read_char_limit,
+            "no_progress_limit": no_progress_limit,
+            "write_proposal_enabled": write_proposal_enabled,
+        }
+
+    def _generate_with_tool_loop(
+        self,
+        *,
+        adapter: Any,
+        task_type: str,
+        prompt: str,
+        platform_config: dict[str, Any],
+        project_id: str | None,
+    ) -> LLMResponse:
+        limits = self._tool_loop_limits(project_id=project_id, platform_config=platform_config)
+        max_rounds = int(limits["max_rounds"])
+        max_calls_per_round = int(limits["max_calls_per_round"])
+        single_read_char_limit = int(limits["single_read_char_limit"])
+        total_read_char_limit = int(limits["total_read_char_limit"])
+        no_progress_limit = int(limits["no_progress_limit"])
+        write_proposal_enabled = bool(limits["write_proposal_enabled"])
+        system_prompt = self._build_system_prompt(project_id)
+        base_prompt = str(prompt or "").strip()
+        tool_result_blocks: list[str] = []
+        round_logs: list[dict[str, Any]] = []
+        tool_logs: list[dict[str, Any]] = []
+        tool_response_cache: dict[str, tuple[Any, int, dict[str, Any]]] = {}
+        evidence_chunk_ids: list[str] = []
+        evidence_seen: set[str] = set()
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+        total_read_chars = 0
+        no_progress_rounds = 0
+        force_final_only = False
+        fallback_content = ""
+        last_response: LLMResponse | None = None
+        final_content = ""
+        agent_name = self._agent_name_for_task(task_type)
+        tool_context_node_id = str(platform_config.get("tool_context_node_id", "") or "").strip()
+        tool_thread_id = str(platform_config.get("tool_thread_id", "") or "").strip()
+        for round_no in range(1, max_rounds + 1):
+            round_prompt = self._build_tool_loop_prompt(
+                base_prompt=base_prompt,
+                round_no=round_no,
+                tool_result_blocks=tool_result_blocks,
+                max_rounds=max_rounds,
+                max_calls_per_round=max_calls_per_round,
+                single_read_char_limit=single_read_char_limit,
+                total_read_char_limit=total_read_char_limit,
+                write_proposal_enabled=write_proposal_enabled,
+                force_final_only=force_final_only,
+            )
+            prompt_hash = hashlib.sha256(round_prompt.encode("utf-8")).hexdigest()
+            request = LLMRequest(
+                task_type=task_type,
+                system_prompt=system_prompt,
+                messages=[LLMMessage(role="user", content=round_prompt)],
+                platform_config=platform_config,
+            )
+            response = adapter.generate(request)
+            if not response.ok:
+                return response
+            last_response = response
+            total_prompt_tokens += int(response.prompt_tokens)
+            total_completion_tokens += int(response.completion_tokens)
+            parsed = self._parse_tool_loop_payload(response.content)
+            parsed_calls = cast(list[dict[str, Any]], parsed["tool_calls"])
+            final_candidate = str(parsed["final_content"] or "").strip()
+            call_budget = max_calls_per_round
+            if force_final_only and not final_candidate:
+                selected_calls: list[dict[str, Any]] = []
+            else:
+                selected_calls = parsed_calls[:call_budget]
+            truncated_calls = len(parsed_calls) > len(selected_calls)
+            round_status = "final"
+            round_had_progress = False
+            if final_candidate:
+                no_progress_rounds = 0
+                round_status = "final"
+            elif selected_calls:
+                for call in selected_calls:
+                    tool_name = str(call.get("name", "")).strip().lower()
+                    args = call.get("arguments")
+                    if not isinstance(args, dict):
+                        args = {}
+                    started = time.perf_counter()
+                    result_payload, read_chars, result_meta = self._execute_tool_call(
+                        tool_name=tool_name,
+                        arguments=args,
+                        project_id=project_id or "",
+                        tool_context_node_id=tool_context_node_id,
+                        tool_thread_id=tool_thread_id,
+                        write_proposal_enabled=write_proposal_enabled,
+                        tool_response_cache=tool_response_cache,
+                        single_read_char_limit=single_read_char_limit,
+                        total_read_char_limit=total_read_char_limit,
+                        total_read_chars=total_read_chars,
+                    )
+                    elapsed_ms = int((time.perf_counter() - started) * 1000)
+                    if int(read_chars) > 0:
+                        total_read_chars += int(read_chars)
+                        round_had_progress = True
+                    result_meta = dict(result_meta)
+                    result_meta["duration_ms"] = elapsed_ms
+                    result_meta["total_read_chars"] = total_read_chars
+                    result_meta["read_chars"] = int(read_chars)
+                    result_evidence = result_meta.get("evidence_chunk_ids")
+                    if isinstance(result_evidence, list):
+                        for chunk_id in result_evidence:
+                            clean_chunk_id = str(chunk_id).strip()
+                            if not clean_chunk_id or clean_chunk_id in evidence_seen:
+                                continue
+                            evidence_seen.add(clean_chunk_id)
+                            evidence_chunk_ids.append(clean_chunk_id)
+                    if bool(result_meta.get("proposal_created", False)):
+                        round_had_progress = True
+                    tool_logs.append(
+                        {
+                            "round_no": round_no,
+                            "task_type": task_type,
+                            "agent": agent_name,
+                            "tool_name": tool_name,
+                            "args": args,
+                            "result_meta": result_meta,
+                            "created_at": utc_now().isoformat(),
+                        }
+                    )
+                    tool_result_blocks.append(
+                        self._tool_result_for_prompt(
+                            round_no=round_no,
+                            tool_name=tool_name,
+                            arguments=args,
+                            result_payload=result_payload,
+                        )
+                    )
+                # Keep prompt growth bounded while preserving most recent context.
+                if len(tool_result_blocks) > 12:
+                    tool_result_blocks = tool_result_blocks[-12:]
+                if round_had_progress:
+                    no_progress_rounds = 0
+                else:
+                    no_progress_rounds += 1
+                if (
+                    no_progress_rounds >= no_progress_limit
+                    and round_no < max_rounds
+                    and not force_final_only
+                ):
+                    force_final_only = True
+                    fallback_content = (
+                        "工具调用连续无新增有效信息，已切换为阶段性收敛模式。"
+                    )
+                    tool_result_blocks.append(
+                        "[SystemNote] No new information in consecutive rounds."
+                        " Return final answer without any tool_calls."
+                    )
+                    round_status = "force_finalize"
+                elif round_no < max_rounds:
+                    round_status = "tool_calls"
+                else:
+                    round_status = "max_rounds_reached"
+            elif force_final_only and not final_candidate:
+                round_status = "force_finalize_no_final"
+            round_logs.append(
+                {
+                    "round_no": round_no,
+                    "task_type": task_type,
+                    "agent": agent_name,
+                    "prompt_hash": prompt_hash,
+                    "prompt_tokens": int(response.prompt_tokens),
+                    "completion_tokens": int(response.completion_tokens),
+                    "status": (
+                        "tool_calls_limited"
+                        if truncated_calls and round_status == "tool_calls"
+                        else round_status
+                    ),
+                    "created_at": utc_now().isoformat(),
+                }
+            )
+            if round_status in {"tool_calls", "force_finalize"}:
+                continue
+            if force_final_only and not final_candidate:
+                final_content = fallback_content or "已达到无进展阈值，请给出阶段性结论。"
+            else:
+                final_content = final_candidate or str(response.content or "").strip()
+            break
+        if last_response is None:
+            return LLMResponse(
+                ok=False,
+                content="",
+                error_code="generic",
+                error_message="tool loop ended without response",
+                provider="unknown",
+            )
+        final_raw = dict(last_response.raw) if isinstance(last_response.raw, dict) else {}
+        final_raw["agent_loop_rounds"] = round_logs
+        final_raw["agent_tool_calls"] = tool_logs
+        final_raw["tool_loop_total_read_chars"] = total_read_chars
+        final_raw["tool_evidence_chunk_ids"] = evidence_chunk_ids
+        final_raw["tool_loop_limits"] = {
+            "max_rounds": max_rounds,
+            "max_calls_per_round": max_calls_per_round,
+            "single_read_char_limit": single_read_char_limit,
+            "total_read_char_limit": total_read_char_limit,
+            "no_progress_limit": no_progress_limit,
+            "write_proposal_enabled": write_proposal_enabled,
+        }
+        final_raw["agent_loop_metrics"] = self._build_agent_loop_metrics(
+            round_logs=round_logs,
+            tool_logs=tool_logs,
+            total_read_chars=total_read_chars,
+            evidence_chunk_count=len(evidence_chunk_ids),
+        )
+        return LLMResponse(
+            ok=True,
+            content=final_content or str(last_response.content or "").strip(),
+            reasoning=last_response.reasoning,
+            prompt_tokens=total_prompt_tokens,
+            completion_tokens=total_completion_tokens,
+            provider=last_response.provider,
+            raw=final_raw,
+        )
+
+    def _build_tool_loop_prompt(
+        self,
+        *,
+        base_prompt: str,
+        round_no: int,
+        tool_result_blocks: list[str],
+        max_rounds: int,
+        max_calls_per_round: int,
+        single_read_char_limit: int,
+        total_read_char_limit: int,
+        write_proposal_enabled: bool,
+        force_final_only: bool,
+    ) -> str:
+        tool_names = [
+            "search_text",
+            "read_chunk",
+            "read_neighbors",
+            "get_chapter_outline",
+            "get_world_state",
+            "get_effective_directives",
+        ]
+        if write_proposal_enabled:
+            tool_names.append("propose_setting_change")
+        lines: list[str] = [str(base_prompt or "").strip(), ""]
+        lines.extend(
+            [
+                "[ToolLoopContract]",
+                "You may either provide final answer directly, or return JSON object:",
+                '{"tool_calls":[{"name":"search_text","arguments":{"query":"...","top_k":5}}],'
+                '"final_answer":"..."}',
+                "Allowed tools: " + ", ".join(tool_names) + ".",
+                (
+                    "Limits: "
+                    f"max_rounds={max_rounds}, "
+                    f"max_tool_calls_per_round={max_calls_per_round}, "
+                    f"single_read_char_limit={single_read_char_limit}, "
+                    f"total_read_char_limit={total_read_char_limit}."
+                ),
+                "When using source text, include chunk_id references in final answer if possible.",
+            ]
+        )
+        if force_final_only:
+            lines.extend(
+                [
+                    "",
+                    "[FinalizationMode]",
+                    "Do not call tools. Return final_answer directly with current evidence.",
+                ]
+            )
+        if tool_result_blocks:
+            lines.extend(["", f"[ToolResults:Round{round_no - 1}]", *tool_result_blocks[-8:]])
+            lines.extend(["", "If information is enough now, output final answer directly."])
+        return "\n".join(lines).strip()
+
+    def _parse_tool_loop_payload(self, text: str) -> dict[str, Any]:
+        payload = self._parse_outline_guide_payload(str(text or ""), strict_json_fence=False)
+        if not payload:
+            return {"tool_calls": [], "final_content": str(text or "").strip()}
+        raw_calls = payload.get("tool_calls")
+        calls: list[dict[str, Any]] = []
+        if isinstance(raw_calls, list):
+            for item in raw_calls:
+                if not isinstance(item, dict):
+                    continue
+                name = str(
+                    item.get("name")
+                    or item.get("tool")
+                    or item.get("tool_name")
+                    or ""
+                ).strip()
+                if not name:
+                    continue
+                raw_args = item.get("arguments", item.get("args", {}))
+                if isinstance(raw_args, str):
+                    try:
+                        loaded = json.loads(raw_args)
+                    except Exception:
+                        loaded = {}
+                    raw_args = loaded
+                if not isinstance(raw_args, dict):
+                    raw_args = {}
+                calls.append({"name": name.lower(), "arguments": raw_args})
+        final_content = str(
+            payload.get("final_answer")
+            or payload.get("final_content")
+            or payload.get("content")
+            or payload.get("answer")
+            or ""
+        ).strip()
+        return {"tool_calls": calls, "final_content": final_content}
+
+    def _normalize_tool_call_arguments(
+        self,
+        *,
+        tool_name: str,
+        arguments: dict[str, Any],
+        tool_context_node_id: str,
+    ) -> tuple[dict[str, Any], str]:
+        normalized = str(tool_name or "").strip().lower()
+        raw = arguments if isinstance(arguments, dict) else {}
+
+        def _clean_text(value: Any, *, limit: int = 4000) -> str:
+            text = str(value or "").strip()
+            if len(text) > limit:
+                return text[:limit]
+            return text
+
+        def _as_int(value: Any, fallback: int, *, lower: int, upper: int) -> int:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                parsed = fallback
+            if parsed < lower:
+                return lower
+            if parsed > upper:
+                return upper
+            return parsed
+
+        if normalized == "search_text":
+            query = _clean_text(raw.get("query") or raw.get("q"), limit=300)
+            if not query:
+                return {}, "query is required"
+            top_k = _as_int(raw.get("top_k", 5), 5, lower=1, upper=20)
+            scope_raw = raw.get("scope")
+            scope: dict[str, Any] = {}
+            if isinstance(scope_raw, dict):
+                node_id = _clean_text(scope_raw.get("node_id"), limit=128)
+                if node_id:
+                    scope["node_id"] = node_id
+                node_ids = scope_raw.get("node_ids")
+                if isinstance(node_ids, list):
+                    normalized_ids = [
+                        _clean_text(item, limit=128)
+                        for item in node_ids
+                        if _clean_text(item, limit=128)
+                    ]
+                    if normalized_ids:
+                        scope["node_ids"] = normalized_ids[:30]
+            return {"query": query, "top_k": top_k, "scope": scope}, ""
+        if normalized == "read_chunk":
+            chunk_id = _clean_text(raw.get("chunk_id"), limit=160)
+            if not chunk_id:
+                return {}, "chunk_id is required"
+            return {"chunk_id": chunk_id}, ""
+        if normalized == "read_neighbors":
+            chunk_id = _clean_text(raw.get("chunk_id"), limit=160)
+            if not chunk_id:
+                return {}, "chunk_id is required"
+            before = _as_int(raw.get("before", 1), 1, lower=0, upper=10)
+            after = _as_int(raw.get("after", 1), 1, lower=0, upper=10)
+            return {"chunk_id": chunk_id, "before": before, "after": after}, ""
+        if normalized == "get_chapter_outline":
+            node_id = _clean_text(raw.get("node_id") or tool_context_node_id, limit=128)
+            if not node_id:
+                return {}, "node_id is required"
+            return {"node_id": node_id}, ""
+        if normalized == "get_world_state":
+            keys = raw.get("keys")
+            if keys is None:
+                keys = raw
+            if not isinstance(keys, dict):
+                keys = {}
+            normalized_keys: dict[str, Any] = {}
+            for key in ("character_ids", "item_ids", "world_variable_keys"):
+                value = keys.get(key)
+                if not isinstance(value, list):
+                    continue
+                cleaned = [_clean_text(item, limit=128) for item in value]
+                cleaned = [item for item in cleaned if item]
+                if cleaned:
+                    normalized_keys[key] = cleaned[:30]
+            rel_pairs = keys.get("relationship_pairs")
+            if isinstance(rel_pairs, list):
+                normalized_pairs: list[dict[str, str]] = []
+                for item in rel_pairs:
+                    if isinstance(item, dict):
+                        left = _clean_text(item.get("subject") or item.get("a"), limit=128)
+                        right = _clean_text(item.get("object") or item.get("b"), limit=128)
+                        if left and right:
+                            normalized_pairs.append({"subject": left, "object": right})
+                    elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                        left = _clean_text(item[0], limit=128)
+                        right = _clean_text(item[1], limit=128)
+                        if left and right:
+                            normalized_pairs.append({"subject": left, "object": right})
+                if normalized_pairs:
+                    normalized_keys["relationship_pairs"] = normalized_pairs[:30]
+            return {"keys": normalized_keys}, ""
+        if normalized == "get_effective_directives":
+            target_project_id = _clean_text(raw.get("project_id"), limit=128)
+            return {"project_id": target_project_id}, ""
+        if normalized == "propose_setting_change":
+            target_scope = _clean_text(raw.get("target_scope") or "project", limit=32).lower()
+            if target_scope not in {"project", "global"}:
+                target_scope = "project"
+            proposal_type = _clean_text(raw.get("proposal_type") or "global_directive", limit=64)
+            directive_text = _clean_text(
+                raw.get("directive_text") or raw.get("content") or raw.get("value"),
+                limit=4000,
+            )
+            if not directive_text:
+                return {}, "directive_text is required"
+            note = _clean_text(raw.get("note") or raw.get("reason"), limit=400)
+            return {
+                "target_scope": target_scope,
+                "proposal_type": proposal_type or "global_directive",
+                "directive_text": directive_text,
+                "note": note,
+            }, ""
+        return {}, "unknown_tool"
+
+    def _tool_cache_key(
+        self,
+        *,
+        tool_name: str,
+        project_id: str,
+        arguments: dict[str, Any],
+    ) -> str:
+        cache_payload = {
+            "tool": str(tool_name or "").strip().lower(),
+            "project_id": str(project_id or "").strip(),
+            "arguments": arguments,
+        }
+        return hashlib.sha256(
+            json.dumps(cache_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
+    def _execute_tool_call(
+        self,
+        *,
+        tool_name: str,
+        arguments: dict[str, Any],
+        project_id: str,
+        tool_context_node_id: str,
+        tool_thread_id: str,
+        write_proposal_enabled: bool,
+        tool_response_cache: dict[str, tuple[Any, int, dict[str, Any]]],
+        single_read_char_limit: int,
+        total_read_char_limit: int,
+        total_read_chars: int,
+    ) -> tuple[Any, int, dict[str, Any]]:
+        normalized = str(tool_name or "").strip().lower()
+        normalized_args, args_error = self._normalize_tool_call_arguments(
+            tool_name=normalized,
+            arguments=arguments,
+            tool_context_node_id=tool_context_node_id,
+        )
+        if args_error:
+            reason = "unknown_tool" if args_error == "unknown_tool" else "invalid_arguments"
+            return (
+                {"error": args_error, "tool": normalized},
+                0,
+                {"ok": False, "reason": reason, "error": args_error},
+            )
+        cacheable_tools = {"search_text", "read_chunk", "read_neighbors", "get_chapter_outline", "get_world_state"}
+        cache_key = self._tool_cache_key(
+            tool_name=normalized,
+            project_id=project_id,
+            arguments=normalized_args,
+        )
+        if normalized in cacheable_tools and cache_key in tool_response_cache:
+            cached_payload, _cached_read_chars, cached_meta = tool_response_cache[cache_key]
+            next_meta = dict(cached_meta)
+            next_meta["cache_hit"] = True
+            next_meta["cached_read_chars"] = int(_cached_read_chars)
+            return cached_payload, 0, next_meta
+        try:
+            if normalized == "search_text":
+                hits = self.readable_tool_service.search_text(
+                    project_id=project_id,
+                    query=str(normalized_args.get("query", "")),
+                    top_k=int(normalized_args.get("top_k", 5)),
+                    scope=cast(dict[str, Any], normalized_args.get("scope", {})),
+                )
+                returned_chars = sum(len(str(item.get("snippet", ""))) for item in hits)
+                evidence_chunk_ids = [str(item.get("chunk_id", "")).strip() for item in hits]
+                result_meta = {
+                    "ok": True,
+                    "cache_hit": False,
+                    "evidence_chunk_ids": [item for item in evidence_chunk_ids if item],
+                }
+                tool_response_cache[cache_key] = (hits, returned_chars, dict(result_meta))
+                return hits, returned_chars, result_meta
+            if normalized == "read_chunk":
+                chunk_id = str(normalized_args.get("chunk_id", ""))
+                payload = self.readable_tool_service.read_chunk(chunk_id, project_id=project_id)
+                content = str(payload.get("content", ""))
+                truncated = False
+                if len(content) > single_read_char_limit:
+                    payload["content"] = content[:single_read_char_limit]
+                    payload["chars"] = len(str(payload["content"]))
+                    payload["truncated"] = True
+                    payload["original_chars"] = len(content)
+                    truncated = True
+                returned_chars = len(str(payload.get("content", "")))
+                if total_read_chars + returned_chars > total_read_char_limit:
+                    return (
+                        {
+                            "error": "total_read_char_limit_exceeded",
+                            "remaining_chars": max(0, total_read_char_limit - total_read_chars),
+                        },
+                        0,
+                        {"ok": False, "reason": "total_read_char_limit_exceeded"},
+                    )
+                evidence_chunk_id = str(payload.get("chunk_id", "")).strip()
+                result_meta = {
+                    "ok": True,
+                    "truncated": truncated,
+                    "cache_hit": False,
+                    "evidence_chunk_ids": [evidence_chunk_id] if evidence_chunk_id else [],
+                }
+                tool_response_cache[cache_key] = (payload, returned_chars, dict(result_meta))
+                return payload, returned_chars, result_meta
+            if normalized == "read_neighbors":
+                payload = self.readable_tool_service.read_neighbors(
+                    str(normalized_args.get("chunk_id", "")),
+                    project_id=project_id,
+                    before=int(normalized_args.get("before", 1)),
+                    after=int(normalized_args.get("after", 1)),
+                )
+                budget = single_read_char_limit
+                trimmed: list[dict[str, Any]] = []
+                truncated = False
+                returned_chars = 0
+                evidence_chunk_ids: list[str] = []
+                for item in payload:
+                    text = str(item.get("content", ""))
+                    if budget <= 0:
+                        truncated = True
+                        break
+                    take = min(len(text), budget)
+                    if take < len(text):
+                        truncated = True
+                    row = dict(item)
+                    row["content"] = text[:take]
+                    row["chars"] = take
+                    trimmed.append(row)
+                    returned_chars += take
+                    budget -= take
+                    chunk_id = str(row.get("chunk_id", "")).strip()
+                    if chunk_id:
+                        evidence_chunk_ids.append(chunk_id)
+                if total_read_chars + returned_chars > total_read_char_limit:
+                    return (
+                        {
+                            "error": "total_read_char_limit_exceeded",
+                            "remaining_chars": max(0, total_read_char_limit - total_read_chars),
+                        },
+                        0,
+                        {"ok": False, "reason": "total_read_char_limit_exceeded"},
+                    )
+                result_meta = {
+                    "ok": True,
+                    "truncated": truncated,
+                    "cache_hit": False,
+                    "evidence_chunk_ids": evidence_chunk_ids,
+                }
+                tool_response_cache[cache_key] = (trimmed, returned_chars, dict(result_meta))
+                return trimmed, returned_chars, result_meta
+            if normalized == "get_chapter_outline":
+                payload = self.readable_tool_service.get_chapter_outline(
+                    project_id=project_id,
+                    node_id=str(normalized_args.get("node_id", "")),
+                )
+                result_meta = {"ok": True, "cache_hit": False}
+                tool_response_cache[cache_key] = (payload, 0, dict(result_meta))
+                return payload, 0, result_meta
+            if normalized == "get_world_state":
+                payload = self.readable_tool_service.get_world_state(
+                    project_id=project_id,
+                    keys=cast(dict[str, Any], normalized_args.get("keys", {})),
+                )
+                result_meta = {"ok": True, "cache_hit": False}
+                tool_response_cache[cache_key] = (payload, 0, dict(result_meta))
+                return payload, 0, result_meta
+            if normalized == "get_effective_directives":
+                target_project_id = str(normalized_args.get("project_id") or project_id).strip()
+                payload = self.readable_tool_service.get_effective_directives(project_id=target_project_id)
+                return payload, 0, {"ok": True}
+            if normalized == "propose_setting_change":
+                if not write_proposal_enabled:
+                    return (
+                        {"error": "write_proposal_tool_disabled"},
+                        0,
+                        {"ok": False, "reason": "write_proposal_tool_disabled"},
+                    )
+                if self.setting_proposal_service is None:
+                    return (
+                        {"error": "setting_proposal_service_unavailable"},
+                        0,
+                        {"ok": False, "reason": "setting_proposal_service_unavailable"},
+                    )
+                if not str(tool_thread_id).strip():
+                    return (
+                        {"error": "tool_thread_id_required"},
+                        0,
+                        {"ok": False, "reason": "tool_thread_id_required"},
+                    )
+                proposal = self.setting_proposal_service.create_from_agent_tool(
+                    project_id=project_id,
+                    node_id=str(tool_context_node_id or ""),
+                    thread_id=str(tool_thread_id),
+                    proposal_type=str(normalized_args.get("proposal_type", "global_directive")),
+                    target_scope=str(normalized_args.get("target_scope", "project")),
+                    directive_text=str(normalized_args.get("directive_text", "")).strip(),
+                    note=str(normalized_args.get("note", "")).strip(),
+                )
+                payload = {
+                    "proposal_id": str(proposal.get("id", "")),
+                    "status": str(proposal.get("status", "")),
+                    "proposal_type": str(proposal.get("proposal_type", "")),
+                    "target_scope": str(proposal.get("target_scope", "")),
+                    "requires_human_review": True,
+                }
+                return payload, 0, {
+                    "ok": True,
+                    "proposal_created": True,
+                    "proposal_id": str(proposal.get("id", "")),
+                }
+            return (
+                {"error": f"unknown_tool:{normalized}"},
+                0,
+                {"ok": False, "reason": "unknown_tool"},
+            )
+        except Exception as exc:
+            return (
+                {"error": str(exc)},
+                0,
+                {"ok": False, "reason": "execution_error", "error": str(exc)},
+            )
+
+    def _tool_result_for_prompt(
+        self,
+        *,
+        round_no: int,
+        tool_name: str,
+        arguments: dict[str, Any],
+        result_payload: Any,
+    ) -> str:
+        args_json = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+        if len(args_json) > 320:
+            args_json = args_json[:320] + "...(truncated)"
+        result_json = json.dumps(result_payload, ensure_ascii=False, sort_keys=True)
+        if len(result_json) > 1200:
+            result_json = result_json[:1200] + "...(truncated)"
+        return (
+            f"round={round_no} tool={tool_name}\n"
+            f"args={args_json}\n"
+            f"result={result_json}"
+        )
+
+    def _build_agent_loop_metrics(
+        self,
+        *,
+        round_logs: list[dict[str, Any]],
+        tool_logs: list[dict[str, Any]],
+        total_read_chars: int,
+        evidence_chunk_count: int,
+    ) -> dict[str, Any]:
+        prompt_tokens = 0
+        completion_tokens = 0
+        for item in round_logs:
+            try:
+                prompt_tokens += int(item.get("prompt_tokens", 0))
+            except (TypeError, ValueError):
+                pass
+            try:
+                completion_tokens += int(item.get("completion_tokens", 0))
+            except (TypeError, ValueError):
+                pass
+        tool_errors = 0
+        cache_hits = 0
+        proposal_created = 0
+        truncated_reads = 0
+        for call in tool_logs:
+            result_meta = call.get("result_meta")
+            if not isinstance(result_meta, dict):
+                result_meta = {}
+            if not bool(result_meta.get("ok", False)):
+                tool_errors += 1
+            if bool(result_meta.get("cache_hit", False)):
+                cache_hits += 1
+            if bool(result_meta.get("proposal_created", False)):
+                proposal_created += 1
+            if bool(result_meta.get("truncated", False)):
+                truncated_reads += 1
+        round_statuses = [str(item.get("status", "")) for item in round_logs]
+        return {
+            "round_count": len(round_logs),
+            "tool_call_count": len(tool_logs),
+            "tool_error_count": tool_errors,
+            "cache_hit_count": cache_hits,
+            "proposal_created_count": proposal_created,
+            "truncated_read_count": truncated_reads,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_read_chars": int(total_read_chars),
+            "evidence_chunk_count": int(evidence_chunk_count),
+            "final_status": round_statuses[-1] if round_statuses else "",
+        }
+
+    def _agent_name_for_task(self, task_type: str) -> str:
+        mapping = {
+            "chapter_plan": "planner",
+            "chapter_write": "writer",
+            "chapter_review": "reviewer",
+            "chapter_synthesize": "synthesizer",
+            "chapter_correction": "correction",
+            "generate_chapter": "single",
+            "chat_writer": "writer",
+        }
+        return mapping.get(str(task_type or "").strip(), "single")
+
+    def _extract_agent_loop_audits(
+        self,
+        response: LLMResponse,
+        *,
+        default_task_type: str,
+        default_agent: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        def _as_int(value: Any, *, fallback: int) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return fallback
+
+        raw = response.raw if isinstance(response.raw, dict) else {}
+        raw_rounds = raw.get("agent_loop_rounds")
+        raw_tools = raw.get("agent_tool_calls")
+        rounds: list[dict[str, Any]] = []
+        if isinstance(raw_rounds, list):
+            for item in raw_rounds:
+                if not isinstance(item, dict):
+                    continue
+                rounds.append(
+                    {
+                        "round_no": max(1, _as_int(item.get("round_no", 1), fallback=1)),
+                        "task_type": str(item.get("task_type") or default_task_type),
+                        "agent": str(item.get("agent") or default_agent),
+                        "prompt_hash": str(item.get("prompt_hash") or ""),
+                        "prompt_tokens": max(0, _as_int(item.get("prompt_tokens", 0), fallback=0)),
+                        "completion_tokens": max(
+                            0, _as_int(item.get("completion_tokens", 0), fallback=0)
+                        ),
+                        "status": str(item.get("status") or "final"),
+                        "created_at": str(item.get("created_at") or utc_now().isoformat()),
+                    }
+                )
+        tools: list[dict[str, Any]] = []
+        if isinstance(raw_tools, list):
+            for item in raw_tools:
+                if not isinstance(item, dict):
+                    continue
+                args = item.get("args")
+                if not isinstance(args, dict):
+                    args = {}
+                result_meta = item.get("result_meta")
+                if not isinstance(result_meta, dict):
+                    result_meta = {}
+                tools.append(
+                    {
+                        "round_no": max(1, _as_int(item.get("round_no", 1), fallback=1)),
+                        "task_type": str(item.get("task_type") or default_task_type),
+                        "agent": str(item.get("agent") or default_agent),
+                        "tool_name": str(item.get("tool_name") or ""),
+                        "args": args,
+                        "result_meta": result_meta,
+                        "created_at": str(item.get("created_at") or utc_now().isoformat()),
+                    }
+                )
+        return rounds, tools
+
+    def _extract_agent_loop_meta(self, response: LLMResponse) -> tuple[dict[str, Any], list[str]]:
+        raw = response.raw if isinstance(response.raw, dict) else {}
+        raw_metrics = raw.get("agent_loop_metrics")
+        metrics = dict(raw_metrics) if isinstance(raw_metrics, dict) else {}
+        raw_evidence = raw.get("tool_evidence_chunk_ids")
+        evidence: list[str] = []
+        if isinstance(raw_evidence, list):
+            seen: set[str] = set()
+            for item in raw_evidence:
+                chunk_id = str(item or "").strip()
+                if not chunk_id or chunk_id in seen:
+                    continue
+                seen.add(chunk_id)
+                evidence.append(chunk_id)
+        return metrics, evidence
+
+    def _collect_flow_agent_loop_audits(
+        self,
+        flow_state: WorkflowState,
+        *,
+        workflow_mode: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        rounds: list[dict[str, Any]] = []
+        tools: list[dict[str, Any]] = []
+        if workflow_mode == "multi_agent":
+            specs = [
+                ("planner_response", "chapter_plan", "planner"),
+                ("writer_response", "chapter_write", "writer"),
+                ("reviewer_response", "chapter_review", "reviewer"),
+                ("llm_response", "chapter_synthesize", "synthesizer"),
+            ]
+        else:
+            specs = [("llm_response", "generate_chapter", "single")]
+        for key, task_type, agent in specs:
+            response = flow_state.get(key)
+            if not isinstance(response, LLMResponse):
+                continue
+            item_rounds, item_tools = self._extract_agent_loop_audits(
+                response,
+                default_task_type=task_type,
+                default_agent=agent,
+            )
+            rounds.extend(item_rounds)
+            tools.extend(item_tools)
+        return rounds, tools
+
+    def _collect_flow_agent_loop_meta(
+        self,
+        flow_state: WorkflowState,
+        *,
+        workflow_mode: str,
+    ) -> tuple[dict[str, Any], list[str]]:
+        if workflow_mode == "multi_agent":
+            keys = [
+                "planner_response",
+                "writer_response",
+                "reviewer_response",
+                "llm_response",
+            ]
+        else:
+            keys = ["llm_response"]
+        merged_metrics: dict[str, Any] = {
+            "round_count": 0,
+            "tool_call_count": 0,
+            "tool_error_count": 0,
+            "cache_hit_count": 0,
+            "proposal_created_count": 0,
+            "truncated_read_count": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_read_chars": 0,
+            "evidence_chunk_count": 0,
+            "final_status": "",
+        }
+        evidence: list[str] = []
+        seen: set[str] = set()
+        for key in keys:
+            response = flow_state.get(key)
+            if not isinstance(response, LLMResponse):
+                continue
+            metrics, response_evidence = self._extract_agent_loop_meta(response)
+            for sum_key in (
+                "round_count",
+                "tool_call_count",
+                "tool_error_count",
+                "cache_hit_count",
+                "proposal_created_count",
+                "truncated_read_count",
+                "prompt_tokens",
+                "completion_tokens",
+                "total_read_chars",
+            ):
+                try:
+                    merged_metrics[sum_key] = int(merged_metrics.get(sum_key, 0)) + int(metrics.get(sum_key, 0))
+                except (TypeError, ValueError):
+                    continue
+            status = str(metrics.get("final_status", "")).strip()
+            if status:
+                merged_metrics["final_status"] = status
+            for chunk_id in response_evidence:
+                if chunk_id in seen:
+                    continue
+                seen.add(chunk_id)
+                evidence.append(chunk_id)
+        merged_metrics["evidence_chunk_count"] = len(evidence)
+        return merged_metrics, evidence
 
     def _build_system_prompt(self, project_id: str | None = None) -> str:
         base_prompt = (
@@ -2281,21 +4041,45 @@ class AIService:
         style = str(getattr(settings, "system_prompt_style", "")).strip()
         forbidden = str(getattr(settings, "system_prompt_forbidden", "")).strip()
         notes = str(getattr(settings, "system_prompt_notes", "")).strip()
-        sections: list[str] = []
+        global_directives = str(getattr(settings, "global_directives", "")).strip()
+        constraint_sections: list[str] = []
         if style:
-            sections.append(f"[User Writing Style]\n{style}")
+            constraint_sections.append(f"[User Writing Style]\n{style}")
         if forbidden:
-            sections.append(f"[Forbidden Content]\n{forbidden}")
+            constraint_sections.append(f"[Forbidden Content]\n{forbidden}")
         if notes:
-            sections.append(f"[Additional Notes To Explain]\n{notes}")
-        if not sections:
-            return base_prompt
-        return (
-            f"{base_prompt}\n\n"
-            "[User Constraints]\n"
-            "The following constraints are from current project settings and should be followed.\n\n"
-            + "\n\n".join(sections)
-        )
+            constraint_sections.append(f"[Additional Notes To Explain]\n{notes}")
+        if global_directives:
+            constraint_sections.append(f"[Global Directives]\n{global_directives}")
+
+        docs_sections: list[str] = []
+        constitution = str(getattr(settings, "constitution_markdown", "")).strip()
+        clarify = str(getattr(settings, "clarify_markdown", "")).strip()
+        specification = str(getattr(settings, "specification_markdown", "")).strip()
+        plan = str(getattr(settings, "plan_markdown", "")).strip()
+        if constitution:
+            docs_sections.append(f"[Constitution]\n{constitution}")
+        if clarify:
+            docs_sections.append(f"[Clarify]\n{clarify}")
+        if specification:
+            docs_sections.append(f"[Specification]\n{specification}")
+        if plan:
+            docs_sections.append(f"[Plan]\n{plan}")
+
+        blocks: list[str] = [base_prompt]
+        if constraint_sections:
+            blocks.append(
+                "[User Constraints]\n"
+                "The following constraints are from current project settings and should be followed.\n\n"
+                + "\n\n".join(constraint_sections)
+            )
+        if docs_sections:
+            blocks.append(
+                "[Published Project Workflow Docs]\n"
+                "Treat these as approved baselines unless the user explicitly asks for revision.\n\n"
+                + "\n\n".join(docs_sections)
+            )
+        return "\n\n".join(blocks)
 
     def _build_single_workflow(self):
         graph = StateGraph(WorkflowState)
@@ -2342,6 +4126,7 @@ class AIService:
         branch_count: int = 3,
         workflow_mode: str = "single",
         task_id: str | None = None,
+        tool_thread_id: str = "",
     ) -> WorkflowState:
         payload: WorkflowState = {
             "task_id": task_id or "",
@@ -2352,6 +4137,7 @@ class AIService:
             "style_hint": style_hint,
             "branch_count": branch_count,
             "workflow_mode": workflow_mode,
+            "tool_thread_id": str(tool_thread_id or "").strip(),
         }
         workflow = self._single_workflow
         if task_type == "generate_chapter" and workflow_mode == "multi_agent":
@@ -2418,6 +4204,8 @@ class AIService:
         prompt = state["prompt"]
         token_budget = int(state.get("token_budget", 2200))
         platform_config = {"token_budget": token_budget}
+        platform_config["tool_context_node_id"] = str(state.get("node_id", ""))
+        platform_config["tool_thread_id"] = str(state.get("tool_thread_id", ""))
         if task_type == "generate_branches":
             platform_config["branch_count"] = int(state.get("branch_count", 3))
         response = self._generate(
@@ -2477,7 +4265,11 @@ class AIService:
         response = self._generate(
             task_type="chapter_write",
             prompt=state["writer_prompt"],
-            platform_config={"token_budget": token_budget},
+            platform_config={
+                "token_budget": token_budget,
+                "tool_context_node_id": str(state.get("node_id", "")),
+                "tool_thread_id": str(state.get("tool_thread_id", "")),
+            },
             llm_route=cast(dict[str, Any] | None, state.get("llm_route")),
             project_id=str(state.get("project_id", "")) or None,
         )
