@@ -970,7 +970,7 @@ class SQLiteRepository:
         now_iso = _dump_time(utc_now())
         with self.store.transaction() as conn:
             existing = conn.execute(
-                "SELECT thread_id FROM chat_threads WHERE thread_id = ? LIMIT 1",
+                "SELECT thread_id, project_id FROM chat_threads WHERE thread_id = ? LIMIT 1",
                 (clean_thread,),
             ).fetchone()
             if existing is None:
@@ -982,13 +982,16 @@ class SQLiteRepository:
                     (clean_thread, clean_project, clean_node, now_iso, now_iso),
                 )
             else:
+                existing_project = str(existing["project_id"] or "").strip()
+                if existing_project and existing_project != clean_project:
+                    raise ValueError("thread_id belongs to another project")
                 conn.execute(
                     """
                     UPDATE chat_threads
-                    SET project_id = ?, node_id = ?, updated_at = ?
+                    SET node_id = ?, updated_at = ?
                     WHERE thread_id = ?
                     """,
-                    (clean_project, clean_node, now_iso, clean_thread),
+                    (clean_node, now_iso, clean_thread),
                 )
         return clean_thread
 
@@ -1034,6 +1037,82 @@ class SQLiteRepository:
                 "role": str(row["role"] or ""),
                 "content": str(row["content"] or ""),
                 "created_at": str(row["created_at"] or ""),
+            }
+            for row in rows
+        ]
+
+    def get_chat_thread(self, thread_id: str) -> dict[str, str] | None:
+        clean_thread = str(thread_id or "").strip()
+        if not clean_thread:
+            return None
+        with self.store.read_only() as conn:
+            row = conn.execute(
+                """
+                SELECT thread_id, project_id, node_id, created_at, updated_at
+                FROM chat_threads
+                WHERE thread_id = ?
+                LIMIT 1
+                """,
+                (clean_thread,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "thread_id": str(row["thread_id"] or ""),
+            "project_id": str(row["project_id"] or ""),
+            "node_id": str(row["node_id"] or ""),
+            "created_at": str(row["created_at"] or ""),
+            "updated_at": str(row["updated_at"] or ""),
+        }
+
+    def list_chat_threads(self, project_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        clean_project = str(project_id or "").strip()
+        if not clean_project:
+            return []
+        safe_limit = max(1, min(int(limit), 200))
+        with self.store.read_only() as conn:
+            rows = conn.execute(
+                """
+                SELECT t.thread_id,
+                       t.project_id,
+                       t.node_id,
+                       t.created_at,
+                       t.updated_at,
+                       COALESCE(m.role, '') AS last_role,
+                       COALESCE(m.content, '') AS last_content,
+                       COALESCE(m.created_at, '') AS last_message_at,
+                       COALESCE(mc.message_count, 0) AS message_count
+                FROM chat_threads AS t
+                LEFT JOIN chat_messages AS m
+                    ON m.id = (
+                        SELECT m2.id
+                        FROM chat_messages AS m2
+                        WHERE m2.thread_id = t.thread_id
+                        ORDER BY m2.id DESC
+                        LIMIT 1
+                    )
+                LEFT JOIN (
+                    SELECT thread_id, COUNT(*) AS message_count
+                    FROM chat_messages
+                    GROUP BY thread_id
+                ) AS mc ON mc.thread_id = t.thread_id
+                WHERE t.project_id = ?
+                ORDER BY t.updated_at DESC, t.thread_id DESC
+                LIMIT ?
+                """,
+                (clean_project, safe_limit),
+            ).fetchall()
+        return [
+            {
+                "thread_id": str(row["thread_id"] or ""),
+                "project_id": str(row["project_id"] or ""),
+                "node_id": str(row["node_id"] or ""),
+                "created_at": str(row["created_at"] or ""),
+                "updated_at": str(row["updated_at"] or ""),
+                "last_role": str(row["last_role"] or ""),
+                "last_content": str(row["last_content"] or ""),
+                "last_message_at": str(row["last_message_at"] or ""),
+                "message_count": int(row["message_count"] or 0),
             }
             for row in rows
         ]

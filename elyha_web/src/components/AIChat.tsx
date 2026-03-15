@@ -4,14 +4,16 @@ import {cn} from '../utils';
 import {
   ApiTimeoutError,
   getAgentSession,
+  getProjectChatThreadMessages,
   listAgentSettingProposals,
+  listProjectChatThreads,
   reviewAgentSettingProposalsBatch,
   sendAiChat,
   startAgentSession,
   submitAgentDiffReview,
   submitAgentDecision,
 } from '../api';
-import type {AgentSessionPayload, AiSuggestedOption} from '../types';
+import type {AgentSessionPayload, AiSuggestedOption, ChatMessagePayload, ChatThreadSummary} from '../types';
 import type {TranslationVars} from '../i18n';
 
 interface ChatMessage {
@@ -37,6 +39,7 @@ interface AIChatProps {
   guideMode?: boolean;
   guideDocStatus?: GuideDocStatusItem[];
   onGuideDocReply?: (reply: string) => Promise<void>;
+  onGuideSkipDocumentRequest?: (docType: string) => Promise<boolean>;
   onCreateSuggestionNode?: (option: AiSuggestedOption) => Promise<void>;
   onRefreshProject?: () => Promise<void>;
   onStatus?: (text: string, isError?: boolean) => void;
@@ -68,6 +71,7 @@ const CHAT_MIN_WIDTH = 360;
 const CHAT_MIN_HEIGHT = 420;
 const CHAT_MARGIN = 12;
 const CHAT_MIN_TOP = 56;
+const LAST_CHAT_THREAD_STORAGE_KEY = 'elyha.chat.last_thread_by_project.v1';
 
 function clampNumber(value: number, min: number, max: number): number {
   if (max <= min) {
@@ -120,6 +124,84 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+function getLastThreadForProject(projectId: string): string {
+  const cleanProject = String(projectId || '').trim();
+  if (!cleanProject || typeof window === 'undefined') {
+    return '';
+  }
+  try {
+    const raw = window.localStorage.getItem(LAST_CHAT_THREAD_STORAGE_KEY);
+    if (!raw) {
+      return '';
+    }
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return '';
+    }
+    const value = String((parsed as Record<string, unknown>)[cleanProject] || '').trim();
+    return value;
+  } catch {
+    return '';
+  }
+}
+
+function setLastThreadForProject(projectId: string, threadId: string): void {
+  const cleanProject = String(projectId || '').trim();
+  const cleanThread = String(threadId || '').trim();
+  if (!cleanProject || !cleanThread || typeof window === 'undefined') {
+    return;
+  }
+  try {
+    const raw = window.localStorage.getItem(LAST_CHAT_THREAD_STORAGE_KEY);
+    const parsed = raw ? (JSON.parse(raw) as unknown) : {};
+    const base =
+      parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : {};
+    const next: Record<string, string> = {};
+    for (const [key, value] of Object.entries(base)) {
+      const cleanKey = String(key || '').trim();
+      const cleanValue = String(value || '').trim();
+      if (cleanKey && cleanValue) {
+        next[cleanKey] = cleanValue;
+      }
+    }
+    next[cleanProject] = cleanThread;
+    window.localStorage.setItem(LAST_CHAT_THREAD_STORAGE_KEY, JSON.stringify(next));
+  } catch {
+    // Ignore storage errors and continue with in-memory session.
+  }
+}
+
+function clearLastThreadForProject(projectId: string): void {
+  const cleanProject = String(projectId || '').trim();
+  if (!cleanProject || typeof window === 'undefined') {
+    return;
+  }
+  try {
+    const raw = window.localStorage.getItem(LAST_CHAT_THREAD_STORAGE_KEY);
+    if (!raw) {
+      return;
+    }
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return;
+    }
+    const next: Record<string, string> = {};
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+      const cleanKey = String(key || '').trim();
+      const cleanValue = String(value || '').trim();
+      if (!cleanKey || !cleanValue || cleanKey === cleanProject) {
+        continue;
+      }
+      next[cleanKey] = cleanValue;
+    }
+    window.localStorage.setItem(LAST_CHAT_THREAD_STORAGE_KEY, JSON.stringify(next));
+  } catch {
+    // Ignore storage errors and continue with in-memory session.
+  }
+}
+
 export function AIChat({
   isOpen,
   onClose,
@@ -130,6 +212,7 @@ export function AIChat({
   guideMode = false,
   guideDocStatus = [],
   onGuideDocReply,
+  onGuideSkipDocumentRequest,
   onCreateSuggestionNode,
   onRefreshProject,
   onStatus,
@@ -140,6 +223,10 @@ export function AIChat({
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
   const [chatThreadId, setChatThreadId] = useState('');
+  const [chatThreadProjectId, setChatThreadProjectId] = useState('');
+  const [chatThreads, setChatThreads] = useState<ChatThreadSummary[]>([]);
+  const [threadsBusy, setThreadsBusy] = useState(false);
+  const [restoringThread, setRestoringThread] = useState(false);
   const [allowNodeWrite, setAllowNodeWrite] = useState(false);
   const [agentThreadId, setAgentThreadId] = useState('');
   const [agentSession, setAgentSession] = useState<AgentSessionPayload | null>(null);
@@ -155,6 +242,8 @@ export function AIChat({
   const dragStateRef = useRef<DragState | null>(null);
   const resizeStateRef = useRef<ResizeState | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const chatThreadIdRef = useRef('');
+  const chatThreadProjectIdRef = useRef('');
 
   const clampWindowRect = useCallback((next: ChatWindowRect): ChatWindowRect => {
     const viewport = readViewportSize();
@@ -266,12 +355,118 @@ export function AIChat({
   const lastResetVersionRef = useRef<number | undefined>(resetVersion);
   const guideKickoffRef = useRef('');
 
+  const previewThreadLabel = useCallback(
+    (item: ChatThreadSummary): string => {
+      const cleanId = String(item.thread_id || '').trim();
+      const suffix = cleanId ? cleanId.slice(-8) : '';
+      const count = Math.max(0, Number(item.message_count || 0));
+      const raw = String(item.last_content || '').replace(/\s+/g, ' ').trim();
+      const preview = raw ? raw.slice(0, 28) : t('web.chat.thread_preview_empty');
+      return `${suffix || '-'} · ${count}${t('web.chat.thread_count_suffix')} · ${preview}`;
+    },
+    [t],
+  );
+
+  const toChatMessages = useCallback(
+    (rows: ChatMessagePayload[]): ChatMessage[] => {
+      const normalized = (rows || [])
+        .map((item, index) => {
+          const roleRaw = String(item.role || '').trim().toLowerCase();
+          const role: ChatMessage['role'] =
+            roleRaw === 'assistant' ? 'assistant' : roleRaw === 'user' ? 'user' : 'system';
+          return {
+            id: `${String(item.created_at || '')}-${index}`,
+            role,
+            content: String(item.content || '').trim(),
+          };
+        })
+        .filter((item) => item.content);
+      if (normalized.length > 0) {
+        return normalized;
+      }
+      return [{id: 'boot', role: 'assistant', content: bootMessage}];
+    },
+    [bootMessage],
+  );
+
+  const activeChatThreadId = useMemo(() => {
+    const cleanThread = String(chatThreadId || '').trim();
+    const cleanOwnerProject = String(chatThreadProjectId || '').trim();
+    const cleanCurrentProject = String(projectId || '').trim();
+    if (!cleanThread || !cleanOwnerProject || !cleanCurrentProject) {
+      return '';
+    }
+    if (cleanOwnerProject !== cleanCurrentProject) {
+      return '';
+    }
+    return cleanThread;
+  }, [chatThreadId, chatThreadProjectId, projectId]);
+
+  const refreshChatThreads = useCallback(
+    async (nextThreadId = ''): Promise<ChatThreadSummary[]> => {
+      const cleanProject = String(projectId || '').trim();
+      if (!cleanProject) {
+        setChatThreads([]);
+        return [];
+      }
+      setThreadsBusy(true);
+      try {
+        const payload = await listProjectChatThreads(cleanProject, 80);
+        const rows = Array.isArray(payload.threads) ? payload.threads : [];
+        setChatThreads(rows);
+        const target = String(nextThreadId || '').trim();
+        if (!target) {
+          return rows;
+        }
+        if (!rows.some((item) => String(item.thread_id || '').trim() === target)) {
+          setChatThreadId('');
+          setChatThreadProjectId('');
+          clearLastThreadForProject(cleanProject);
+          return rows;
+        }
+        setChatThreadProjectId(cleanProject);
+        return rows;
+      } catch (error) {
+        const text = errorToText(error, t, t('web.error.unknown'));
+        onStatus?.(t('web.chat.thread_list_failed', {message: text}), true);
+        return [];
+      } finally {
+        setThreadsBusy(false);
+      }
+    },
+    [onStatus, projectId, t],
+  );
+
+  const loadThreadMessages = useCallback(
+    async (threadId: string): Promise<void> => {
+      const cleanProject = String(projectId || '').trim();
+      const cleanThread = String(threadId || '').trim();
+      if (!cleanProject || !cleanThread) {
+        setMessages([{id: 'boot', role: 'assistant', content: bootMessage}]);
+        return;
+      }
+      setBusy(true);
+      try {
+        const payload = await getProjectChatThreadMessages(cleanProject, cleanThread, 120);
+        setMessages(toChatMessages(payload.messages || []));
+      } catch (error) {
+        const text = errorToText(error, t, t('web.error.unknown'));
+        setMessages([{id: 'boot', role: 'assistant', content: bootMessage}]);
+        onStatus?.(t('web.chat.thread_load_failed', {message: text}), true);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [bootMessage, onStatus, projectId, t, toChatMessages],
+  );
+
   const clearCurrentSession = useCallback(
     (notify = true) => {
       setMessages([{id: 'boot', role: 'assistant', content: bootMessage}]);
       setInput('');
       setBusy(false);
       setChatThreadId('');
+      setChatThreadProjectId('');
       setAllowNodeWrite(false);
       setAgentThreadId('');
       setAgentSession(null);
@@ -307,6 +502,14 @@ export function AIChat({
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({behavior: 'smooth'});
   }, [messages]);
+
+  useEffect(() => {
+    chatThreadIdRef.current = String(chatThreadId || '').trim();
+  }, [chatThreadId]);
+
+  useEffect(() => {
+    chatThreadProjectIdRef.current = String(chatThreadProjectId || '').trim();
+  }, [chatThreadProjectId]);
 
   useEffect(() => {
     if (!agentSession) {
@@ -356,7 +559,77 @@ export function AIChat({
   }, [clearCurrentSession, resetVersion]);
 
   useEffect(() => {
+    if (!projectId) {
+      setChatThreads([]);
+      setChatThreadId('');
+      setChatThreadProjectId('');
+      setMessages([{id: 'boot', role: 'assistant', content: bootMessage}]);
+      setInput('');
+      return;
+    }
+    setChatThreads([]);
+    setChatThreadId('');
+    setChatThreadProjectId('');
+    setMessages([{id: 'boot', role: 'assistant', content: bootMessage}]);
+    setInput('');
+    setAllowNodeWrite(false);
+    setAgentThreadId('');
+    setAgentSession(null);
+    setCorrectionInput('');
+    setPersistDirective('');
+    setProposalQueue([]);
+    setSelectedProposalIds([]);
+    guideKickoffRef.current = '';
+  }, [projectId]);
+
+  useEffect(() => {
+    if (!isOpen) {
+      return;
+    }
+    if (!projectId) {
+      setChatThreads([]);
+      return;
+    }
+    setRestoringThread(true);
+    void (async () => {
+      try {
+        const rows = await refreshChatThreads();
+        const cleanProject = String(projectId || '').trim();
+        if (!cleanProject || rows.length === 0) {
+          return;
+        }
+        const current = String(chatThreadIdRef.current || '').trim();
+        const hasCurrent = current && rows.some((item) => String(item.thread_id || '').trim() === current);
+        if (hasCurrent) {
+          if (!chatThreadProjectIdRef.current) {
+            setChatThreadProjectId(cleanProject);
+          }
+          return;
+        }
+        const stored = getLastThreadForProject(cleanProject);
+        const storedValid = stored && rows.some((item) => String(item.thread_id || '').trim() === stored);
+        const fallback = storedValid ? stored : String(rows[0]?.thread_id || '').trim();
+        if (!fallback) {
+          return;
+        }
+        setChatThreadId(fallback);
+        setChatThreadProjectId(cleanProject);
+        setLastThreadForProject(cleanProject, fallback);
+        await loadThreadMessages(fallback);
+      } finally {
+        setRestoringThread(false);
+      }
+    })();
+  }, [isOpen, loadThreadMessages, projectId, refreshChatThreads]);
+
+  useEffect(() => {
     if (!guideMode || !isOpen || !projectId) {
+      return;
+    }
+    if (threadsBusy || restoringThread) {
+      return;
+    }
+    if (activeChatThreadId) {
       return;
     }
     if (messages.length > 1) {
@@ -372,11 +645,15 @@ export function AIChat({
         const response = await sendAiChat({
           project_id: projectId,
           message: t('web.chat.guide_kickoff_request'),
-          thread_id: chatThreadId.trim() || undefined,
+          thread_id: activeChatThreadId || undefined,
+          guide_mode: guideMode,
           token_budget: 1400,
         });
         if (response.thread_id) {
           setChatThreadId(response.thread_id);
+          setChatThreadProjectId(projectId);
+          setLastThreadForProject(projectId, response.thread_id);
+          void refreshChatThreads(response.thread_id);
         }
         setMessages((prev) => [
           ...prev,
@@ -386,8 +663,14 @@ export function AIChat({
             content: response.reply || t('web.chat.empty_reply'),
           },
         ]);
-        if (onGuideDocReply) {
+        if (!guideMode && onGuideDocReply) {
           await onGuideDocReply(response.reply || '');
+        }
+        if (guideMode && response.guide_skip_document && onGuideSkipDocumentRequest) {
+          await onGuideSkipDocumentRequest(response.guide_skip_document);
+        }
+        if (onRefreshProject) {
+          await onRefreshProject();
         }
       } catch (error) {
         const text = errorToText(error, t, t('web.error.unknown'));
@@ -404,7 +687,20 @@ export function AIChat({
         setBusy(false);
       }
     })();
-  }, [chatThreadId, guideMode, isOpen, messages.length, onGuideDocReply, onStatus, projectId, t]);
+  }, [
+    activeChatThreadId,
+    guideMode,
+    isOpen,
+    messages.length,
+    onGuideDocReply,
+    onGuideSkipDocumentRequest,
+    onStatus,
+    projectId,
+    refreshChatThreads,
+    restoringThread,
+    t,
+    threadsBusy,
+  ]);
 
   const appendMessage = (message: ChatMessage) => {
     setMessages((prev) => [...prev, message]);
@@ -434,11 +730,15 @@ export function AIChat({
         project_id: projectId,
         message,
         node_id: allowNodeWrite && selectedNodeId ? selectedNodeId : undefined,
-        thread_id: chatThreadId.trim() || undefined,
+        thread_id: activeChatThreadId || undefined,
+        guide_mode: guideMode,
         token_budget: 1800,
       });
       if (response.thread_id) {
         setChatThreadId(response.thread_id);
+        setChatThreadProjectId(projectId);
+        setLastThreadForProject(projectId, response.thread_id);
+        void refreshChatThreads(response.thread_id);
       }
 
       appendMessage({
@@ -448,15 +748,18 @@ export function AIChat({
         suggestions: response.suggested_options || [],
       });
 
-      if (onGuideDocReply) {
+      if (!guideMode && onGuideDocReply) {
         await onGuideDocReply(response.reply || '');
+      }
+      if (guideMode && response.guide_skip_document && onGuideSkipDocumentRequest) {
+        await onGuideSkipDocumentRequest(response.guide_skip_document);
       }
 
       if (response.updated_node_id) {
         onStatus?.(t('web.toast.ai_node_updated', {node: response.updated_node_id}), false);
-        if (onRefreshProject) {
-          await onRefreshProject();
-        }
+      }
+      if (onRefreshProject) {
+        await onRefreshProject();
       }
     } catch (error) {
       const text = errorToText(error, t, t('web.error.unknown'));
@@ -703,6 +1006,21 @@ export function AIChat({
   const sessionStatus = String(agentSession?.status || '').trim();
   const pendingStateUpdateCount = Number(agentSession?.pending_state_update_count || 0);
 
+  const selectChatThread = useCallback(
+    async (nextThreadId: string) => {
+      const clean = String(nextThreadId || '').trim();
+      if (!clean) {
+        clearCurrentSession(false);
+        return;
+      }
+      setChatThreadId(clean);
+      setChatThreadProjectId(String(projectId || '').trim());
+      setLastThreadForProject(projectId, clean);
+      await loadThreadMessages(clean);
+    },
+    [clearCurrentSession, loadThreadMessages, projectId],
+  );
+
   return (
     <div
       className={cn(
@@ -807,6 +1125,28 @@ export function AIChat({
           ) : (
             <span className="text-[11px] text-slate-500">{t('web.chat.guide_step_hint')}</span>
           )}
+        </div>
+        <div className="mt-2 flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => clearCurrentSession(true)}
+            className="h-8 px-3 rounded-md border border-slate-200 bg-white hover:bg-slate-100 text-[11px] font-medium"
+          >
+            {t('web.chat.new_conversation')}
+          </button>
+          <select
+            value={chatThreadId}
+            onChange={(event) => void selectChatThread(event.target.value)}
+            disabled={threadsBusy || busy || !projectId}
+            className="flex-1 h-8 rounded-md border border-slate-200 bg-white px-2 text-[11px] disabled:opacity-60"
+          >
+            <option value="">{t('web.chat.thread_current_new')}</option>
+            {chatThreads.map((item) => (
+              <option key={item.thread_id} value={item.thread_id}>
+                {previewThreadLabel(item)}
+              </option>
+            ))}
+          </select>
         </div>
       </div>
 

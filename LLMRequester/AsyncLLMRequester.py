@@ -20,6 +20,7 @@ from ModuleFolders.Base.Base import Base
 from ModuleFolders.Infrastructure.LLMRequester.AsyncOpenaiRequester import AsyncOpenaiRequester
 from ModuleFolders.Infrastructure.LLMRequester.ErrorClassifier import ErrorClassifier, ErrorType
 from ModuleFolders.Infrastructure.LLMRequester.AsyncSignalHub import get_signal_hub
+from ModuleFolders.Infrastructure.LLMRequester.LLMClientFactory import LLMClientFactory
 
 
 class AsyncLLMRequester(Base):
@@ -82,6 +83,152 @@ class AsyncLLMRequester(Base):
             await cls._session.close()
             cls._session = None
 
+    def _normalize_transport(self, platform_config: dict) -> str:
+        raw = str(platform_config.get("llm_transport", "") or "").strip().lower()
+        if raw in {"openai_sdk", "openai-client", "openai_client"}:
+            return "openai"
+        if raw in {"anthropic_sdk", "anthropic-client", "anthropic_client"}:
+            return "anthropic"
+        if raw in {"httpx", "openai", "anthropic"}:
+            return raw
+        return "httpx"
+
+    @staticmethod
+    def _parse_tool_arguments(raw_args) -> dict:
+        if isinstance(raw_args, dict):
+            return raw_args
+        if isinstance(raw_args, str):
+            try:
+                parsed = json.loads(raw_args)
+            except Exception:
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
+
+    def _extract_anthropic_content(self, content_blocks: list[dict]) -> tuple[str, str, list[dict]]:
+        response_content = ""
+        response_think = ""
+        tool_calls: list[dict] = []
+        for block in content_blocks:
+            block_type = str(block.get("type", "") or "").strip().lower()
+            if block_type == "text":
+                response_content += str(block.get("text", "") or "")
+            elif block_type == "thinking":
+                response_think += str(block.get("thinking", "") or "")
+            elif block_type == "tool_use":
+                name = str(block.get("name", "") or "").strip()
+                if name:
+                    tool_calls.append(
+                        {
+                            "name": name,
+                            "arguments": self._parse_tool_arguments(block.get("input", {})),
+                        }
+                    )
+        return response_think, response_content, tool_calls
+
+    @staticmethod
+    def _build_tool_call_response(tool_calls: list[dict], content_text: str = "") -> str:
+        payload: dict = {"action": "tool_calls", "tool_calls": tool_calls}
+        clean = str(content_text or "").strip()
+        if clean:
+            payload["final_answer"] = clean
+        return json.dumps(payload, ensure_ascii=False)
+
+    @staticmethod
+    def _normalize_openai_tool_choice(raw_choice):
+        if raw_choice is None:
+            return None
+        if isinstance(raw_choice, str):
+            text = raw_choice.strip().lower()
+            if text in {"auto", "none", "required"}:
+                return text
+            return raw_choice
+        if isinstance(raw_choice, dict):
+            choice_type = str(raw_choice.get("type", "")).strip().lower()
+            if choice_type in {"auto", "none", "required"}:
+                return choice_type
+            return raw_choice
+        return raw_choice
+
+    @staticmethod
+    def _normalize_anthropic_tool_choice(raw_choice):
+        if raw_choice is None:
+            return {"type": "auto"}
+        if isinstance(raw_choice, str):
+            text = raw_choice.strip().lower()
+            if text in {"auto", "any"}:
+                return {"type": text}
+            if text == "none":
+                return {"type": "auto"}
+            return {"type": "tool", "name": raw_choice}
+        if isinstance(raw_choice, dict):
+            choice_type = str(raw_choice.get("type", "")).strip().lower()
+            if choice_type in {"auto", "any"}:
+                return {"type": choice_type}
+            if choice_type == "none":
+                return {"type": "auto"}
+            if choice_type == "tool":
+                name = str(raw_choice.get("name", "")).strip()
+                if name:
+                    return {"type": "tool", "name": name}
+            return raw_choice
+        return {"type": "auto"}
+
+    def _build_openai_function_tools(self, platform_config: dict) -> list[dict]:
+        raw_tools = platform_config.get("native_tools")
+        if not isinstance(raw_tools, list):
+            return []
+        tools: list[dict] = []
+        for item in raw_tools:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            if not name:
+                continue
+            description = str(item.get("description", "") or "")
+            input_schema = item.get("input_schema")
+            if not isinstance(input_schema, dict):
+                input_schema = item.get("parameters")
+            if not isinstance(input_schema, dict):
+                input_schema = {"type": "object", "properties": {}}
+            tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": description,
+                        "parameters": input_schema,
+                    },
+                }
+            )
+        return tools
+
+    def _build_anthropic_tools(self, platform_config: dict) -> list[dict]:
+        raw_tools = platform_config.get("native_tools")
+        if not isinstance(raw_tools, list):
+            return []
+        tools: list[dict] = []
+        for item in raw_tools:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            if not name:
+                continue
+            description = str(item.get("description", "") or "")
+            input_schema = item.get("input_schema")
+            if not isinstance(input_schema, dict):
+                input_schema = item.get("parameters")
+            if not isinstance(input_schema, dict):
+                input_schema = {"type": "object", "properties": {}}
+            tools.append(
+                {
+                    "name": name,
+                    "description": description,
+                    "input_schema": input_schema,
+                }
+            )
+        return tools
+
     async def send_request_async(
         self,
         messages: list,
@@ -110,10 +257,18 @@ class AsyncLLMRequester(Base):
 
             target_platform = platform_config.get("target_platform")
             api_format = platform_config.get("api_format")
+            llm_transport = str(platform_config.get("llm_transport", "") or "").strip().lower()
+            target_text = str(target_platform or "")
+            transport_override_allowed = (
+                target_text.startswith("custom_platform_")
+                or target_text in {"anthropic", "openai", ""}
+            )
 
             try:
                 # 根据平台分发请求
-                if target_platform == "sakura":
+                if llm_transport == "anthropic" and transport_override_allowed:
+                    result = await self._request_anthropic_async(messages, system_prompt, platform_config)
+                elif target_platform == "sakura":
                     result = await self._request_sakura_async(messages, system_prompt, platform_config)
                 elif target_platform == "murasaki":
                     result = await self._request_sakura_async(messages, system_prompt, platform_config)
@@ -167,67 +322,195 @@ class AsyncLLMRequester(Base):
         """异步 Anthropic 请求"""
         try:
             model_name = platform_config.get("model_name")
-            api_url = platform_config.get("api_url", "https://api.anthropic.com").rstrip('/')
+            api_url = str(platform_config.get("api_url", "") or "").strip().rstrip("/")
+            if not api_url:
+                raise ValueError(
+                    "api_url is required for this provider. "
+                    "Please configure your provider endpoint in runtime profile."
+                )
             api_key = platform_config.get("api_key")
-            request_timeout = platform_config.get("request_timeout", 120)
+            request_timeout = int(platform_config.get("request_timeout", 120) or 120)
             temperature = platform_config.get("temperature", 1.0)
-            max_tokens = platform_config.get("max_tokens", 4096)
-            think_switch = platform_config.get("think_switch", False)
-            think_budget = platform_config.get("think_budget", 10000)
+            top_p = platform_config.get("top_p", 1.0)
+            max_tokens = int(platform_config.get("max_tokens", 4096) or 4096)
+            think_switch = bool(platform_config.get("think_switch", False))
+            think_budget = int(
+                platform_config.get("thinking_budget")
+                or platform_config.get("think_budget")
+                or 10000
+            )
+            extra_body = platform_config.get("extra_body", {})
+            transport = self._normalize_transport(platform_config)
 
-            # 构建请求体
+            if transport == "anthropic":
+                sdk_config = dict(platform_config)
+                sdk_config["api_url"] = api_url
+                client = LLMClientFactory().get_anthropic_client(sdk_config)
+                request_body = {
+                    "model": model_name,
+                    "max_tokens": max_tokens,
+                    "messages": messages,
+                    "timeout": request_timeout,
+                }
+                if system_prompt:
+                    request_body["system"] = system_prompt
+                if temperature != 1:
+                    request_body["temperature"] = temperature
+                if top_p != 1:
+                    request_body["top_p"] = top_p
+                if think_switch:
+                    request_body["thinking"] = {"type": "enabled", "budget_tokens": max(128, think_budget)}
+                native_tools = self._build_anthropic_tools(platform_config)
+                if native_tools:
+                    request_body["tools"] = native_tools
+                    request_body["tool_choice"] = self._normalize_anthropic_tool_choice(
+                        platform_config.get("native_tool_choice", {"type": "auto"})
+                    )
+                if isinstance(extra_body, dict) and extra_body:
+                    request_body.update(extra_body)
+
+                def _sync_call():
+                    return client.messages.create(**request_body)
+
+                loop = asyncio.get_event_loop()
+                response = await loop.run_in_executor(None, _sync_call)
+                blocks = list(response.content or [])
+                normalized_blocks = []
+                for block in blocks:
+                    normalized_blocks.append(
+                        {
+                            "type": str(getattr(block, "type", "") or ""),
+                            "text": str(getattr(block, "text", "") or ""),
+                            "thinking": str(getattr(block, "thinking", "") or ""),
+                            "name": str(getattr(block, "name", "") or ""),
+                            "input": getattr(block, "input", {}),
+                        }
+                    )
+                response_think, response_content, tool_calls = self._extract_anthropic_content(normalized_blocks)
+                if tool_calls:
+                    response_content = self._build_tool_call_response(tool_calls, response_content)
+                usage = getattr(response, "usage", None)
+                prompt_tokens = int(getattr(usage, "input_tokens", 0) or getattr(usage, "prompt_tokens", 0) or 0)
+                completion_tokens = int(
+                    getattr(usage, "output_tokens", 0)
+                    or getattr(usage, "completion_tokens", 0)
+                    or 0
+                )
+                return False, response_think, response_content, prompt_tokens, completion_tokens
+
+            if transport == "openai":
+                sdk_config = dict(platform_config)
+                openai_base_url = api_url
+                if openai_base_url.endswith("/chat/completions"):
+                    openai_base_url = openai_base_url[:-17]
+                if bool(platform_config.get("auto_complete", False)) and not openai_base_url.endswith("/v1"):
+                    openai_base_url = f"{openai_base_url}/v1"
+                sdk_config["api_url"] = openai_base_url
+                client = LLMClientFactory().get_openai_client(sdk_config)
+
+                request_messages = list(messages)
+                if system_prompt:
+                    request_messages = [{"role": "system", "content": system_prompt}] + request_messages
+                request_body = {
+                    "model": model_name,
+                    "messages": request_messages,
+                    "max_tokens": max_tokens,
+                }
+                if temperature != 1:
+                    request_body["temperature"] = temperature
+                if top_p != 1:
+                    request_body["top_p"] = top_p
+                native_tools = self._build_openai_function_tools(platform_config)
+                if native_tools:
+                    request_body["tools"] = native_tools
+                    request_body["tool_choice"] = self._normalize_openai_tool_choice(
+                        platform_config.get("native_tool_choice", "auto")
+                    )
+                if isinstance(extra_body, dict) and extra_body:
+                    request_body.update(extra_body)
+
+                def _sync_openai_call():
+                    return client.chat.completions.create(timeout=request_timeout, **request_body)
+
+                loop = asyncio.get_event_loop()
+                response = await loop.run_in_executor(None, _sync_openai_call)
+                message = response.choices[0].message
+                response_content = message.content or ""
+                response_think = getattr(message, "reasoning_content", "") or ""
+                tool_calls = []
+                raw_calls = getattr(message, "tool_calls", [])
+                if isinstance(raw_calls, list):
+                    for call in raw_calls:
+                        fn = getattr(call, "function", None)
+                        name = str(getattr(fn, "name", "") or "").strip()
+                        if not name:
+                            continue
+                        args = self._parse_tool_arguments(getattr(fn, "arguments", {}))
+                        tool_calls.append({"name": name, "arguments": args})
+                if tool_calls:
+                    response_content = self._build_tool_call_response(tool_calls, response_content)
+                usage = getattr(response, "usage", None)
+                prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or getattr(usage, "input_tokens", 0) or 0)
+                completion_tokens = int(
+                    getattr(usage, "completion_tokens", 0)
+                    or getattr(usage, "output_tokens", 0)
+                    or 0
+                )
+                return False, response_think, response_content, prompt_tokens, completion_tokens
+
+            # 默认 HTTPX 模式
             request_body = {
                 "model": model_name,
                 "max_tokens": max_tokens,
                 "messages": messages,
             }
-
             if system_prompt:
                 request_body["system"] = system_prompt
-
             if temperature != 1:
                 request_body["temperature"] = temperature
-
+            if top_p != 1:
+                request_body["top_p"] = top_p
             if think_switch:
-                request_body["thinking"] = {
-                    "type": "enabled",
-                    "budget_tokens": think_budget
-                }
+                request_body["thinking"] = {"type": "enabled", "budget_tokens": max(128, think_budget)}
+            native_tools = self._build_anthropic_tools(platform_config)
+            if native_tools:
+                request_body["tools"] = native_tools
+                request_body["tool_choice"] = self._normalize_anthropic_tool_choice(
+                    platform_config.get("native_tool_choice", {"type": "auto"})
+                )
+            if isinstance(extra_body, dict) and extra_body:
+                request_body.update(extra_body)
 
             headers = {
                 "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
+                "anthropic-version": str(platform_config.get("anthropic_version", "2023-06-01") or "2023-06-01"),
                 "Content-Type": "application/json",
             }
 
-            if not api_url.endswith('/messages'):
-                api_url = f"{api_url}/v1/messages"
+            endpoint = api_url
+            if not endpoint.endswith("/messages"):
+                if endpoint.endswith("/v1"):
+                    endpoint = f"{endpoint}/messages"
+                else:
+                    endpoint = f"{endpoint}/v1/messages"
 
             session = await self.get_session()
             timeout = aiohttp.ClientTimeout(total=request_timeout)
 
-            async with session.post(api_url, json=request_body, headers=headers, timeout=timeout) as resp:
+            async with session.post(endpoint, json=request_body, headers=headers, timeout=timeout) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
                     raise Exception(f"HTTP {resp.status}: {error_text}")
-
                 response_json = await resp.json()
 
-            # 解析响应
             content_blocks = response_json.get("content", [])
-            response_content = ""
-            response_think = ""
-
-            for block in content_blocks:
-                if block.get("type") == "text":
-                    response_content += block.get("text", "")
-                elif block.get("type") == "thinking":
-                    response_think += block.get("thinking", "")
-
+            parsed_blocks = content_blocks if isinstance(content_blocks, list) else []
+            response_think, response_content, tool_calls = self._extract_anthropic_content(parsed_blocks)
+            if tool_calls:
+                response_content = self._build_tool_call_response(tool_calls, response_content)
             usage = response_json.get("usage", {})
-            prompt_tokens = usage.get("input_tokens", 0)
-            completion_tokens = usage.get("output_tokens", 0)
-
+            prompt_tokens = int(usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0) or 0)
+            completion_tokens = int(usage.get("output_tokens", 0) or usage.get("completion_tokens", 0) or 0)
             return False, response_think, response_content, prompt_tokens, completion_tokens
 
         except Exception as e:

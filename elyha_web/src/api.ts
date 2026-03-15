@@ -3,6 +3,8 @@ import type {
   AgentSessionResponse,
   AiChatPayload,
   AiChatResponse,
+  ChatThreadMessagesResponse,
+  ChatThreadsResponse,
   ClarificationQuestionPayload,
   ClarificationQuestionResponse,
   CreateNodePayload,
@@ -12,6 +14,7 @@ import type {
   LlmPresetPayload,
   ProjectInsights,
   ProjectPayload,
+  ProjectSettings,
   RequestAgentClarificationPayload,
   ResumeAgentSessionPayload,
   ReviewAgentSettingProposalPayload,
@@ -261,6 +264,27 @@ export async function sendAiChat(payload: AiChatPayload): Promise<AiChatResponse
   });
 }
 
+export async function listProjectChatThreads(
+  projectId: string,
+  limit = 50,
+): Promise<ChatThreadsResponse> {
+  return apiRequest<ChatThreadsResponse>(
+    `/api/projects/${projectId}/chat/threads?limit=${encodeURIComponent(String(limit))}`,
+  );
+}
+
+export async function getProjectChatThreadMessages(
+  projectId: string,
+  threadId: string,
+  limit = 80,
+): Promise<ChatThreadMessagesResponse> {
+  return apiRequest<ChatThreadMessagesResponse>(
+    `/api/projects/${projectId}/chat/threads/${encodeURIComponent(threadId)}/messages?limit=${encodeURIComponent(
+      String(limit),
+    )}`,
+  );
+}
+
 export async function requestClarificationQuestion(
   payload: ClarificationQuestionPayload,
 ): Promise<ClarificationQuestionResponse> {
@@ -437,4 +461,14 @@ export async function getProjectBundle(projectId: string): Promise<{
     listEdges(projectId),
   ]);
   return { project, nodes, edges };
+}
+
+export async function updateProjectSettings(
+  projectId: string,
+  payload: Partial<ProjectSettings>,
+): Promise<ProjectPayload> {
+  return apiRequest<ProjectPayload>(`/api/projects/${projectId}/settings`, {
+    method: 'PUT',
+    body: payload,
+  });
 }

@@ -26,6 +26,7 @@ class ProjectSettingsPatch:
     clarify_markdown: str | None = None
     specification_markdown: str | None = None
     plan_markdown: str | None = None
+    guide_skipped_docs: list[str] | None = None
     global_directives: str | None = None
     context_soft_min_chars: int | None = None
     context_soft_max_chars: int | None = None
@@ -165,6 +166,11 @@ class ProjectService:
                 if patch.plan_markdown is None
                 else patch.plan_markdown
             ),
+            guide_skipped_docs=(
+                current.guide_skipped_docs
+                if patch.guide_skipped_docs is None
+                else patch.guide_skipped_docs
+            ),
             global_directives=(
                 current.global_directives
                 if patch.global_directives is None
@@ -271,6 +277,7 @@ class ProjectService:
                 "clarify_markdown": updated.clarify_markdown,
                 "specification_markdown": updated.specification_markdown,
                 "plan_markdown": updated.plan_markdown,
+                "guide_skipped_docs": list(updated.guide_skipped_docs),
                 "global_directives": updated.global_directives,
                 "context_soft_min_chars": updated.context_soft_min_chars,
                 "context_soft_max_chars": updated.context_soft_max_chars,

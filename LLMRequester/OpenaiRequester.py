@@ -1,4 +1,5 @@
 import hashlib
+import json
 from ModuleFolders.Base.Base import Base
 from ModuleFolders.Infrastructure.LLMRequester.LLMClientFactory import LLMClientFactory
 from ModuleFolders.Infrastructure.LLMRequester.ErrorClassifier import ErrorClassifier, ErrorType
@@ -9,6 +10,112 @@ from ModuleFolders.Infrastructure.LLMRequester.ProviderFingerprint import Provid
 class OpenaiRequester(Base):
     def __init__(self) -> None:
         pass
+
+    def _normalize_transport(self, platform_config: dict) -> str:
+        raw = str(platform_config.get("llm_transport", "")).strip().lower()
+        if not raw:
+            use_sdk = platform_config.get("use_openai_sdk", False)
+            return "openai" if bool(use_sdk) else "httpx"
+        if raw in {"openai_sdk", "openai-client", "openai_client"}:
+            return "openai"
+        if raw in {"anthropic_sdk", "anthropic-client", "anthropic_client"}:
+            return "anthropic"
+        if raw in {"httpx", "openai", "anthropic"}:
+            return raw
+        return "httpx"
+
+    def _resolve_base_url(self, platform_config: dict, transport: str) -> str:
+        _ = transport
+        return str(platform_config.get("api_url", "") or "").strip()
+
+    def _build_httpx_url(self, base_url: str, auto_complete: bool) -> str:
+        api_url = str(base_url or "").rstrip("/")
+        if auto_complete and not api_url.endswith("/chat/completions"):
+            api_url = f"{api_url}/chat/completions"
+        return api_url
+
+    def _parse_tool_arguments(self, raw_args) -> dict:
+        if isinstance(raw_args, dict):
+            return raw_args
+        if isinstance(raw_args, str):
+            try:
+                parsed = json.loads(raw_args)
+            except Exception:
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
+
+    def _normalize_message_tool_calls(self, raw_calls) -> list[dict]:
+        if not isinstance(raw_calls, list):
+            return []
+        normalized: list[dict] = []
+        for call in raw_calls:
+            if isinstance(call, dict):
+                fn = call.get("function", {})
+                name = str((fn or {}).get("name", "") or call.get("name", "")).strip()
+                args = self._parse_tool_arguments((fn or {}).get("arguments", call.get("arguments", {})))
+            else:
+                fn = getattr(call, "function", None)
+                name = str(getattr(fn, "name", "") or getattr(call, "name", "")).strip()
+                args = self._parse_tool_arguments(getattr(fn, "arguments", getattr(call, "arguments", {})))
+            if not name:
+                continue
+            normalized.append({"name": name, "arguments": args})
+        return normalized
+
+    def _build_tool_call_response(self, tool_calls: list[dict], content_text: str = "") -> str:
+        payload: dict = {
+            "action": "tool_calls",
+            "tool_calls": tool_calls,
+        }
+        clean_content = str(content_text or "").strip()
+        if clean_content:
+            payload["final_answer"] = clean_content
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _normalize_tool_choice_for_openai(self, raw_choice):
+        if raw_choice is None:
+            return None
+        if isinstance(raw_choice, str):
+            text = raw_choice.strip().lower()
+            if text in {"auto", "none", "required"}:
+                return text
+            return raw_choice
+        if isinstance(raw_choice, dict):
+            choice_type = str(raw_choice.get("type", "")).strip().lower()
+            if choice_type in {"auto", "none", "required"}:
+                return choice_type
+            return raw_choice
+        return raw_choice
+
+    def _build_openai_function_tools(self, platform_config: dict) -> list[dict]:
+        raw_tools = platform_config.get("native_tools")
+        if not isinstance(raw_tools, list):
+            return []
+        tools: list[dict] = []
+        for item in raw_tools:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            if not name:
+                continue
+            description = str(item.get("description", "") or "")
+            input_schema = item.get("input_schema")
+            if not isinstance(input_schema, dict):
+                input_schema = item.get("parameters")
+            if not isinstance(input_schema, dict):
+                input_schema = {"type": "object", "properties": {}}
+            tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": description,
+                        "parameters": input_schema,
+                    },
+                }
+            )
+        return tools
 
     def _get_api_cache_key(self, api_url: str, model_name: str) -> str:
         """生成API缓存键，基于URL和模型名"""
@@ -65,6 +172,9 @@ class OpenaiRequester(Base):
         """解析JSON格式响应"""
         message = response_json["choices"][0]["message"]
         content = message.get("content", "")
+        tool_calls = self._normalize_message_tool_calls(message.get("tool_calls", []))
+        if tool_calls:
+            content = self._build_tool_call_response(tool_calls, str(content or ""))
 
         # 自适应提取推理过程
         response_think = ""
@@ -123,6 +233,9 @@ class OpenaiRequester(Base):
 
         message = response.choices[0].message
         response_content = message.content or ""
+        tool_calls = self._normalize_message_tool_calls(getattr(message, "tool_calls", []))
+        if tool_calls:
+            response_content = self._build_tool_call_response(tool_calls, response_content)
 
         # 自适应提取推理过程
         response_think = ""
@@ -193,6 +306,13 @@ class OpenaiRequester(Base):
             web_search_max_results = platform_config.get("web_search_max_results")
             web_search_tool_type = platform_config.get("web_search_tool_type", "web_search_preview")
             enable_stream = platform_config.get("enable_stream_api", True)
+            transport = self._normalize_transport(platform_config)
+            resolved_base_url = self._resolve_base_url(platform_config, transport)
+            if not resolved_base_url:
+                raise ValueError(
+                    "api_url is required for non-preset providers. "
+                    "Please create a custom preset/profile and set the provider endpoint."
+                )
 
             # 插入系统消息
             if system_prompt:
@@ -247,13 +367,27 @@ class OpenaiRequester(Base):
                     options.setdefault("max_results", max_results)
                 if options:
                     request_body["web_search_options"] = options
+            native_tools = self._build_openai_function_tools(platform_config)
+            if native_tools:
+                existing_tools = request_body.get("tools", [])
+                if not isinstance(existing_tools, list):
+                    existing_tools = []
+                request_body["tools"] = existing_tools + native_tools
+                tool_choice = self._normalize_tool_choice_for_openai(
+                    platform_config.get("native_tool_choice", "auto")
+                )
+                if tool_choice is not None:
+                    request_body["tool_choice"] = tool_choice
+                # tool-calls in stream mode parsing is not fully supported, force non-stream for correctness.
+                enable_stream = False
 
-            # 读取请求模式开关
-            use_sdk = platform_config.get("use_openai_sdk", False)
+            use_sdk = transport == "openai"
 
             if use_sdk:
                 # ===== OpenAI SDK 模式 =====
-                client = LLMClientFactory().get_openai_client(platform_config)
+                sdk_config = dict(platform_config)
+                sdk_config["api_url"] = resolved_base_url
+                client = LLMClientFactory().get_openai_client(sdk_config)
                 try:
                     return self._do_request_sdk(client, request_body, request_timeout)
                 except Exception as sdk_error:
@@ -265,9 +399,10 @@ class OpenaiRequester(Base):
             else:
                 # ===== 原生 HTTPX 模式 =====
                 def _request_http(body: dict) -> tuple[bool, str, str, int, int]:
-                    api_url = platform_config.get("api_url").rstrip('/')
-                    if platform_config.get("auto_complete", False) and not api_url.endswith('/chat/completions'):
-                        api_url = f"{api_url}/chat/completions"
+                    api_url = self._build_httpx_url(
+                        resolved_base_url,
+                        bool(platform_config.get("auto_complete", False)),
+                    )
                     api_key = platform_config.get("api_key")
 
                     # 智能流式判断逻辑
@@ -316,7 +451,7 @@ class OpenaiRequester(Base):
             if error_type_enum == ErrorType.HARD_ERROR:
                 error_type = "HARD_ERROR"
                 # 检查是否为缓存相关错误，更新 Provider 指纹
-                api_url = platform_config.get("api_url", "")
+                api_url = locals().get("resolved_base_url") or platform_config.get("api_url", "")
                 if ErrorClassifier.is_cache_related_error(error_str):
                     fingerprint = ProviderFingerprint()
                     fingerprint.mark_cache_unsupported(api_url, error_str)
@@ -326,7 +461,7 @@ class OpenaiRequester(Base):
                 error_type = "UNKNOWN_ERROR"
 
             if Base.work_status != Base.STATUS.STOPING:
-                api_url = platform_config.get("api_url", "Unknown URL")
+                api_url = locals().get("resolved_base_url") or platform_config.get("api_url", "Unknown URL")
                 model_name = platform_config.get("model_name", "Unknown Model")
                 self.error(f"Request error ({error_type}) [URL: {api_url}, Model: {model_name}] ... {e}",
                           e if self.is_debug() else None)

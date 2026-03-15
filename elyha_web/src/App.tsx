@@ -26,6 +26,7 @@ import {
   rollbackProject,
   switchRuntimeProfile,
   updateNode,
+  updateProjectSettings,
   updateRuntimeSettings,
   validateProject,
 } from './api';
@@ -37,6 +38,7 @@ import type {
   LlmPresetPayload,
   ProjectInsights,
   ProjectPayload,
+  ProjectSettings,
   RuntimeConfigPayload,
   RuntimeSettingsPayload,
   UpdateNodePayload,
@@ -86,8 +88,10 @@ interface DialogResolve {
 interface RuntimeDraft {
   locale: string;
   llm_provider: string;
+  llm_transport: 'httpx' | 'openai' | 'anthropic';
   api_url: string;
   api_key: string;
+  api_key_mask: string;
   model_name: string;
   web_search_enabled: boolean;
   default_workflow_mode: WorkflowMode;
@@ -95,11 +99,19 @@ interface RuntimeDraft {
 
 function toRuntimeDraft(config: RuntimeConfigPayload): RuntimeDraft {
   const workflowMode: WorkflowMode = config.default_workflow_mode === 'single' ? 'single' : 'multi_agent';
+  const llmTransport = config.llm_transport === 'openai' || config.llm_transport === 'anthropic'
+    ? config.llm_transport
+    : 'httpx';
+  const dynamicMask = typeof config.api_key_mask === 'string'
+    ? config.api_key_mask
+    : '';
   return {
     locale: config.locale,
     llm_provider: 'llmrequester',
+    llm_transport: llmTransport,
     api_url: config.api_url,
-    api_key: config.api_key,
+    api_key: '',
+    api_key_mask: dynamicMask,
     model_name: config.model_name,
     web_search_enabled: config.web_search_enabled,
     default_workflow_mode: workflowMode,
@@ -107,6 +119,11 @@ function toRuntimeDraft(config: RuntimeConfigPayload): RuntimeDraft {
 }
 
 type GuideDocKey = 'clarify' | 'constitution' | 'plan' | 'specification';
+type GuideDocSettingField =
+  | 'clarify_markdown'
+  | 'constitution_markdown'
+  | 'plan_markdown'
+  | 'specification_markdown';
 
 const GUIDE_DOC_ORDER: GuideDocKey[] = ['clarify', 'constitution', 'plan', 'specification'];
 
@@ -117,7 +134,58 @@ const GUIDE_DOC_TITLES: Record<GuideDocKey, string> = {
   specification: 'specification.md',
 };
 
+const GUIDE_DOC_SETTING_FIELDS: Record<GuideDocKey, GuideDocSettingField> = {
+  clarify: 'clarify_markdown',
+  constitution: 'constitution_markdown',
+  plan: 'plan_markdown',
+  specification: 'specification_markdown',
+};
+
 const GUIDE_DOC_TITLE_SET = new Set(Object.values(GUIDE_DOC_TITLES).map((item) => item.toLowerCase()));
+
+function normalizeGuideSkippedDocs(value: unknown): GuideDocSettingField[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const next: GuideDocSettingField[] = [];
+  for (const item of value) {
+    const raw = String(item || '').trim().toLowerCase();
+    let normalized = '';
+    if (raw === 'clarify' || raw === 'clarify_markdown') {
+      normalized = 'clarify_markdown';
+    } else if (raw === 'constitution' || raw === 'constitution_markdown') {
+      normalized = 'constitution_markdown';
+    } else if (raw === 'plan' || raw === 'plan_markdown') {
+      normalized = 'plan_markdown';
+    } else if (raw === 'specification' || raw === 'specification_markdown') {
+      normalized = 'specification_markdown';
+    }
+    if (!normalized) {
+      continue;
+    }
+    if (!next.includes(normalized as GuideDocSettingField)) {
+      next.push(normalized as GuideDocSettingField);
+    }
+  }
+  return next;
+}
+
+function normalizeGuideDocType(rawDocType: string): GuideDocSettingField | '' {
+  const raw = String(rawDocType || '').trim().toLowerCase();
+  if (raw === 'clarify' || raw === 'clarify_markdown') {
+    return 'clarify_markdown';
+  }
+  if (raw === 'constitution' || raw === 'constitution_markdown') {
+    return 'constitution_markdown';
+  }
+  if (raw === 'plan' || raw === 'plan_markdown') {
+    return 'plan_markdown';
+  }
+  if (raw === 'specification' || raw === 'specification_markdown') {
+    return 'specification_markdown';
+  }
+  return '';
+}
 
 function normalizeText(value: unknown): string {
   if (typeof value === 'string') {
@@ -224,8 +292,10 @@ export default function App() {
   const [settingsDraft, setSettingsDraft] = useState<RuntimeDraft>({
     locale: 'zh',
     llm_provider: 'llmrequester',
+    llm_transport: 'httpx',
     api_url: '',
     api_key: '',
+    api_key_mask: '',
     model_name: '',
     web_search_enabled: false,
     default_workflow_mode: 'multi_agent',
@@ -494,49 +564,41 @@ export default function App() {
     return nodes.find((item) => item.id === linkSourceNodeId)?.title || '';
   }, [linkSourceNodeId, nodes]);
 
-  const guideDocNodes = useMemo(() => {
-    const map = new Map<GuideDocKey, GraphNodePayload>();
-    for (const node of nodes) {
-      const lowered = String(node.title || '').trim().toLowerCase();
-      if (lowered === GUIDE_DOC_TITLES.clarify.toLowerCase()) {
-        map.set('clarify', node);
-      } else if (lowered === GUIDE_DOC_TITLES.constitution.toLowerCase()) {
-        map.set('constitution', node);
-      } else if (lowered === GUIDE_DOC_TITLES.plan.toLowerCase()) {
-        map.set('plan', node);
-      } else if (lowered === GUIDE_DOC_TITLES.specification.toLowerCase()) {
-        map.set('specification', node);
-      }
-    }
-    return map;
-  }, [nodes]);
-
   const guideDocStatus = useMemo(
-    () =>
-      GUIDE_DOC_ORDER.map((key) => {
-        const node = guideDocNodes.get(key);
+    () => {
+      const skipped = new Set<GuideDocSettingField>(
+        normalizeGuideSkippedDocs(project?.settings?.guide_skipped_docs),
+      );
+      return GUIDE_DOC_ORDER.map((key) => {
+        const field = GUIDE_DOC_SETTING_FIELDS[key];
+        const content = normalizeText(project?.settings?.[field]);
         return {
           key,
           title: GUIDE_DOC_TITLES[key],
-          filled: !!node && !!nodePrimaryText(node.metadata),
+          filled: Boolean(content) || skipped.has(field),
         };
-      }),
-    [guideDocNodes],
+      });
+    },
+    [project],
   );
 
   const guideOutlineCards = useMemo(
-    () =>
-      GUIDE_DOC_ORDER.map((key) => {
-        const node = guideDocNodes.get(key);
-        const content = node ? nodePrimaryText(node.metadata).trim() : '';
+    () => {
+      const skipped = new Set<GuideDocSettingField>(
+        normalizeGuideSkippedDocs(project?.settings?.guide_skipped_docs),
+      );
+      return GUIDE_DOC_ORDER.map((key) => {
+        const field = GUIDE_DOC_SETTING_FIELDS[key];
+        const content = normalizeText(project?.settings?.[field]);
         return {
           key,
           title: GUIDE_DOC_TITLES[key],
           content,
-          filled: Boolean(content),
+          filled: Boolean(content) || skipped.has(field),
         };
-      }),
-    [guideDocNodes],
+      });
+    },
+    [project],
   );
 
   const globalOutlineText = useMemo(() => normalizeText(project?.settings?.global_directives), [project]);
@@ -595,8 +657,8 @@ export default function App() {
     if (!projectId) {
       return false;
     }
-    return !guideDocsComplete && !hasStoryProgress;
-  }, [activeTab, guideDocsComplete, hasStoryProgress, projectId]);
+    return !guideDocsComplete;
+  }, [activeTab, guideDocsComplete, projectId]);
 
   useEffect(() => {
     if (!shouldShowGuideWorkspace) {
@@ -951,16 +1013,16 @@ export default function App() {
         }
 
         let changedCount = 0;
-        for (let index = 0; index < GUIDE_DOC_ORDER.length; index += 1) {
-          const key = GUIDE_DOC_ORDER[index];
+        const patch: Partial<Record<GuideDocSettingField, string>> = {};
+        for (const key of GUIDE_DOC_ORDER) {
           const title = GUIDE_DOC_TITLES[key];
+          const field = GUIDE_DOC_SETTING_FIELDS[key];
           const nextContent = (parsed[key] || '').trim();
           if (!nextContent) {
             continue;
           }
 
-          const existing = guideDocNodes.get(key);
-          const currentContent = existing ? nodePrimaryText(existing.metadata).trim() : '';
+          const currentContent = normalizeText(project?.settings?.[field]);
           if (currentContent === nextContent) {
             continue;
           }
@@ -975,30 +1037,12 @@ export default function App() {
             continue;
           }
 
-          const metadata: Record<string, unknown> = {
-            content: nextContent,
-            outline_markdown: nextContent,
-            summary: nextContent.slice(0, 200),
-          };
-          if (existing) {
-            await updateNode(projectId, existing.id, {
-              title,
-              type: 'chapter',
-              metadata,
-            });
-          } else {
-            await createNode(projectId, {
-              title,
-              type: 'chapter',
-              pos_x: 120 + (index % 2) * 460,
-              pos_y: 120 + Math.floor(index / 2) * 220,
-              metadata,
-            });
-          }
+          patch[field] = nextContent;
           changedCount += 1;
         }
 
         if (changedCount > 0) {
+          await updateProjectSettings(projectId, patch);
           await loadProjectBundle(projectId);
           setStatus(t('web.guide.docs_written_count', {count: changedCount}));
         }
@@ -1006,7 +1050,42 @@ export default function App() {
         setStatus(`${t('web.error.guide_docs_write_failed')}: ${errorToText(error, t, t('web.error.unknown'))}`, true);
       }
     },
-    [askConfirm, guideDocNodes, hasStoryProgress, loadProjectBundle, projectId, setStatus, t],
+    [askConfirm, hasStoryProgress, loadProjectBundle, project, projectId, setStatus, t],
+  );
+
+  const handleGuideSkipDocumentRequest = useCallback(
+    async (docType: string): Promise<boolean> => {
+      if (!projectId) {
+        return false;
+      }
+      const field = normalizeGuideDocType(docType);
+      if (!field) {
+        return false;
+      }
+      const key = GUIDE_DOC_ORDER.find((item) => GUIDE_DOC_SETTING_FIELDS[item] === field);
+      if (!key) {
+        return false;
+      }
+      const title = GUIDE_DOC_TITLES[key];
+      const confirmed = await askConfirm(
+        t('web.guide.skip_confirm_title'),
+        t('web.guide.skip_confirm_body', {name: title}),
+      );
+      if (!confirmed) {
+        return false;
+      }
+      const nextSkipped = normalizeGuideSkippedDocs(project?.settings?.guide_skipped_docs);
+      if (!nextSkipped.includes(field)) {
+        nextSkipped.push(field);
+      }
+      await updateProjectSettings(projectId, {
+        guide_skipped_docs: nextSkipped,
+      });
+      await loadProjectBundle(projectId);
+      setStatus(t('web.guide.skip_confirmed', {name: title}));
+      return true;
+    },
+    [askConfirm, loadProjectBundle, project, projectId, setStatus, t],
   );
 
   const refreshInsights = useCallback(async () => {
@@ -1038,6 +1117,23 @@ export default function App() {
     return payload;
   }, [applyRuntimeSettings]);
 
+  const buildRuntimePatch = useCallback((): Partial<RuntimeConfigPayload> => {
+    const payload: Partial<RuntimeConfigPayload> = {
+      locale: settingsDraft.locale,
+      llm_provider: 'llmrequester',
+      llm_transport: settingsDraft.llm_transport,
+      api_url: settingsDraft.api_url,
+      model_name: settingsDraft.model_name,
+      web_search_enabled: settingsDraft.web_search_enabled,
+      default_workflow_mode: settingsDraft.default_workflow_mode,
+    };
+    const nextApiKey = settingsDraft.api_key.trim();
+    if (nextApiKey) {
+      payload.api_key = nextApiKey;
+    }
+    return payload;
+  }, [settingsDraft]);
+
   useEffect(() => {
     void execute(async () => {
       const payload = await loadRuntimeSettings();
@@ -1057,20 +1153,12 @@ export default function App() {
 
   const saveRuntime = useCallback(async () => {
     await execute(async () => {
-      const payload = await updateRuntimeSettings({
-        locale: settingsDraft.locale,
-        llm_provider: 'llmrequester',
-        api_url: settingsDraft.api_url,
-        api_key: settingsDraft.api_key,
-        model_name: settingsDraft.model_name,
-        web_search_enabled: settingsDraft.web_search_enabled,
-        default_workflow_mode: settingsDraft.default_workflow_mode,
-      });
+      const payload = await updateRuntimeSettings(buildRuntimePatch());
       applyRuntimeSettings(payload);
       await applyLocale(payload.config.locale);
       setStatus(t('web.toast.runtime_saved'));
     }, t('web.error.runtime_save_failed'));
-  }, [applyLocale, applyRuntimeSettings, execute, setStatus, settingsDraft, t]);
+  }, [applyLocale, applyRuntimeSettings, buildRuntimePatch, execute, setStatus, t]);
 
   const llmSchemeOptions = useMemo(() => {
     const options: Array<{value: string; label: string}> = [];
@@ -1098,9 +1186,13 @@ export default function App() {
         return;
       }
       const nextModel = preset.default_model || preset.models[0] || '';
+      const nextTransport = preset.llm_transport === 'openai' || preset.llm_transport === 'anthropic'
+        ? preset.llm_transport
+        : 'httpx';
       setSettingsDraft((prev) => ({
         ...prev,
         llm_provider: 'llmrequester',
+        llm_transport: nextTransport,
         api_url: preset.api_url || prev.api_url,
         model_name: nextModel || prev.model_name,
       }));
@@ -1151,21 +1243,13 @@ export default function App() {
     await execute(async () => {
       await createRuntimeProfile(profileName, runtimeSettings?.active_profile || 'core');
       await switchRuntimeProfile(profileName, false);
-      const saved = await updateRuntimeSettings({
-        locale: settingsDraft.locale,
-        llm_provider: 'llmrequester',
-        api_url: settingsDraft.api_url,
-        api_key: settingsDraft.api_key,
-        model_name: settingsDraft.model_name,
-        web_search_enabled: settingsDraft.web_search_enabled,
-        default_workflow_mode: settingsDraft.default_workflow_mode,
-      });
+      const saved = await updateRuntimeSettings(buildRuntimePatch());
       applyRuntimeSettings(saved);
       await applyLocale(saved.config.locale);
       setSelectedLlmScheme(`profile:${profileName}`);
       setStatus(t('web.toast.runtime_profile_created', {profile: profileName}));
     }, t('web.error.runtime_profile_create_failed'));
-  }, [applyLocale, applyRuntimeSettings, askPrompt, execute, runtimeSettings?.active_profile, setStatus, settingsDraft, t]);
+  }, [applyLocale, applyRuntimeSettings, askPrompt, buildRuntimePatch, execute, runtimeSettings?.active_profile, setStatus, t]);
 
   const handleSwitchLanguage = useCallback(async () => {
     const selected = await askSelect({
@@ -1388,6 +1472,23 @@ export default function App() {
                       />
                     </FormRow>
 
+                    <FormRow label={t('web.runtime.llm_transport')}>
+                      <select
+                        value={settingsDraft.llm_transport}
+                        onChange={(event) =>
+                          setSettingsDraft((prev) => ({
+                            ...prev,
+                            llm_transport: event.target.value as RuntimeDraft['llm_transport'],
+                          }))
+                        }
+                        className="w-full h-10 rounded-lg border border-slate-200 px-3 text-sm bg-white"
+                      >
+                        <option value="httpx">{t('web.runtime.transport.httpx')}</option>
+                        <option value="openai">{t('web.runtime.transport.openai')}</option>
+                        <option value="anthropic">{t('web.runtime.transport.anthropic')}</option>
+                      </select>
+                    </FormRow>
+
                     <FormRow label={t('web.runtime.model_name')}>
                       <input
                         value={settingsDraft.model_name}
@@ -1401,7 +1502,7 @@ export default function App() {
                         type="password"
                         value={settingsDraft.api_key}
                         onChange={(event) => setSettingsDraft((prev) => ({...prev, api_key: event.target.value}))}
-                        placeholder={t('web.runtime.api_key_placeholder')}
+                        placeholder={settingsDraft.api_key_mask}
                         autoComplete="new-password"
                         className="w-full h-10 rounded-lg border border-slate-200 px-3 text-sm"
                       />
@@ -1472,6 +1573,7 @@ export default function App() {
             guideMode={shouldShowGuideWorkspace}
             guideDocStatus={guideDocStatus}
             onGuideDocReply={handleGuideDocReply}
+            onGuideSkipDocumentRequest={handleGuideSkipDocumentRequest}
             onCreateSuggestionNode={handleCreateSuggestionNode}
             onRefreshProject={refreshCurrentProject}
             onStatus={setStatus}

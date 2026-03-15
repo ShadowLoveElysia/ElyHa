@@ -14,6 +14,7 @@ class LLMPreset:
     name: str
     group: str
     api_format: str
+    llm_transport: str
     api_url: str
     api_key: str
     model: str
@@ -62,6 +63,13 @@ def _preset_from_payload(default_tag: str, payload: Any) -> LLMPreset | None:
     name = _as_text(payload.get("name")) or tag
     group = _as_text(payload.get("group"))
     api_format = _as_text(payload.get("api_format"))
+    llm_transport = _as_text(payload.get("llm_transport")).lower()
+    if llm_transport in {"openai_sdk", "openai-client", "openai_client"}:
+        llm_transport = "openai"
+    elif llm_transport in {"anthropic_sdk", "anthropic-client", "anthropic_client"}:
+        llm_transport = "anthropic"
+    elif llm_transport not in {"httpx", "openai", "anthropic"}:
+        llm_transport = "anthropic" if api_format.lower() == "anthropic" else "httpx"
     api_url = _as_text(payload.get("api_url"))
     api_key = _as_text(payload.get("api_key"))
     model = _as_text(payload.get("model"))
@@ -74,6 +82,7 @@ def _preset_from_payload(default_tag: str, payload: Any) -> LLMPreset | None:
         name=name,
         group=group,
         api_format=api_format,
+        llm_transport=llm_transport,
         api_url=api_url,
         api_key=api_key,
         model=model,
@@ -108,6 +117,7 @@ def preset_to_platform_config(preset: LLMPreset) -> dict[str, Any]:
     config: dict[str, Any] = {
         "target_platform": preset.tag,
         "auto_complete": bool(preset.auto_complete),
+        "llm_transport": preset.llm_transport,
     }
     if preset.api_url:
         config["api_url"] = preset.api_url

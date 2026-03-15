@@ -74,9 +74,25 @@ class LLMRequester:
 
             target_platform = platform_config.get("target_platform")
             api_format = platform_config.get("api_format")
+            llm_transport = str(platform_config.get("llm_transport", "") or "").strip().lower()
             request_messages = self._clone_messages(base_messages)
+            target_text = str(target_platform or "")
+            transport_override_allowed = (
+                target_text.startswith("custom_platform_")
+                or target_text in {"anthropic", "openai", ""}
+            )
 
-            if target_platform == "sakura":
+            if llm_transport == "anthropic" and transport_override_allowed:
+                from ModuleFolders.Infrastructure.LLMRequester.AnthropicRequester import AnthropicRequester
+
+                anthropic_requester = AnthropicRequester()
+                skip, response_think, response_content, prompt_tokens, completion_tokens = anthropic_requester.request_anthropic(
+                    request_messages,
+                    system_prompt,
+                    platform_config,
+                )
+            elif target_platform == "sakura":
+
                 from ModuleFolders.Infrastructure.LLMRequester.SakuraRequester import SakuraRequester
 
                 sakura_requester = SakuraRequester()

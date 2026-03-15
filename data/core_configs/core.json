@@ -1,6 +1,7 @@
 {
   "locale": "zh",
   "llm_provider": "mock",
+  "llm_transport": "httpx",
   "api_url": "",
   "api_key": "",
   "model_name": "",

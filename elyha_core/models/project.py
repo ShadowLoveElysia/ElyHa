@@ -56,6 +56,18 @@ def _coerce_text(value: object, fallback: str = "") -> str:
     return str(value)
 
 
+def _coerce_text_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    normalized: list[str] = []
+    for item in value:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        normalized.append(text)
+    return normalized
+
+
 @dataclass(slots=True)
 class ProjectSettings:
     """Project-level behavior toggles."""
@@ -70,6 +82,7 @@ class ProjectSettings:
     clarify_markdown: str = ""
     specification_markdown: str = ""
     plan_markdown: str = ""
+    guide_skipped_docs: list[str] = field(default_factory=list)
     global_directives: str = ""
     context_soft_min_chars: int = 3000
     context_soft_max_chars: int = 5000
@@ -133,6 +146,30 @@ class ProjectSettings:
         self.clarify_markdown = _normalize_prompt_text(self.clarify_markdown, limit=12000)
         self.specification_markdown = _normalize_prompt_text(self.specification_markdown, limit=12000)
         self.plan_markdown = _normalize_prompt_text(self.plan_markdown, limit=12000)
+        normalized_skips: list[str] = []
+        for item in list(self.guide_skipped_docs):
+            clean = str(item or "").strip().lower()
+            if clean in {
+                "constitution",
+                "constitution_markdown",
+                "clarify",
+                "clarify_markdown",
+                "specification",
+                "specification_markdown",
+                "plan",
+                "plan_markdown",
+            }:
+                if clean == "constitution":
+                    clean = "constitution_markdown"
+                elif clean == "clarify":
+                    clean = "clarify_markdown"
+                elif clean == "specification":
+                    clean = "specification_markdown"
+                elif clean == "plan":
+                    clean = "plan_markdown"
+                if clean not in normalized_skips:
+                    normalized_skips.append(clean)
+        self.guide_skipped_docs = normalized_skips
         self.global_directives = _normalize_prompt_text(self.global_directives, limit=12000)
 
 
@@ -175,6 +212,7 @@ def project_settings_from_payload(raw: Any) -> ProjectSettings:
         clarify_markdown=legacy_clarify,
         specification_markdown=legacy_specification,
         plan_markdown=legacy_plan,
+        guide_skipped_docs=_coerce_text_list(payload.get("guide_skipped_docs")),
         global_directives=global_directives,
         context_soft_min_chars=_coerce_positive_int(payload.get("context_soft_min_chars"), 3000),
         context_soft_max_chars=_coerce_positive_int(payload.get("context_soft_max_chars"), 5000),

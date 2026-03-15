@@ -45,6 +45,24 @@ _STRICT_JSON_FENCE_PATTERN = re.compile(
     flags=re.IGNORECASE,
 )
 
+_GUIDE_DOC_LABELS = {
+    "constitution_markdown": "constitution",
+    "clarify_markdown": "clarify",
+    "specification_markdown": "specification",
+    "plan_markdown": "plan",
+}
+_GUIDE_DOC_SLOTS = tuple(_GUIDE_DOC_LABELS.keys())
+_GUIDE_DOC_ALIASES = {
+    "constitution": "constitution_markdown",
+    "constitution_markdown": "constitution_markdown",
+    "clarify": "clarify_markdown",
+    "clarify_markdown": "clarify_markdown",
+    "specification": "specification_markdown",
+    "specification_markdown": "specification_markdown",
+    "plan": "plan_markdown",
+    "plan_markdown": "plan_markdown",
+}
+
 
 @dataclass(slots=True)
 class BranchOption:
@@ -112,6 +130,7 @@ class ChatAssistResult:
     updated_node_id: str | None = None
     suggested_node_ids: list[str] = field(default_factory=list)
     suggested_options: list[dict[str, str]] = field(default_factory=list)
+    guide_skip_document: str = ""
     revision: int = 0
 
 
@@ -591,6 +610,7 @@ class AIService:
         message: str,
         node_id: str | None = None,
         thread_id: str | None = None,
+        guide_mode: bool = False,
         token_budget: int = 1800,
     ) -> ChatAssistResult:
         cleaned_message, explicit_route = self._extract_chat_route(message)
@@ -609,7 +629,14 @@ class AIService:
             else:
                 route = "writer"
         review_bypassed = node is not None and auto_review_passed and route == "writer"
-        clean_thread_id = str(thread_id or "").strip() or generate_id("chat")
+        requested_thread_id = str(thread_id or "").strip()
+        clean_thread_id = requested_thread_id or generate_id("chat")
+        if requested_thread_id:
+            existing_thread = self.repository.get_chat_thread(requested_thread_id)
+            if existing_thread is not None:
+                existing_project = str(existing_thread.get("project_id") or "").strip()
+                if existing_project and existing_project != project_id:
+                    clean_thread_id = generate_id("chat")
         self.repository.upsert_chat_thread(
             clean_thread_id,
             project_id=project_id,
@@ -632,16 +659,96 @@ class AIService:
             prompt_user_message = f"{cleaned_message}\n\n{chat_context}"
 
         if node is None:
-            response = self._generate(
-                task_type="chat_global_" + route,
-                prompt=self._chat_global_prompt(
-                    project_id,
-                    prompt_user_message,
+            if guide_mode:
+                route = "planner"
+                before_status = self._workflow_doc_status(project_id)
+                response = self._generate(
+                    task_type="chat_global_" + route,
+                    prompt=self._chat_global_guide_prompt(
+                        project_id,
+                        prompt_user_message,
+                        route=route,
+                        missing_labels=cast(list[str], before_status.get("missing_labels", [])),
+                    ),
+                    platform_config={
+                        "token_budget": token_budget,
+                        "enable_tool_loop": True,
+                        "write_document_enabled": True,
+                        "write_document_required": False,
+                        "allow_skip_document": True,
+                    },
+                    project_id=project_id,
+                )
+                after_status = self._workflow_doc_status(project_id)
+                guide_skip_document = self._extract_guide_skip_document_request(response.raw)
+                content = response.content.strip() or tr("ai.chat.empty_fallback")
+                after_missing_labels = cast(list[str], after_status.get("missing_labels", []))
+                if bool(after_status.get("complete", False)):
+                    completion_hint = "四份基础大纲已全部写入，可退出创作引导并进入节点创建。"
+                    if completion_hint not in content:
+                        content = f"{content}\n\n{completion_hint}" if content else completion_hint
+                elif after_missing_labels:
+                    before_missing_slots = cast(list[str], before_status.get("missing_slots", []))
+                    after_missing_slots = cast(list[str], after_status.get("missing_slots", []))
+                    if before_missing_slots == after_missing_slots:
+                        missing_text = "、".join(after_missing_labels)
+                        reminder = (
+                            "当前仍在创作引导模式，尚未完成："
+                            f"{missing_text}。请继续补充这些信息，我会写入对应文档。"
+                        )
+                        if reminder not in content:
+                            content = f"{content}\n\n{reminder}" if content else reminder
+                self.repository.append_chat_message(
+                    clean_thread_id,
+                    role="assistant",
+                    content=content,
+                )
+                return ChatAssistResult(
+                    project_id=project_id,
+                    node_id=None,
+                    thread_id=clean_thread_id,
                     route=route,
-                ),
-                platform_config={"token_budget": token_budget},
+                    reply=content,
+                    review_bypassed=False,
+                    guide_skip_document=guide_skip_document,
+                    revision=self._project_revision(project_id),
+                )
+
+            base_prompt = self._chat_global_prompt(
+                project_id,
+                prompt_user_message,
+                route=route,
+            )
+            gate_prompt = self._append_global_tool_gate_contract(base_prompt)
+            gate_platform_config: dict[str, Any] = {
+                "token_budget": token_budget,
+                "native_tools": self._build_global_tool_gate_specs(),
+                "native_tool_choice": {"type": "auto"},
+            }
+            gate_response = self._generate(
+                task_type="chat_global_" + route,
+                prompt=gate_prompt,
+                platform_config=gate_platform_config,
                 project_id=project_id,
             )
+            gate_parsed = self._parse_tool_loop_response(gate_response)
+            gate_decision = self._extract_global_tool_gate_decision(
+                cast(list[dict[str, Any]], gate_parsed.get("tool_calls", []))
+            )
+            response = gate_response
+            if gate_decision["enable_tool_loop"]:
+                loop_platform_config: dict[str, Any] = {
+                    "token_budget": token_budget,
+                    "enable_tool_loop": True,
+                }
+                if gate_decision["write_document_enabled"]:
+                    loop_platform_config["write_document_enabled"] = True
+                response = self._generate(
+                    task_type="chat_global_" + route,
+                    prompt=base_prompt,
+                    platform_config=loop_platform_config,
+                    project_id=project_id,
+                )
             content = response.content.strip() or tr("ai.chat.empty_fallback")
             self.repository.append_chat_message(
                 clean_thread_id,
@@ -1102,10 +1209,28 @@ class AIService:
         response = self._generate(
             task_type="workflow_docs_draft",
             prompt=prompt,
-            platform_config={"token_budget": max(1000, token_budget)},
+            platform_config={
+                "token_budget": max(1000, token_budget),
+                "write_document_enabled": True,
+            },
             project_id=project_id,
         )
-        docs = self._parse_workflow_docs_payload(response.content)
+
+        # Check if documents were written via tools
+        state = self.repository.get_workflow_doc_state(project_id)
+        if state and state.get("pending_docs"):
+            pending = state.get("pending_docs", {})
+            docs = {
+                "constitution_markdown": str(pending.get("constitution_markdown", "")).strip(),
+                "clarify_markdown": str(pending.get("clarify_markdown", "")).strip(),
+                "specification_markdown": str(pending.get("specification_markdown", "")).strip(),
+                "plan_markdown": str(pending.get("plan_markdown", "")).strip(),
+                "written_keys": [k.replace("_markdown", "") for k, v in pending.items() if v and k.endswith("_markdown")],
+                "assistant_message": response.content.strip() or tr("ai.chat.empty_fallback"),
+            }
+        else:
+            docs = self._parse_workflow_docs_payload(response.content)
+
         written_keys = [str(item) for item in list(docs.get("written_keys", []) or []) if str(item).strip()]
         ignored_keys = [str(item) for item in list(docs.get("ignored_keys", []) or []) if str(item).strip()]
         assistant_message = str(docs.get("assistant_message", "")).strip()
@@ -1174,10 +1299,28 @@ class AIService:
         response = self._generate(
             task_type="workflow_docs_revise",
             prompt=prompt,
-            platform_config={"token_budget": max(1000, token_budget)},
+            platform_config={
+                "token_budget": max(1000, token_budget),
+                "write_document_enabled": True,
+            },
             project_id=project_id,
         )
-        docs = self._parse_workflow_docs_payload(response.content)
+
+        # Check if documents were written via tools
+        state = self.repository.get_workflow_doc_state(project_id)
+        if state and state.get("pending_docs"):
+            pending = state.get("pending_docs", {})
+            docs = {
+                "constitution_markdown": str(pending.get("constitution_markdown", "")).strip(),
+                "clarify_markdown": str(pending.get("clarify_markdown", "")).strip(),
+                "specification_markdown": str(pending.get("specification_markdown", "")).strip(),
+                "plan_markdown": str(pending.get("plan_markdown", "")).strip(),
+                "written_keys": [k.replace("_markdown", "") for k, v in pending.items() if v and k.endswith("_markdown")],
+                "assistant_message": response.content.strip() or tr("ai.chat.empty_fallback"),
+            }
+        else:
+            docs = self._parse_workflow_docs_payload(response.content)
+
         written_keys = [str(item) for item in list(docs.get("written_keys", []) or []) if str(item).strip()]
         ignored_keys = [str(item) for item in list(docs.get("ignored_keys", []) or []) if str(item).strip()]
         assistant_message = str(docs.get("assistant_message", "")).strip()
@@ -1962,6 +2105,10 @@ class AIService:
             parts.append("[Specification]\n" + specification)
         if plan:
             parts.append("[Plan]\n" + plan)
+        skipped_docs = self._normalized_guide_skipped_docs(project_id)
+        if skipped_docs:
+            skipped_labels = [_GUIDE_DOC_LABELS.get(slot, slot) for slot in skipped_docs]
+            parts.append("[Guide Skipped Docs]\n" + ", ".join(skipped_labels))
         state = self.repository.get_workflow_doc_state(project_id)
         if state is not None:
             stage = str(state.get("workflow_stage", "") or "").strip()
@@ -1985,6 +2132,88 @@ class AIService:
                 if pending_plan:
                     parts.append("[Pending Plan]\n" + pending_plan)
         return "\n\n".join(parts).strip()
+
+    def _normalized_guide_skipped_docs(self, project_id: str) -> list[str]:
+        settings = self._project_settings(project_id)
+        raw = getattr(settings, "guide_skipped_docs", [])
+        if not isinstance(raw, list):
+            return []
+        normalized: list[str] = []
+        for item in raw:
+            slot = _GUIDE_DOC_ALIASES.get(str(item or "").strip().lower(), "")
+            if not slot:
+                continue
+            if slot not in normalized:
+                normalized.append(slot)
+        return normalized
+
+    def _workflow_doc_status(self, project_id: str) -> dict[str, Any]:
+        settings = self._project_settings(project_id)
+        docs = {
+            "constitution_markdown": str(getattr(settings, "constitution_markdown", "") or "").strip(),
+            "clarify_markdown": str(getattr(settings, "clarify_markdown", "") or "").strip(),
+            "specification_markdown": str(getattr(settings, "specification_markdown", "") or "").strip(),
+            "plan_markdown": str(getattr(settings, "plan_markdown", "") or "").strip(),
+        }
+        skipped_slots = self._normalized_guide_skipped_docs(project_id)
+        skipped_set = set(skipped_slots)
+        missing_slots = [slot for slot, value in docs.items() if not value and slot not in skipped_set]
+        return {
+            "docs": docs,
+            "missing_slots": missing_slots,
+            "missing_labels": [_GUIDE_DOC_LABELS.get(slot, slot) for slot in missing_slots],
+            "skipped_slots": skipped_slots,
+            "skipped_labels": [_GUIDE_DOC_LABELS.get(slot, slot) for slot in skipped_slots],
+            "complete": not missing_slots,
+        }
+
+    def _chat_global_guide_prompt(
+        self,
+        project_id: str,
+        message: str,
+        *,
+        route: str,
+        missing_labels: list[str] | None = None,
+    ) -> str:
+        base = self._chat_global_prompt(project_id, message, route=route)
+        missing = [str(item).strip() for item in list(missing_labels or []) if str(item).strip()]
+        missing_text = ", ".join(missing) if missing else "none"
+        lines = [
+            base,
+            "",
+            "[GuideModeContract]",
+            "This turn is in mandatory outline-guide mode.",
+            "Target docs: constitution, clarify, specification, plan.",
+            f"Missing docs right now: {missing_text}.",
+            "You may ask concise clarification questions first, then write docs when information is sufficient.",
+            "Use write_document to persist finalized doc content. Do not output chapter/story prose here.",
+            "If user explicitly asks to skip a doc, call skip_document instead of writing that doc.",
+            "Do not claim tool success without actual tool results.",
+            "Keep reply concise: status + at most one short follow-up question.",
+        ]
+        return "\n".join(lines).strip()
+
+    def _extract_guide_skip_document_request(self, raw: Any) -> str:
+        if not isinstance(raw, dict):
+            return ""
+        logs = raw.get("agent_tool_calls")
+        if not isinstance(logs, list):
+            return ""
+        for item in reversed(logs):
+            if not isinstance(item, dict):
+                continue
+            tool_name = str(item.get("tool_name", "") or "").strip().lower()
+            if tool_name != "skip_document":
+                continue
+            result_meta = item.get("result_meta")
+            if not isinstance(result_meta, dict):
+                continue
+            if not bool(result_meta.get("skip_document_requested", False)):
+                continue
+            doc_type = str(result_meta.get("skip_document_type", "") or "").strip().lower()
+            if doc_type in {"constitution", "clarify", "specification", "plan"}:
+                return doc_type
+        return ""
 
     def _combine_chat_prompt_context(
         self,
@@ -2681,6 +2910,93 @@ class AIService:
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         return cleaned, route
 
+    def _build_global_tool_gate_specs(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "name": "request_tool_mode",
+                "description": (
+                    "Request entering tool loop for this turn. "
+                    "Set write_document_enabled=true only when workflow docs must be written."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "enable_tool_loop": {
+                            "type": "boolean",
+                            "description": "Whether to enable full tool loop for current turn.",
+                        },
+                        "write_document_enabled": {
+                            "type": "boolean",
+                            "description": "Whether write_document tool is required in this turn.",
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Short reason for the decision.",
+                        },
+                    },
+                    "required": ["enable_tool_loop"],
+                },
+            }
+        ]
+
+    def _append_global_tool_gate_contract(self, prompt: str) -> str:
+        base = str(prompt or "").strip()
+        available_tools = (
+            "search_text, read_chunk, read_neighbors, get_chapter_outline, "
+            "get_world_state, get_effective_directives, write_document(optional)"
+        )
+        lines = [
+            base,
+            "",
+            "[ToolModeGate]",
+            f"Runtime tool inventory exists: {available_tools}.",
+            "Important: these runtime tools are only callable after entering tool loop.",
+            "Outside loop, any non-gate tool call will be blocked by backend and not executed.",
+            "If normal text response is enough, answer directly without tool calls.",
+            "If tool usage is needed, call request_tool_mode exactly once.",
+            'Example: {"enable_tool_loop":true,"write_document_enabled":false,"reason":"need retrieval"}',
+            "Set write_document_enabled=true only if workflow docs must be written via write_document.",
+            "Do not claim tool execution success unless tool loop actually returns tool results.",
+            "Never fabricate tool outputs.",
+        ]
+        return "\n".join(lines).strip()
+
+    def _extract_global_tool_gate_decision(
+        self,
+        tool_calls: list[dict[str, Any]],
+    ) -> dict[str, bool]:
+        def _as_bool(value: Any) -> bool:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return bool(value)
+            if isinstance(value, str):
+                text = value.strip().lower()
+                if text in {"1", "true", "yes", "on"}:
+                    return True
+                if text in {"0", "false", "no", "off"}:
+                    return False
+            return False
+
+        decision = {"enable_tool_loop": False, "write_document_enabled": False}
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            name = str(call.get("name", "")).strip().lower()
+            if name not in {"request_tool_mode", "enable_tool_loop"}:
+                continue
+            args = call.get("arguments")
+            if not isinstance(args, dict):
+                args = {}
+            enable_tool_loop = _as_bool(args.get("enable_tool_loop"))
+            write_document_enabled = _as_bool(args.get("write_document_enabled"))
+            if enable_tool_loop or write_document_enabled:
+                decision["enable_tool_loop"] = True
+            if write_document_enabled:
+                decision["write_document_enabled"] = True
+            break
+        return decision
+
     def _project_snapshot_prompt(self, project_id: str, *, max_nodes: int = 18, max_edges: int = 30) -> str:
         nodes = self.graph_service.list_nodes(project_id)
         edges = self.graph_service.list_edges(project_id)
@@ -3025,7 +3341,14 @@ class AIService:
             return True
         if project_id and self._strict_json_fence_output_enabled(project_id):
             return False
-        enabled_tasks = {"generate_chapter", "chapter_write", "chapter_correction", "chat_writer"}
+        enabled_tasks = {
+            "generate_chapter",
+            "chapter_write",
+            "chapter_correction",
+            "chat_writer",
+            "workflow_docs_draft",
+            "workflow_docs_revise",
+        }
         return task_type in enabled_tasks
 
     def _tool_loop_limits(
@@ -3166,6 +3489,23 @@ class AIService:
         agent_name = self._agent_name_for_task(task_type)
         tool_context_node_id = str(platform_config.get("tool_context_node_id", "") or "").strip()
         tool_thread_id = str(platform_config.get("tool_thread_id", "") or "").strip()
+        write_document_enabled = bool(platform_config.get("write_document_enabled", False))
+        allow_skip_document = bool(platform_config.get("allow_skip_document", False))
+        write_document_required_default = (
+            write_document_enabled and task_type in {"workflow_docs_draft", "workflow_docs_revise"}
+        )
+        write_document_required = bool(
+            platform_config.get("write_document_required", write_document_required_default)
+        )
+        loop_platform_config = dict(platform_config)
+        native_tools = self._build_native_tool_specs(
+            write_proposal_enabled=write_proposal_enabled,
+            write_document_enabled=write_document_enabled,
+            allow_skip_document=allow_skip_document,
+        )
+        if native_tools:
+            loop_platform_config["native_tools"] = native_tools
+            loop_platform_config.setdefault("native_tool_choice", {"type": "auto"})
         for round_no in range(1, max_rounds + 1):
             round_prompt = self._build_tool_loop_prompt(
                 base_prompt=base_prompt,
@@ -3177,13 +3517,16 @@ class AIService:
                 total_read_char_limit=total_read_char_limit,
                 write_proposal_enabled=write_proposal_enabled,
                 force_final_only=force_final_only,
+                write_document_enabled=write_document_enabled,
+                write_document_required=write_document_required,
+                allow_skip_document=allow_skip_document,
             )
             prompt_hash = hashlib.sha256(round_prompt.encode("utf-8")).hexdigest()
             request = LLMRequest(
                 task_type=task_type,
                 system_prompt=system_prompt,
                 messages=[LLMMessage(role="user", content=round_prompt)],
-                platform_config=platform_config,
+                platform_config=loop_platform_config,
             )
             response = adapter.generate(request)
             if not response.ok:
@@ -3191,18 +3534,21 @@ class AIService:
             last_response = response
             total_prompt_tokens += int(response.prompt_tokens)
             total_completion_tokens += int(response.completion_tokens)
-            parsed = self._parse_tool_loop_payload(response.content)
+            parsed = self._parse_tool_loop_response(response)
             parsed_calls = cast(list[dict[str, Any]], parsed["tool_calls"])
             final_candidate = str(parsed["final_content"] or "").strip()
+            action_hint = str(parsed.get("action", "") or "").strip().lower()
+            if action_hint == "tool_calls":
+                final_candidate = ""
             call_budget = max_calls_per_round
-            if force_final_only and not final_candidate:
+            if force_final_only or action_hint == "final":
                 selected_calls: list[dict[str, Any]] = []
             else:
                 selected_calls = parsed_calls[:call_budget]
             truncated_calls = len(parsed_calls) > len(selected_calls)
-            round_status = "final"
+            round_status = "no_action"
             round_had_progress = False
-            if final_candidate:
+            if final_candidate and not selected_calls:
                 no_progress_rounds = 0
                 round_status = "final"
             elif selected_calls:
@@ -3219,6 +3565,8 @@ class AIService:
                         tool_context_node_id=tool_context_node_id,
                         tool_thread_id=tool_thread_id,
                         write_proposal_enabled=write_proposal_enabled,
+                        write_document_enabled=write_document_enabled,
+                        allow_skip_document=allow_skip_document,
                         tool_response_cache=tool_response_cache,
                         single_read_char_limit=single_read_char_limit,
                         total_read_char_limit=total_read_char_limit,
@@ -3240,7 +3588,11 @@ class AIService:
                                 continue
                             evidence_seen.add(clean_chunk_id)
                             evidence_chunk_ids.append(clean_chunk_id)
-                    if bool(result_meta.get("proposal_created", False)):
+                    if bool(result_meta.get("proposal_created", False)) or bool(
+                        result_meta.get("document_written", False)
+                    ):
+                        round_had_progress = True
+                    if bool(result_meta.get("skip_document_requested", False)):
                         round_had_progress = True
                     tool_logs.append(
                         {
@@ -3288,6 +3640,24 @@ class AIService:
                     round_status = "max_rounds_reached"
             elif force_final_only and not final_candidate:
                 round_status = "force_finalize_no_final"
+            else:
+                no_progress_rounds += 1
+                if (
+                    no_progress_rounds >= no_progress_limit
+                    and round_no < max_rounds
+                    and not force_final_only
+                ):
+                    force_final_only = True
+                    fallback_content = "工具调用连续无新增有效信息，已切换为阶段性收敛模式。"
+                    tool_result_blocks.append(
+                        "[SystemNote] No valid tool action was returned."
+                        " Return final answer without any tool_calls."
+                    )
+                    round_status = "force_finalize"
+                elif round_no < max_rounds:
+                    round_status = "no_action"
+                else:
+                    round_status = "max_rounds_reached"
             round_logs.append(
                 {
                     "round_no": round_no,
@@ -3304,10 +3674,12 @@ class AIService:
                     "created_at": utc_now().isoformat(),
                 }
             )
-            if round_status in {"tool_calls", "force_finalize"}:
+            if round_status in {"tool_calls", "force_finalize", "no_action"}:
                 continue
             if force_final_only and not final_candidate:
                 final_content = fallback_content or "已达到无进展阈值，请给出阶段性结论。"
+            elif round_status == "max_rounds_reached" and not final_candidate:
+                final_content = fallback_content or "已达到最大轮次，请给出阶段性结论。"
             else:
                 final_content = final_candidate or str(response.content or "").strip()
             break
@@ -3348,6 +3720,148 @@ class AIService:
             raw=final_raw,
         )
 
+    def _build_native_tool_specs(
+        self,
+        *,
+        write_proposal_enabled: bool,
+        write_document_enabled: bool,
+        allow_skip_document: bool,
+    ) -> list[dict[str, Any]]:
+        tools: list[dict[str, Any]] = [
+            {
+                "name": "search_text",
+                "description": "Search relevant text chunks by query.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Keyword query to search."},
+                        "top_k": {"type": "integer", "description": "Max chunks to return."},
+                    },
+                    "required": ["query"],
+                },
+            },
+            {
+                "name": "read_chunk",
+                "description": "Read one chunk by chunk_id.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "chunk_id": {"type": "string", "description": "Target chunk id."},
+                    },
+                    "required": ["chunk_id"],
+                },
+            },
+            {
+                "name": "read_neighbors",
+                "description": "Read nearby chunks around a chunk_id.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "chunk_id": {"type": "string", "description": "Center chunk id."},
+                        "before": {"type": "integer", "description": "How many chunks before center."},
+                        "after": {"type": "integer", "description": "How many chunks after center."},
+                    },
+                    "required": ["chunk_id"],
+                },
+            },
+            {
+                "name": "get_chapter_outline",
+                "description": "Get outline markdown for current chapter node.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "node_id": {"type": "string", "description": "Chapter node id."},
+                    },
+                    "required": [],
+                },
+            },
+            {
+                "name": "get_world_state",
+                "description": "Get project world-state snapshot for entities and variables.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "keys": {
+                            "type": "object",
+                            "properties": {
+                                "character_ids": {"type": "array", "items": {"type": "string"}},
+                                "item_ids": {"type": "array", "items": {"type": "string"}},
+                                "world_variable_keys": {"type": "array", "items": {"type": "string"}},
+                            },
+                        }
+                    },
+                    "required": [],
+                },
+            },
+            {
+                "name": "get_effective_directives",
+                "description": "Read effective writing directives and constraints.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                    },
+                    "required": [],
+                },
+            },
+        ]
+        if write_proposal_enabled:
+            tools.append(
+                {
+                    "name": "propose_setting_change",
+                    "description": "Create a setting-change proposal for user review.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "target_scope": {"type": "string", "description": "project or global"},
+                            "proposal_type": {"type": "string"},
+                            "title": {"type": "string"},
+                            "content": {"type": "string"},
+                            "reason": {"type": "string"},
+                            "node_id": {"type": "string"},
+                        },
+                        "required": ["proposal_type", "title", "content"],
+                    },
+                }
+            )
+        if write_document_enabled:
+            tools.append(
+                {
+                    "name": "write_document",
+                    "description": "Write one workflow document.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "document_type": {
+                                "type": "string",
+                                "enum": ["constitution", "clarify", "specification", "plan"],
+                            },
+                            "content": {"type": "string"},
+                        },
+                        "required": ["document_type", "content"],
+                    },
+                }
+            )
+        if allow_skip_document:
+            tools.append(
+                {
+                    "name": "skip_document",
+                    "description": "Request skipping one workflow document with user confirmation.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "document_type": {
+                                "type": "string",
+                                "enum": ["constitution", "clarify", "specification", "plan"],
+                            },
+                            "reason": {"type": "string"},
+                        },
+                        "required": ["document_type"],
+                    },
+                }
+            )
+        return tools
+
     def _build_tool_loop_prompt(
         self,
         *,
@@ -3360,6 +3874,9 @@ class AIService:
         total_read_char_limit: int,
         write_proposal_enabled: bool,
         force_final_only: bool,
+        write_document_enabled: bool = False,
+        write_document_required: bool = False,
+        allow_skip_document: bool = False,
     ) -> str:
         tool_names = [
             "search_text",
@@ -3371,11 +3888,18 @@ class AIService:
         ]
         if write_proposal_enabled:
             tool_names.append("propose_setting_change")
+        if write_document_enabled:
+            tool_names.append("write_document")
+        if allow_skip_document:
+            tool_names.append("skip_document")
         lines: list[str] = [str(base_prompt or "").strip(), ""]
         lines.extend(
             [
                 "[ToolLoopContract]",
                 "You may either provide final answer directly, or return JSON object:",
+                '{"action":"tool_calls","tool_calls":[{"name":"search_text","arguments":{"query":"...","top_k":5}}]}',
+                '{"action":"final","final_answer":"..."}',
+                "Legacy format is also accepted:",
                 '{"tool_calls":[{"name":"search_text","arguments":{"query":"...","top_k":5}}],'
                 '"final_answer":"..."}',
                 "Allowed tools: " + ", ".join(tool_names) + ".",
@@ -3389,6 +3913,33 @@ class AIService:
                 "When using source text, include chunk_id references in final answer if possible.",
             ]
         )
+        if write_document_enabled and write_document_required:
+            lines.extend(
+                [
+                    "",
+                    "[IMPORTANT] You MUST use write_document tool to write content, DO NOT output content directly.",
+                    'Example: {"action":"tool_calls","tool_calls":[{"name":"write_document","arguments":{"document_type":"constitution","content":"..."}}]}',
+                    "Valid document_type: constitution, clarify, specification, plan.",
+                ]
+            )
+        elif write_document_enabled:
+            lines.extend(
+                [
+                    "",
+                    "[GuideDraftMode]",
+                    "When requirements are still unclear, ask one concise clarification question.",
+                    "When enough information is available, call write_document to persist one or more docs.",
+                    "Do not output long story/chapter content in guide mode.",
+                ]
+            )
+        if allow_skip_document:
+            lines.extend(
+                [
+                    "[SkipRule]",
+                    "Only call skip_document when user explicitly confirms skipping a specific doc.",
+                    "Do not skip docs by assumption.",
+                ]
+            )
         if force_final_only:
             lines.extend(
                 [
@@ -3405,8 +3956,16 @@ class AIService:
     def _parse_tool_loop_payload(self, text: str) -> dict[str, Any]:
         payload = self._parse_outline_guide_payload(str(text or ""), strict_json_fence=False)
         if not payload:
-            return {"tool_calls": [], "final_content": str(text or "").strip()}
+            return {
+                "tool_calls": [],
+                "final_content": str(text or "").strip(),
+                "action": "",
+            }
         raw_calls = payload.get("tool_calls")
+        if not isinstance(raw_calls, list):
+            raw_calls = payload.get("tools")
+        if not isinstance(raw_calls, list):
+            raw_calls = payload.get("tool_uses")
         calls: list[dict[str, Any]] = []
         if isinstance(raw_calls, list):
             for item in raw_calls:
@@ -3437,7 +3996,114 @@ class AIService:
             or payload.get("answer")
             or ""
         ).strip()
-        return {"tool_calls": calls, "final_content": final_content}
+        action = self._normalize_tool_loop_action(
+            payload.get("action")
+            or payload.get("next_action")
+            or payload.get("loop_action")
+            or payload.get("decision")
+            or ""
+        )
+        return {"tool_calls": calls, "final_content": final_content, "action": action}
+
+    def _parse_tool_loop_response(self, response: LLMResponse) -> dict[str, Any]:
+        parsed = self._parse_tool_loop_payload(response.content)
+        tool_calls = list(cast(list[dict[str, Any]], parsed.get("tool_calls", [])))
+        final_content = str(parsed.get("final_content", "") or "").strip()
+        action = self._normalize_tool_loop_action(parsed.get("action", ""))
+        raw = response.raw if isinstance(response.raw, dict) else {}
+        if not raw:
+            return {
+                "tool_calls": tool_calls,
+                "final_content": final_content,
+                "action": action,
+            }
+
+        raw_action = self._normalize_tool_loop_action(
+            raw.get("action")
+            or raw.get("next_action")
+            or raw.get("loop_action")
+            or raw.get("decision")
+            or ""
+        )
+        if raw_action:
+            action = raw_action
+
+        raw_final_content = str(
+            raw.get("final_answer")
+            or raw.get("final_content")
+            or raw.get("answer")
+            or raw.get("content_text")
+            or ""
+        ).strip()
+
+        raw_calls: list[dict[str, Any]] = []
+        for key in ("tool_calls", "tools", "tool_uses"):
+            value = raw.get(key)
+            if isinstance(value, list):
+                raw_calls.extend(self._parse_tool_call_items(value))
+
+        raw_content = raw.get("content")
+        if isinstance(raw_content, list):
+            text_blocks: list[str] = []
+            for block in raw_content:
+                if not isinstance(block, dict):
+                    continue
+                block_type = str(block.get("type") or "").strip().lower()
+                if block_type in {"tool_use", "tool_call", "function_call"}:
+                    raw_calls.extend(self._parse_tool_call_items([block]))
+                    continue
+                if block_type in {"text", "output_text"}:
+                    text = str(block.get("text") or block.get("content") or "").strip()
+                    if text:
+                        text_blocks.append(text)
+            if text_blocks and not raw_final_content:
+                raw_final_content = "\n".join(text_blocks).strip()
+
+        if raw_calls:
+            tool_calls = raw_calls
+            if not action:
+                action = "tool_calls"
+        if raw_final_content:
+            final_content = raw_final_content
+
+        return {
+            "tool_calls": tool_calls,
+            "final_content": final_content,
+            "action": action,
+        }
+
+    def _normalize_tool_loop_action(self, value: Any) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized in {"tool_calls", "tool_call", "call_tools", "tools", "continue", "next"}:
+            return "tool_calls"
+        if normalized in {"final", "finalize", "done", "complete", "answer", "stop"}:
+            return "final"
+        return ""
+
+    def _parse_tool_call_items(self, items: list[Any]) -> list[dict[str, Any]]:
+        calls: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = str(
+                item.get("name")
+                or item.get("tool")
+                or item.get("tool_name")
+                or ""
+            ).strip()
+            if not name:
+                continue
+            raw_args = item.get("input", item.get("arguments", item.get("args", {})))
+            if isinstance(raw_args, str):
+                try:
+                    loaded = json.loads(raw_args)
+                except Exception:
+                    loaded = {}
+                raw_args = loaded
+            if not isinstance(raw_args, dict):
+                raw_args = {}
+            calls.append({"name": name.lower(), "arguments": raw_args})
+        return calls
 
     def _normalize_tool_call_arguments(
         self,
@@ -3557,6 +4223,55 @@ class AIService:
                 "directive_text": directive_text,
                 "note": note,
             }, ""
+        if normalized == "write_document":
+            document_type_raw = _clean_text(
+                raw.get("document_type")
+                or raw.get("doc_type")
+                or raw.get("type"),
+                limit=64,
+            ).lower()
+            aliases = {
+                "constitution_markdown": "constitution",
+                "clarify_markdown": "clarify",
+                "specification_markdown": "specification",
+                "plan_markdown": "plan",
+            }
+            document_type = aliases.get(document_type_raw, document_type_raw)
+            if document_type not in {"constitution", "clarify", "specification", "plan"}:
+                return {}, "document_type is required"
+            content = _clean_text(
+                raw.get("content")
+                or raw.get("markdown")
+                or raw.get("text"),
+                limit=12000,
+            )
+            if not content:
+                return {}, "content is required"
+            return {
+                "document_type": document_type,
+                "content": content,
+            }, ""
+        if normalized == "skip_document":
+            document_type_raw = _clean_text(
+                raw.get("document_type")
+                or raw.get("doc_type")
+                or raw.get("type"),
+                limit=64,
+            ).lower()
+            aliases = {
+                "constitution_markdown": "constitution",
+                "clarify_markdown": "clarify",
+                "specification_markdown": "specification",
+                "plan_markdown": "plan",
+            }
+            document_type = aliases.get(document_type_raw, document_type_raw)
+            if document_type not in {"constitution", "clarify", "specification", "plan"}:
+                return {}, "document_type is required"
+            reason = _clean_text(raw.get("reason") or raw.get("note"), limit=300)
+            return {
+                "document_type": document_type,
+                "reason": reason,
+            }, ""
         return {}, "unknown_tool"
 
     def _tool_cache_key(
@@ -3584,6 +4299,8 @@ class AIService:
         tool_context_node_id: str,
         tool_thread_id: str,
         write_proposal_enabled: bool,
+        write_document_enabled: bool,
+        allow_skip_document: bool,
         tool_response_cache: dict[str, tuple[Any, int, dict[str, Any]]],
         single_read_char_limit: int,
         total_read_char_limit: int,
@@ -3595,6 +4312,12 @@ class AIService:
             arguments=arguments,
             tool_context_node_id=tool_context_node_id,
         )
+        def _payload_chars(payload: Any) -> int:
+            try:
+                return len(json.dumps(payload, ensure_ascii=False))
+            except Exception:
+                return len(str(payload or ""))
+
         if args_error:
             reason = "unknown_tool" if args_error == "unknown_tool" else "invalid_arguments"
             return (
@@ -3712,21 +4435,51 @@ class AIService:
                     project_id=project_id,
                     node_id=str(normalized_args.get("node_id", "")),
                 )
+                returned_chars = _payload_chars(payload)
+                if total_read_chars + returned_chars > total_read_char_limit:
+                    return (
+                        {
+                            "error": "total_read_char_limit_exceeded",
+                            "remaining_chars": max(0, total_read_char_limit - total_read_chars),
+                        },
+                        0,
+                        {"ok": False, "reason": "total_read_char_limit_exceeded"},
+                    )
                 result_meta = {"ok": True, "cache_hit": False}
-                tool_response_cache[cache_key] = (payload, 0, dict(result_meta))
-                return payload, 0, result_meta
+                tool_response_cache[cache_key] = (payload, returned_chars, dict(result_meta))
+                return payload, returned_chars, result_meta
             if normalized == "get_world_state":
                 payload = self.readable_tool_service.get_world_state(
                     project_id=project_id,
                     keys=cast(dict[str, Any], normalized_args.get("keys", {})),
                 )
+                returned_chars = _payload_chars(payload)
+                if total_read_chars + returned_chars > total_read_char_limit:
+                    return (
+                        {
+                            "error": "total_read_char_limit_exceeded",
+                            "remaining_chars": max(0, total_read_char_limit - total_read_chars),
+                        },
+                        0,
+                        {"ok": False, "reason": "total_read_char_limit_exceeded"},
+                    )
                 result_meta = {"ok": True, "cache_hit": False}
-                tool_response_cache[cache_key] = (payload, 0, dict(result_meta))
-                return payload, 0, result_meta
+                tool_response_cache[cache_key] = (payload, returned_chars, dict(result_meta))
+                return payload, returned_chars, result_meta
             if normalized == "get_effective_directives":
                 target_project_id = str(normalized_args.get("project_id") or project_id).strip()
                 payload = self.readable_tool_service.get_effective_directives(project_id=target_project_id)
-                return payload, 0, {"ok": True}
+                returned_chars = _payload_chars(payload)
+                if total_read_chars + returned_chars > total_read_char_limit:
+                    return (
+                        {
+                            "error": "total_read_char_limit_exceeded",
+                            "remaining_chars": max(0, total_read_char_limit - total_read_chars),
+                        },
+                        0,
+                        {"ok": False, "reason": "total_read_char_limit_exceeded"},
+                    )
+                return payload, returned_chars, {"ok": True}
             if normalized == "propose_setting_change":
                 if not write_proposal_enabled:
                     return (
@@ -3767,6 +4520,115 @@ class AIService:
                     "proposal_created": True,
                     "proposal_id": str(proposal.get("id", "")),
                 }
+            if normalized == "write_document":
+                if not write_document_enabled:
+                    return (
+                        {"error": "write_document_tool_disabled"},
+                        0,
+                        {"ok": False, "reason": "write_document_tool_disabled"},
+                    )
+                doc_type = str(normalized_args.get("document_type", "")).strip()
+                content = str(normalized_args.get("content", "")).strip()
+                if not doc_type or not content:
+                    return (
+                        {"error": "document_type and content required"},
+                        0,
+                        {"ok": False, "reason": "invalid_arguments"},
+                    )
+                valid_types = {"constitution", "clarify", "specification", "plan"}
+                if doc_type not in valid_types:
+                    return (
+                        {"error": f"invalid document_type, must be one of: {', '.join(valid_types)}"},
+                        0,
+                        {"ok": False, "reason": "invalid_arguments"},
+                    )
+                doc_key = f"{doc_type}_markdown"
+                state = self.repository.get_workflow_doc_state(project_id)
+                if state is None:
+                    state = self.repository.upsert_workflow_doc_state(
+                        project_id,
+                        workflow_mode="original",
+                        workflow_stage="draft",
+                        workflow_initialized=True,
+                        round_number=1,
+                        assistant_message="",
+                        collected_inputs={},
+                        clarify_questions=[],
+                        pending_docs={},
+                        published_docs={},
+                    )
+                pending_docs = {
+                    str(k): str(v or "")
+                    for k, v in dict(state.get("pending_docs", {})).items()
+                }
+                pending_docs[doc_key] = content
+                collected_inputs = {
+                    str(k): str(v or "")
+                    for k, v in dict(state.get("collected_inputs", {})).items()
+                }
+                clarify_questions = [
+                    str(item).strip()
+                    for item in list(state.get("clarify_questions", []))
+                    if str(item).strip()
+                ]
+                published_docs = {
+                    str(k): str(v or "")
+                    for k, v in dict(state.get("published_docs", {})).items()
+                }
+                self.repository.upsert_workflow_doc_state(
+                    project_id,
+                    workflow_mode=str(state.get("workflow_mode", "")).strip() or "original",
+                    workflow_stage=str(state.get("workflow_stage", "")).strip() or "idle",
+                    workflow_initialized=bool(state.get("workflow_initialized", False)),
+                    round_number=max(0, int(state.get("round_number", 0) or 0)),
+                    assistant_message=str(state.get("assistant_message", "") or ""),
+                    collected_inputs=collected_inputs,
+                    clarify_questions=clarify_questions,
+                    pending_docs=pending_docs,
+                    published_docs=published_docs,
+                )
+                persisted = self._persist_workflow_doc_to_project_settings(
+                    project_id=project_id,
+                    doc_key=doc_key,
+                    content=content,
+                )
+                payload = {
+                    "document_type": doc_type,
+                    "status": "written",
+                    "chars": len(content),
+                    "project_settings_updated": persisted,
+                }
+                return payload, 0, {
+                    "ok": True,
+                    "document_written": True,
+                    "project_settings_updated": persisted,
+                }
+            if normalized == "skip_document":
+                if not allow_skip_document:
+                    return (
+                        {"error": "skip_document_tool_disabled"},
+                        0,
+                        {"ok": False, "reason": "skip_document_tool_disabled"},
+                    )
+                doc_type = str(normalized_args.get("document_type", "")).strip().lower()
+                if doc_type not in {"constitution", "clarify", "specification", "plan"}:
+                    return (
+                        {"error": "invalid document_type"},
+                        0,
+                        {"ok": False, "reason": "invalid_arguments"},
+                    )
+                payload = {
+                    "document_type": doc_type,
+                    "status": "pending_user_confirm",
+                    "reason": str(normalized_args.get("reason", "")).strip(),
+                    "requires_user_confirmation": True,
+                }
+                return payload, 0, {
+                    "ok": True,
+                    "skip_document_requested": True,
+                    "skip_document_type": doc_type,
+                    "requires_user_confirmation": True,
+                }
             return (
                 {"error": f"unknown_tool:{normalized}"},
                 0,
@@ -3778,6 +4640,40 @@ class AIService:
                 0,
                 {"ok": False, "reason": "execution_error", "error": str(exc)},
             )
+
+    def _persist_workflow_doc_to_project_settings(
+        self,
+        *,
+        project_id: str,
+        doc_key: str,
+        content: str,
+    ) -> bool:
+        clean_doc_key = str(doc_key or "").strip()
+        if clean_doc_key not in {
+            "constitution_markdown",
+            "clarify_markdown",
+            "specification_markdown",
+            "plan_markdown",
+        }:
+            return False
+        text = str(content or "").strip()
+        project = self.repository.get_project(project_id)
+        if project is None:
+            return False
+        setattr(project.settings, clean_doc_key, text)
+        current_skips = list(getattr(project.settings, "guide_skipped_docs", []) or [])
+        filtered_skips: list[str] = []
+        for item in current_skips:
+            slot = _GUIDE_DOC_ALIASES.get(str(item or "").strip().lower(), "")
+            if not slot or slot == clean_doc_key:
+                continue
+            if slot not in filtered_skips:
+                filtered_skips.append(slot)
+        project.settings.guide_skipped_docs = filtered_skips
+        project.updated_at = utc_now()
+        project.active_revision += 1
+        self.repository.update_project(project)
+        return True
 
     def _tool_result_for_prompt(
         self,
@@ -3821,6 +4717,7 @@ class AIService:
         tool_errors = 0
         cache_hits = 0
         proposal_created = 0
+        document_written = 0
         truncated_reads = 0
         for call in tool_logs:
             result_meta = call.get("result_meta")
@@ -3832,6 +4729,8 @@ class AIService:
                 cache_hits += 1
             if bool(result_meta.get("proposal_created", False)):
                 proposal_created += 1
+            if bool(result_meta.get("document_written", False)):
+                document_written += 1
             if bool(result_meta.get("truncated", False)):
                 truncated_reads += 1
         round_statuses = [str(item.get("status", "")) for item in round_logs]
@@ -3841,6 +4740,7 @@ class AIService:
             "tool_error_count": tool_errors,
             "cache_hit_count": cache_hits,
             "proposal_created_count": proposal_created,
+            "document_written_count": document_written,
             "truncated_read_count": truncated_reads,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,

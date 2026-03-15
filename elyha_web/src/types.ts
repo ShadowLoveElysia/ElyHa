@@ -14,6 +14,7 @@ export interface ProjectSettings {
   clarify_markdown: string;
   specification_markdown: string;
   plan_markdown: string;
+  guide_skipped_docs: string[];
   global_directives: string;
   context_soft_min_chars: number;
   context_soft_max_chars: number;
@@ -90,8 +91,10 @@ export interface UpdateNodePayload {
 export interface RuntimeConfigPayload {
   locale: string;
   llm_provider: string;
+  llm_transport: string;
   api_url: string;
   api_key: string;
+  api_key_mask: string;
   model_name: string;
   auto_complete: boolean;
   think_switch: boolean;
@@ -120,6 +123,7 @@ export interface LlmPresetPayload {
   name: string;
   group: string;
   api_format: string;
+  llm_transport: string;
   api_url: string;
   auto_complete: boolean;
   default_model: string;
@@ -154,6 +158,7 @@ export interface AiChatPayload {
   message: string;
   node_id?: string;
   thread_id?: string;
+  guide_mode?: boolean;
   token_budget?: number;
 }
 
@@ -177,7 +182,39 @@ export interface AiChatResponse {
   updated_node_id: string | null;
   suggested_node_ids: string[];
   suggested_options: AiSuggestedOption[];
+  guide_skip_document?: string;
   revision: number;
+}
+
+export interface ChatThreadSummary {
+  thread_id: string;
+  project_id: string;
+  node_id: string;
+  created_at: string;
+  updated_at: string;
+  last_role: string;
+  last_content: string;
+  last_message_at: string;
+  message_count: number;
+}
+
+export interface ChatMessagePayload {
+  role: string;
+  content: string;
+  created_at: string;
+}
+
+export interface ChatThreadsResponse {
+  project_id: string;
+  count: number;
+  threads: ChatThreadSummary[];
+}
+
+export interface ChatThreadMessagesResponse {
+  project_id: string;
+  thread_id: string;
+  count: number;
+  messages: ChatMessagePayload[];
 }
 
 export interface ClarificationQuestionPayload {

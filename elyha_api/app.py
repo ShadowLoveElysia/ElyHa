@@ -43,6 +43,13 @@ from elyha_core.storage.sqlite_store import SQLiteStore
 API_KEY_CONFIGURED_PLACEHOLDER = "__ELYHA_API_KEY_CONFIGURED__"
 
 
+def _mask_secret(value: str) -> str:
+    secret = str(value or "")
+    if not secret:
+        return ""
+    return "*" * len(secret)
+
+
 @dataclass(slots=True)
 class ServiceContainer:
     project_service: ProjectService
@@ -76,6 +83,7 @@ class UpdateSettingsRequest(BaseModel):
     clarify_markdown: str | None = Field(default=None, max_length=12000)
     specification_markdown: str | None = Field(default=None, max_length=12000)
     plan_markdown: str | None = Field(default=None, max_length=12000)
+    guide_skipped_docs: list[str] | None = None
     global_directives: str | None = Field(default=None, max_length=12000)
     context_soft_min_chars: int | None = Field(default=None, ge=1)
     context_soft_max_chars: int | None = Field(default=None, ge=1)
@@ -220,6 +228,7 @@ class ChatAssistRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     node_id: str | None = None
     thread_id: str | None = Field(default=None, min_length=1, max_length=128)
+    guide_mode: bool = False
     token_budget: int = Field(default=1800, ge=1)
 
 
@@ -360,6 +369,7 @@ class ReviewSettingProposalsBatchRequest(BaseModel):
 class UpdateRuntimeSettingsRequest(BaseModel):
     locale: str | None = None
     llm_provider: str | None = None
+    llm_transport: str | None = None
     api_url: str | None = None
     api_key: str | None = None
     model_name: str | None = None
@@ -411,6 +421,7 @@ def _to_project_payload(project) -> dict[str, Any]:
             "clarify_markdown": project.settings.clarify_markdown,
             "specification_markdown": project.settings.specification_markdown,
             "plan_markdown": project.settings.plan_markdown,
+            "guide_skipped_docs": list(project.settings.guide_skipped_docs),
             "global_directives": project.settings.global_directives,
             "context_soft_min_chars": project.settings.context_soft_min_chars,
             "context_soft_max_chars": project.settings.context_soft_max_chars,
@@ -529,12 +540,10 @@ def _to_runtime_config_payload(config: CoreRuntimeConfig) -> dict[str, Any]:
     return {
         "locale": config.locale,
         "llm_provider": config.llm_provider,
+        "llm_transport": config.llm_transport,
         "api_url": config.api_url,
-        "api_key": (
-            API_KEY_CONFIGURED_PLACEHOLDER
-            if str(config.api_key).strip()
-            else ""
-        ),
+        "api_key": "",
+        "api_key_mask": _mask_secret(str(config.api_key or "")),
         "model_name": config.model_name,
         "auto_complete": config.auto_complete,
         "think_switch": config.think_switch,
@@ -571,6 +580,7 @@ def _to_llm_preset_payload(preset: LLMPreset) -> dict[str, Any]:
         "name": preset.name,
         "group": preset.group,
         "api_format": preset.api_format,
+        "llm_transport": preset.llm_transport,
         "api_url": preset.api_url,
         "auto_complete": preset.auto_complete,
         "default_model": preset.model,
@@ -581,6 +591,7 @@ def _to_llm_preset_payload(preset: LLMPreset) -> dict[str, Any]:
 def _to_llm_platform_config(config: CoreRuntimeConfig) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "auto_complete": bool(config.auto_complete),
+        "llm_transport": str(config.llm_transport),
         "think_switch": bool(config.think_switch),
         "think_depth": str(config.think_depth),
         "thinking_budget": int(config.thinking_budget),
@@ -753,7 +764,13 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 raise PermissionError("core profile is read-only")
             merged = asdict(current)
             for key, value in patch.items():
-                if key == "api_key" and value == API_KEY_CONFIGURED_PLACEHOLDER:
+                if key == "api_key_mask":
+                    continue
+                if key == "api_key":
+                    text = str(value or "").strip()
+                    if not text or text == API_KEY_CONFIGURED_PLACEHOLDER:
+                        continue
+                    merged[key] = text
                     continue
                 merged[key] = value
             candidate = CoreRuntimeConfig(**merged).normalized()
@@ -888,6 +905,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             clarify_markdown=payload.clarify_markdown,
             specification_markdown=payload.specification_markdown,
             plan_markdown=payload.plan_markdown,
+            guide_skipped_docs=payload.guide_skipped_docs,
             global_directives=payload.global_directives,
             context_soft_min_chars=payload.context_soft_min_chars,
             context_soft_max_chars=payload.context_soft_max_chars,
@@ -1522,6 +1540,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 message=payload.message,
                 node_id=payload.node_id,
                 thread_id=payload.thread_id,
+                guide_mode=payload.guide_mode,
                 token_budget=payload.token_budget,
             )
         except KeyError as exc:
@@ -1540,7 +1559,38 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             "updated_node_id": result.updated_node_id,
             "suggested_node_ids": result.suggested_node_ids,
             "suggested_options": result.suggested_options,
+            "guide_skip_document": result.guide_skip_document,
             "revision": result.revision,
+        }
+
+    @api.get("/api/projects/{project_id}/chat/threads")
+    def list_project_chat_threads(project_id: str, limit: int = 50) -> dict[str, Any]:
+        if repository.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail=f"project not found: {project_id}")
+        rows = repository.list_chat_threads(project_id, limit=limit)
+        return {
+            "project_id": project_id,
+            "count": len(rows),
+            "threads": rows,
+        }
+
+    @api.get("/api/projects/{project_id}/chat/threads/{thread_id}/messages")
+    def list_project_chat_thread_messages(
+        project_id: str,
+        thread_id: str,
+        limit: int = 80,
+    ) -> dict[str, Any]:
+        if repository.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail=f"project not found: {project_id}")
+        thread = repository.get_chat_thread(thread_id)
+        if thread is None or str(thread.get("project_id", "") or "") != project_id:
+            raise HTTPException(status_code=404, detail=f"chat thread not found: {thread_id}")
+        rows = repository.list_chat_messages(thread_id, limit=limit)
+        return {
+            "project_id": project_id,
+            "thread_id": thread_id,
+            "count": len(rows),
+            "messages": rows,
         }
 
     @api.post("/api/ai/outline/guide")

@@ -14,6 +14,8 @@ dependencies = [
   "uvicorn>=0.30,<1",
   "pydantic>=2.7,<3",
   "httpx>=0.27,<1",
+  "openai>=1.40,<2",
+  "anthropic>=0.37,<1",
   "langgraph>=0.2,<1",
   "tiktoken>=0.8,<1",
 ]

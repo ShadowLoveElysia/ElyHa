@@ -20,6 +20,7 @@ class CoreRuntimeConfig:
 
     locale: str = "zh"
     llm_provider: str = "mock"
+    llm_transport: str = "httpx"
     api_url: str = ""
     api_key: str = ""
     model_name: str = ""
@@ -40,6 +41,13 @@ class CoreRuntimeConfig:
     def normalized(self) -> "CoreRuntimeConfig":
         locale = str(self.locale).strip().lower() or "zh"
         llm_provider = str(self.llm_provider).strip().lower() or "mock"
+        llm_transport = str(self.llm_transport).strip().lower() or "httpx"
+        if llm_transport in {"openai_sdk", "openai-client", "openai_client"}:
+            llm_transport = "openai"
+        elif llm_transport in {"anthropic_sdk", "anthropic-client", "anthropic_client"}:
+            llm_transport = "anthropic"
+        elif llm_transport not in {"httpx", "openai", "anthropic"}:
+            llm_transport = "httpx"
         api_url = str(self.api_url).strip()
         api_key = str(self.api_key).strip()
         model_name = str(self.model_name).strip()
@@ -112,6 +120,7 @@ class CoreRuntimeConfig:
         return CoreRuntimeConfig(
             locale=locale,
             llm_provider=llm_provider,
+            llm_transport=llm_transport,
             api_url=api_url,
             api_key=api_key,
             model_name=model_name,
