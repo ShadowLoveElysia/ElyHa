@@ -25,11 +25,11 @@ from elyha_core.services.context_assembler import (
     PromptBundle,
 )
 from elyha_core.services.context_service import ContextPack, ContextService
-from elyha_core.services.graph_service import GraphService, NodeCreate
+from elyha_core.services.graph_service import GraphService
 from elyha_core.services.prompt_template_service import PromptTemplateService
 from elyha_core.services.readable_content_tool_service import ReadableContentToolService
+from elyha_core.services.Tools import ToolService
 from elyha_core.services.validation_service import ValidationService
-from elyha_core.models.node import NodeType
 from elyha_core.storage.repository import SQLiteRepository
 from elyha_core.utils.clock import utc_now
 from elyha_core.utils.ids import generate_id
@@ -273,6 +273,12 @@ class AIService:
             graph_service,
             state_service=state_service,
         )
+        self.tool_service = ToolService(
+            repository=repository,
+            graph_service=graph_service,
+            readable_tool_service=self.readable_tool_service,
+            setting_proposal_service=setting_proposal_service,
+        )
         self._default_platform_config = (llm_platform_config or {}).copy()
         self._llm_presets = dict(llm_presets or {})
         self._adapter_cache: dict[str, Any] = {}
@@ -292,6 +298,7 @@ class AIService:
 
     def set_setting_proposal_service(self, service: Any | None) -> None:
         self.setting_proposal_service = service
+        self.tool_service.set_setting_proposal_service(service)
 
     def generate_chapter_draft(
         self,
@@ -794,10 +801,20 @@ class AIService:
                 strict_json_fence=self._strict_json_fence_output_enabled(project_id),
             )
             self._clear_suggested_nodes_for_source(project_id, source_node_id=node.id)
-            suggested_node_ids = self._create_suggested_nodes(
-                project_id,
+            suggested_node_ids = self.tool_service.create_suggested_nodes(
+                project_id=project_id,
                 source_node=node,
-                options=options,
+                options=[
+                    {
+                        "title": option.title,
+                        "description": option.description,
+                        "outline_steps": option.outline_steps,
+                        "sentiment": option.sentiment,
+                        "plan_mode": option.plan_mode,
+                    }
+                    for option in options
+                ],
+                edge_label=tr("ai.chat.suggested_edge_label"),
             )
             reply = tr(
                 "ai.chat.planner_reply",
@@ -2943,7 +2960,8 @@ class AIService:
         base = str(prompt or "").strip()
         available_tools = (
             "search_text, read_chunk, read_neighbors, get_chapter_outline, "
-            "get_world_state, get_effective_directives, write_document(optional)"
+            "get_world_state, get_effective_directives, write_document(optional), "
+            "graph_tools(optional)"
         )
         lines = [
             base,
@@ -3235,51 +3253,6 @@ class AIService:
 
         return {"revised_content": revised_content, "diff_patch": diff_patch}
 
-    def _create_suggested_nodes(
-        self,
-        project_id: str,
-        *,
-        source_node: Any,
-        options: list[BranchOption],
-    ) -> list[str]:
-        created_ids: list[str] = []
-        source_x = float(getattr(source_node, "pos_x", 0.0))
-        source_y = float(getattr(source_node, "pos_y", 0.0))
-        now_iso = utc_now().isoformat()
-        for index, option in enumerate(options):
-            metadata = {
-                "ai_suggested": True,
-                "ai_suggested_from": source_node.id,
-                "ai_suggested_at": now_iso,
-                "summary": option.description,
-                "content": option.description,
-                "outline_markdown": "\n".join(f"- {step}" for step in option.outline_steps)
-                if option.outline_steps
-                else "",
-                "ai_suggested_sentiment": option.sentiment,
-                "ai_suggested_plan_mode": option.plan_mode,
-            }
-            node = self.graph_service.add_node(
-                project_id,
-                NodeCreate(
-                    title=option.title[:200],
-                    type=NodeType.BRANCH,
-                    status=getattr(source_node, "status"),
-                    storyline_id=getattr(source_node, "storyline_id"),
-                    pos_x=source_x + 280 + index * 240,
-                    pos_y=source_y + (index - 1) * 150,
-                    metadata=metadata,
-                ),
-            )
-            self.graph_service.add_edge(
-                project_id,
-                source_node.id,
-                node.id,
-                label=tr("ai.chat.suggested_edge_label"),
-            )
-            created_ids.append(node.id)
-        return created_ids
-
     def _generate(
         self,
         *,
@@ -3491,6 +3464,7 @@ class AIService:
         tool_thread_id = str(platform_config.get("tool_thread_id", "") or "").strip()
         write_document_enabled = bool(platform_config.get("write_document_enabled", False))
         allow_skip_document = bool(platform_config.get("allow_skip_document", False))
+        node_tools_enabled = bool(platform_config.get("node_tools_enabled", False))
         write_document_required_default = (
             write_document_enabled and task_type in {"workflow_docs_draft", "workflow_docs_revise"}
         )
@@ -3498,10 +3472,11 @@ class AIService:
             platform_config.get("write_document_required", write_document_required_default)
         )
         loop_platform_config = dict(platform_config)
-        native_tools = self._build_native_tool_specs(
+        native_tools = self.tool_service.build_native_tool_specs(
             write_proposal_enabled=write_proposal_enabled,
             write_document_enabled=write_document_enabled,
             allow_skip_document=allow_skip_document,
+            node_tools_enabled=node_tools_enabled,
         )
         if native_tools:
             loop_platform_config["native_tools"] = native_tools
@@ -3520,6 +3495,7 @@ class AIService:
                 write_document_enabled=write_document_enabled,
                 write_document_required=write_document_required,
                 allow_skip_document=allow_skip_document,
+                node_tools_enabled=node_tools_enabled,
             )
             prompt_hash = hashlib.sha256(round_prompt.encode("utf-8")).hexdigest()
             request = LLMRequest(
@@ -3558,7 +3534,7 @@ class AIService:
                     if not isinstance(args, dict):
                         args = {}
                     started = time.perf_counter()
-                    result_payload, read_chars, result_meta = self._execute_tool_call(
+                    result_payload, read_chars, result_meta = self.tool_service.execute_tool_call(
                         tool_name=tool_name,
                         arguments=args,
                         project_id=project_id or "",
@@ -3567,6 +3543,7 @@ class AIService:
                         write_proposal_enabled=write_proposal_enabled,
                         write_document_enabled=write_document_enabled,
                         allow_skip_document=allow_skip_document,
+                        node_tools_enabled=node_tools_enabled,
                         tool_response_cache=tool_response_cache,
                         single_read_char_limit=single_read_char_limit,
                         total_read_char_limit=total_read_char_limit,
@@ -3720,148 +3697,6 @@ class AIService:
             raw=final_raw,
         )
 
-    def _build_native_tool_specs(
-        self,
-        *,
-        write_proposal_enabled: bool,
-        write_document_enabled: bool,
-        allow_skip_document: bool,
-    ) -> list[dict[str, Any]]:
-        tools: list[dict[str, Any]] = [
-            {
-                "name": "search_text",
-                "description": "Search relevant text chunks by query.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Keyword query to search."},
-                        "top_k": {"type": "integer", "description": "Max chunks to return."},
-                    },
-                    "required": ["query"],
-                },
-            },
-            {
-                "name": "read_chunk",
-                "description": "Read one chunk by chunk_id.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "chunk_id": {"type": "string", "description": "Target chunk id."},
-                    },
-                    "required": ["chunk_id"],
-                },
-            },
-            {
-                "name": "read_neighbors",
-                "description": "Read nearby chunks around a chunk_id.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "chunk_id": {"type": "string", "description": "Center chunk id."},
-                        "before": {"type": "integer", "description": "How many chunks before center."},
-                        "after": {"type": "integer", "description": "How many chunks after center."},
-                    },
-                    "required": ["chunk_id"],
-                },
-            },
-            {
-                "name": "get_chapter_outline",
-                "description": "Get outline markdown for current chapter node.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "node_id": {"type": "string", "description": "Chapter node id."},
-                    },
-                    "required": [],
-                },
-            },
-            {
-                "name": "get_world_state",
-                "description": "Get project world-state snapshot for entities and variables.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "keys": {
-                            "type": "object",
-                            "properties": {
-                                "character_ids": {"type": "array", "items": {"type": "string"}},
-                                "item_ids": {"type": "array", "items": {"type": "string"}},
-                                "world_variable_keys": {"type": "array", "items": {"type": "string"}},
-                            },
-                        }
-                    },
-                    "required": [],
-                },
-            },
-            {
-                "name": "get_effective_directives",
-                "description": "Read effective writing directives and constraints.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "project_id": {"type": "string"},
-                    },
-                    "required": [],
-                },
-            },
-        ]
-        if write_proposal_enabled:
-            tools.append(
-                {
-                    "name": "propose_setting_change",
-                    "description": "Create a setting-change proposal for user review.",
-                    "input_schema": {
-                        "type": "object",
-                        "properties": {
-                            "target_scope": {"type": "string", "description": "project or global"},
-                            "proposal_type": {"type": "string"},
-                            "title": {"type": "string"},
-                            "content": {"type": "string"},
-                            "reason": {"type": "string"},
-                            "node_id": {"type": "string"},
-                        },
-                        "required": ["proposal_type", "title", "content"],
-                    },
-                }
-            )
-        if write_document_enabled:
-            tools.append(
-                {
-                    "name": "write_document",
-                    "description": "Write one workflow document.",
-                    "input_schema": {
-                        "type": "object",
-                        "properties": {
-                            "document_type": {
-                                "type": "string",
-                                "enum": ["constitution", "clarify", "specification", "plan"],
-                            },
-                            "content": {"type": "string"},
-                        },
-                        "required": ["document_type", "content"],
-                    },
-                }
-            )
-        if allow_skip_document:
-            tools.append(
-                {
-                    "name": "skip_document",
-                    "description": "Request skipping one workflow document with user confirmation.",
-                    "input_schema": {
-                        "type": "object",
-                        "properties": {
-                            "document_type": {
-                                "type": "string",
-                                "enum": ["constitution", "clarify", "specification", "plan"],
-                            },
-                            "reason": {"type": "string"},
-                        },
-                        "required": ["document_type"],
-                    },
-                }
-            )
-        return tools
-
     def _build_tool_loop_prompt(
         self,
         *,
@@ -3877,6 +3712,7 @@ class AIService:
         write_document_enabled: bool = False,
         write_document_required: bool = False,
         allow_skip_document: bool = False,
+        node_tools_enabled: bool = False,
     ) -> str:
         tool_names = [
             "search_text",
@@ -3886,6 +3722,17 @@ class AIService:
             "get_world_state",
             "get_effective_directives",
         ]
+        if node_tools_enabled:
+            tool_names.extend(
+                [
+                    "list_nodes",
+                    "get_node",
+                    "create_node",
+                    "update_node",
+                    "create_edge",
+                    "delete_node(confirm required)",
+                ]
+            )
         if write_proposal_enabled:
             tool_names.append("propose_setting_change")
         if write_document_enabled:
@@ -3938,6 +3785,14 @@ class AIService:
                     "[SkipRule]",
                     "Only call skip_document when user explicitly confirms skipping a specific doc.",
                     "Do not skip docs by assumption.",
+                ]
+            )
+        if node_tools_enabled:
+            lines.extend(
+                [
+                    "[GraphMutationRule]",
+                    "When mutating graph, prefer create_node/update_node/create_edge.",
+                    "delete_node is sensitive and requires confirm=true.",
                 ]
             )
         if force_final_only:
@@ -4104,576 +3959,6 @@ class AIService:
                 raw_args = {}
             calls.append({"name": name.lower(), "arguments": raw_args})
         return calls
-
-    def _normalize_tool_call_arguments(
-        self,
-        *,
-        tool_name: str,
-        arguments: dict[str, Any],
-        tool_context_node_id: str,
-    ) -> tuple[dict[str, Any], str]:
-        normalized = str(tool_name or "").strip().lower()
-        raw = arguments if isinstance(arguments, dict) else {}
-
-        def _clean_text(value: Any, *, limit: int = 4000) -> str:
-            text = str(value or "").strip()
-            if len(text) > limit:
-                return text[:limit]
-            return text
-
-        def _as_int(value: Any, fallback: int, *, lower: int, upper: int) -> int:
-            try:
-                parsed = int(value)
-            except (TypeError, ValueError):
-                parsed = fallback
-            if parsed < lower:
-                return lower
-            if parsed > upper:
-                return upper
-            return parsed
-
-        if normalized == "search_text":
-            query = _clean_text(raw.get("query") or raw.get("q"), limit=300)
-            if not query:
-                return {}, "query is required"
-            top_k = _as_int(raw.get("top_k", 5), 5, lower=1, upper=20)
-            scope_raw = raw.get("scope")
-            scope: dict[str, Any] = {}
-            if isinstance(scope_raw, dict):
-                node_id = _clean_text(scope_raw.get("node_id"), limit=128)
-                if node_id:
-                    scope["node_id"] = node_id
-                node_ids = scope_raw.get("node_ids")
-                if isinstance(node_ids, list):
-                    normalized_ids = [
-                        _clean_text(item, limit=128)
-                        for item in node_ids
-                        if _clean_text(item, limit=128)
-                    ]
-                    if normalized_ids:
-                        scope["node_ids"] = normalized_ids[:30]
-            return {"query": query, "top_k": top_k, "scope": scope}, ""
-        if normalized == "read_chunk":
-            chunk_id = _clean_text(raw.get("chunk_id"), limit=160)
-            if not chunk_id:
-                return {}, "chunk_id is required"
-            return {"chunk_id": chunk_id}, ""
-        if normalized == "read_neighbors":
-            chunk_id = _clean_text(raw.get("chunk_id"), limit=160)
-            if not chunk_id:
-                return {}, "chunk_id is required"
-            before = _as_int(raw.get("before", 1), 1, lower=0, upper=10)
-            after = _as_int(raw.get("after", 1), 1, lower=0, upper=10)
-            return {"chunk_id": chunk_id, "before": before, "after": after}, ""
-        if normalized == "get_chapter_outline":
-            node_id = _clean_text(raw.get("node_id") or tool_context_node_id, limit=128)
-            if not node_id:
-                return {}, "node_id is required"
-            return {"node_id": node_id}, ""
-        if normalized == "get_world_state":
-            keys = raw.get("keys")
-            if keys is None:
-                keys = raw
-            if not isinstance(keys, dict):
-                keys = {}
-            normalized_keys: dict[str, Any] = {}
-            for key in ("character_ids", "item_ids", "world_variable_keys"):
-                value = keys.get(key)
-                if not isinstance(value, list):
-                    continue
-                cleaned = [_clean_text(item, limit=128) for item in value]
-                cleaned = [item for item in cleaned if item]
-                if cleaned:
-                    normalized_keys[key] = cleaned[:30]
-            rel_pairs = keys.get("relationship_pairs")
-            if isinstance(rel_pairs, list):
-                normalized_pairs: list[dict[str, str]] = []
-                for item in rel_pairs:
-                    if isinstance(item, dict):
-                        left = _clean_text(item.get("subject") or item.get("a"), limit=128)
-                        right = _clean_text(item.get("object") or item.get("b"), limit=128)
-                        if left and right:
-                            normalized_pairs.append({"subject": left, "object": right})
-                    elif isinstance(item, (list, tuple)) and len(item) >= 2:
-                        left = _clean_text(item[0], limit=128)
-                        right = _clean_text(item[1], limit=128)
-                        if left and right:
-                            normalized_pairs.append({"subject": left, "object": right})
-                if normalized_pairs:
-                    normalized_keys["relationship_pairs"] = normalized_pairs[:30]
-            return {"keys": normalized_keys}, ""
-        if normalized == "get_effective_directives":
-            target_project_id = _clean_text(raw.get("project_id"), limit=128)
-            return {"project_id": target_project_id}, ""
-        if normalized == "propose_setting_change":
-            target_scope = _clean_text(raw.get("target_scope") or "project", limit=32).lower()
-            if target_scope not in {"project", "global"}:
-                target_scope = "project"
-            proposal_type = _clean_text(raw.get("proposal_type") or "global_directive", limit=64)
-            directive_text = _clean_text(
-                raw.get("directive_text") or raw.get("content") or raw.get("value"),
-                limit=4000,
-            )
-            if not directive_text:
-                return {}, "directive_text is required"
-            note = _clean_text(raw.get("note") or raw.get("reason"), limit=400)
-            return {
-                "target_scope": target_scope,
-                "proposal_type": proposal_type or "global_directive",
-                "directive_text": directive_text,
-                "note": note,
-            }, ""
-        if normalized == "write_document":
-            document_type_raw = _clean_text(
-                raw.get("document_type")
-                or raw.get("doc_type")
-                or raw.get("type"),
-                limit=64,
-            ).lower()
-            aliases = {
-                "constitution_markdown": "constitution",
-                "clarify_markdown": "clarify",
-                "specification_markdown": "specification",
-                "plan_markdown": "plan",
-            }
-            document_type = aliases.get(document_type_raw, document_type_raw)
-            if document_type not in {"constitution", "clarify", "specification", "plan"}:
-                return {}, "document_type is required"
-            content = _clean_text(
-                raw.get("content")
-                or raw.get("markdown")
-                or raw.get("text"),
-                limit=12000,
-            )
-            if not content:
-                return {}, "content is required"
-            return {
-                "document_type": document_type,
-                "content": content,
-            }, ""
-        if normalized == "skip_document":
-            document_type_raw = _clean_text(
-                raw.get("document_type")
-                or raw.get("doc_type")
-                or raw.get("type"),
-                limit=64,
-            ).lower()
-            aliases = {
-                "constitution_markdown": "constitution",
-                "clarify_markdown": "clarify",
-                "specification_markdown": "specification",
-                "plan_markdown": "plan",
-            }
-            document_type = aliases.get(document_type_raw, document_type_raw)
-            if document_type not in {"constitution", "clarify", "specification", "plan"}:
-                return {}, "document_type is required"
-            reason = _clean_text(raw.get("reason") or raw.get("note"), limit=300)
-            return {
-                "document_type": document_type,
-                "reason": reason,
-            }, ""
-        return {}, "unknown_tool"
-
-    def _tool_cache_key(
-        self,
-        *,
-        tool_name: str,
-        project_id: str,
-        arguments: dict[str, Any],
-    ) -> str:
-        cache_payload = {
-            "tool": str(tool_name or "").strip().lower(),
-            "project_id": str(project_id or "").strip(),
-            "arguments": arguments,
-        }
-        return hashlib.sha256(
-            json.dumps(cache_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        ).hexdigest()
-
-    def _execute_tool_call(
-        self,
-        *,
-        tool_name: str,
-        arguments: dict[str, Any],
-        project_id: str,
-        tool_context_node_id: str,
-        tool_thread_id: str,
-        write_proposal_enabled: bool,
-        write_document_enabled: bool,
-        allow_skip_document: bool,
-        tool_response_cache: dict[str, tuple[Any, int, dict[str, Any]]],
-        single_read_char_limit: int,
-        total_read_char_limit: int,
-        total_read_chars: int,
-    ) -> tuple[Any, int, dict[str, Any]]:
-        normalized = str(tool_name or "").strip().lower()
-        normalized_args, args_error = self._normalize_tool_call_arguments(
-            tool_name=normalized,
-            arguments=arguments,
-            tool_context_node_id=tool_context_node_id,
-        )
-        def _payload_chars(payload: Any) -> int:
-            try:
-                return len(json.dumps(payload, ensure_ascii=False))
-            except Exception:
-                return len(str(payload or ""))
-
-        if args_error:
-            reason = "unknown_tool" if args_error == "unknown_tool" else "invalid_arguments"
-            return (
-                {"error": args_error, "tool": normalized},
-                0,
-                {"ok": False, "reason": reason, "error": args_error},
-            )
-        cacheable_tools = {"search_text", "read_chunk", "read_neighbors", "get_chapter_outline", "get_world_state"}
-        cache_key = self._tool_cache_key(
-            tool_name=normalized,
-            project_id=project_id,
-            arguments=normalized_args,
-        )
-        if normalized in cacheable_tools and cache_key in tool_response_cache:
-            cached_payload, _cached_read_chars, cached_meta = tool_response_cache[cache_key]
-            next_meta = dict(cached_meta)
-            next_meta["cache_hit"] = True
-            next_meta["cached_read_chars"] = int(_cached_read_chars)
-            return cached_payload, 0, next_meta
-        try:
-            if normalized == "search_text":
-                hits = self.readable_tool_service.search_text(
-                    project_id=project_id,
-                    query=str(normalized_args.get("query", "")),
-                    top_k=int(normalized_args.get("top_k", 5)),
-                    scope=cast(dict[str, Any], normalized_args.get("scope", {})),
-                )
-                returned_chars = sum(len(str(item.get("snippet", ""))) for item in hits)
-                evidence_chunk_ids = [str(item.get("chunk_id", "")).strip() for item in hits]
-                result_meta = {
-                    "ok": True,
-                    "cache_hit": False,
-                    "evidence_chunk_ids": [item for item in evidence_chunk_ids if item],
-                }
-                tool_response_cache[cache_key] = (hits, returned_chars, dict(result_meta))
-                return hits, returned_chars, result_meta
-            if normalized == "read_chunk":
-                chunk_id = str(normalized_args.get("chunk_id", ""))
-                payload = self.readable_tool_service.read_chunk(chunk_id, project_id=project_id)
-                content = str(payload.get("content", ""))
-                truncated = False
-                if len(content) > single_read_char_limit:
-                    payload["content"] = content[:single_read_char_limit]
-                    payload["chars"] = len(str(payload["content"]))
-                    payload["truncated"] = True
-                    payload["original_chars"] = len(content)
-                    truncated = True
-                returned_chars = len(str(payload.get("content", "")))
-                if total_read_chars + returned_chars > total_read_char_limit:
-                    return (
-                        {
-                            "error": "total_read_char_limit_exceeded",
-                            "remaining_chars": max(0, total_read_char_limit - total_read_chars),
-                        },
-                        0,
-                        {"ok": False, "reason": "total_read_char_limit_exceeded"},
-                    )
-                evidence_chunk_id = str(payload.get("chunk_id", "")).strip()
-                result_meta = {
-                    "ok": True,
-                    "truncated": truncated,
-                    "cache_hit": False,
-                    "evidence_chunk_ids": [evidence_chunk_id] if evidence_chunk_id else [],
-                }
-                tool_response_cache[cache_key] = (payload, returned_chars, dict(result_meta))
-                return payload, returned_chars, result_meta
-            if normalized == "read_neighbors":
-                payload = self.readable_tool_service.read_neighbors(
-                    str(normalized_args.get("chunk_id", "")),
-                    project_id=project_id,
-                    before=int(normalized_args.get("before", 1)),
-                    after=int(normalized_args.get("after", 1)),
-                )
-                budget = single_read_char_limit
-                trimmed: list[dict[str, Any]] = []
-                truncated = False
-                returned_chars = 0
-                evidence_chunk_ids: list[str] = []
-                for item in payload:
-                    text = str(item.get("content", ""))
-                    if budget <= 0:
-                        truncated = True
-                        break
-                    take = min(len(text), budget)
-                    if take < len(text):
-                        truncated = True
-                    row = dict(item)
-                    row["content"] = text[:take]
-                    row["chars"] = take
-                    trimmed.append(row)
-                    returned_chars += take
-                    budget -= take
-                    chunk_id = str(row.get("chunk_id", "")).strip()
-                    if chunk_id:
-                        evidence_chunk_ids.append(chunk_id)
-                if total_read_chars + returned_chars > total_read_char_limit:
-                    return (
-                        {
-                            "error": "total_read_char_limit_exceeded",
-                            "remaining_chars": max(0, total_read_char_limit - total_read_chars),
-                        },
-                        0,
-                        {"ok": False, "reason": "total_read_char_limit_exceeded"},
-                    )
-                result_meta = {
-                    "ok": True,
-                    "truncated": truncated,
-                    "cache_hit": False,
-                    "evidence_chunk_ids": evidence_chunk_ids,
-                }
-                tool_response_cache[cache_key] = (trimmed, returned_chars, dict(result_meta))
-                return trimmed, returned_chars, result_meta
-            if normalized == "get_chapter_outline":
-                payload = self.readable_tool_service.get_chapter_outline(
-                    project_id=project_id,
-                    node_id=str(normalized_args.get("node_id", "")),
-                )
-                returned_chars = _payload_chars(payload)
-                if total_read_chars + returned_chars > total_read_char_limit:
-                    return (
-                        {
-                            "error": "total_read_char_limit_exceeded",
-                            "remaining_chars": max(0, total_read_char_limit - total_read_chars),
-                        },
-                        0,
-                        {"ok": False, "reason": "total_read_char_limit_exceeded"},
-                    )
-                result_meta = {"ok": True, "cache_hit": False}
-                tool_response_cache[cache_key] = (payload, returned_chars, dict(result_meta))
-                return payload, returned_chars, result_meta
-            if normalized == "get_world_state":
-                payload = self.readable_tool_service.get_world_state(
-                    project_id=project_id,
-                    keys=cast(dict[str, Any], normalized_args.get("keys", {})),
-                )
-                returned_chars = _payload_chars(payload)
-                if total_read_chars + returned_chars > total_read_char_limit:
-                    return (
-                        {
-                            "error": "total_read_char_limit_exceeded",
-                            "remaining_chars": max(0, total_read_char_limit - total_read_chars),
-                        },
-                        0,
-                        {"ok": False, "reason": "total_read_char_limit_exceeded"},
-                    )
-                result_meta = {"ok": True, "cache_hit": False}
-                tool_response_cache[cache_key] = (payload, returned_chars, dict(result_meta))
-                return payload, returned_chars, result_meta
-            if normalized == "get_effective_directives":
-                target_project_id = str(normalized_args.get("project_id") or project_id).strip()
-                payload = self.readable_tool_service.get_effective_directives(project_id=target_project_id)
-                returned_chars = _payload_chars(payload)
-                if total_read_chars + returned_chars > total_read_char_limit:
-                    return (
-                        {
-                            "error": "total_read_char_limit_exceeded",
-                            "remaining_chars": max(0, total_read_char_limit - total_read_chars),
-                        },
-                        0,
-                        {"ok": False, "reason": "total_read_char_limit_exceeded"},
-                    )
-                return payload, returned_chars, {"ok": True}
-            if normalized == "propose_setting_change":
-                if not write_proposal_enabled:
-                    return (
-                        {"error": "write_proposal_tool_disabled"},
-                        0,
-                        {"ok": False, "reason": "write_proposal_tool_disabled"},
-                    )
-                if self.setting_proposal_service is None:
-                    return (
-                        {"error": "setting_proposal_service_unavailable"},
-                        0,
-                        {"ok": False, "reason": "setting_proposal_service_unavailable"},
-                    )
-                if not str(tool_thread_id).strip():
-                    return (
-                        {"error": "tool_thread_id_required"},
-                        0,
-                        {"ok": False, "reason": "tool_thread_id_required"},
-                    )
-                proposal = self.setting_proposal_service.create_from_agent_tool(
-                    project_id=project_id,
-                    node_id=str(tool_context_node_id or ""),
-                    thread_id=str(tool_thread_id),
-                    proposal_type=str(normalized_args.get("proposal_type", "global_directive")),
-                    target_scope=str(normalized_args.get("target_scope", "project")),
-                    directive_text=str(normalized_args.get("directive_text", "")).strip(),
-                    note=str(normalized_args.get("note", "")).strip(),
-                )
-                payload = {
-                    "proposal_id": str(proposal.get("id", "")),
-                    "status": str(proposal.get("status", "")),
-                    "proposal_type": str(proposal.get("proposal_type", "")),
-                    "target_scope": str(proposal.get("target_scope", "")),
-                    "requires_human_review": True,
-                }
-                return payload, 0, {
-                    "ok": True,
-                    "proposal_created": True,
-                    "proposal_id": str(proposal.get("id", "")),
-                }
-            if normalized == "write_document":
-                if not write_document_enabled:
-                    return (
-                        {"error": "write_document_tool_disabled"},
-                        0,
-                        {"ok": False, "reason": "write_document_tool_disabled"},
-                    )
-                doc_type = str(normalized_args.get("document_type", "")).strip()
-                content = str(normalized_args.get("content", "")).strip()
-                if not doc_type or not content:
-                    return (
-                        {"error": "document_type and content required"},
-                        0,
-                        {"ok": False, "reason": "invalid_arguments"},
-                    )
-                valid_types = {"constitution", "clarify", "specification", "plan"}
-                if doc_type not in valid_types:
-                    return (
-                        {"error": f"invalid document_type, must be one of: {', '.join(valid_types)}"},
-                        0,
-                        {"ok": False, "reason": "invalid_arguments"},
-                    )
-                doc_key = f"{doc_type}_markdown"
-                state = self.repository.get_workflow_doc_state(project_id)
-                if state is None:
-                    state = self.repository.upsert_workflow_doc_state(
-                        project_id,
-                        workflow_mode="original",
-                        workflow_stage="draft",
-                        workflow_initialized=True,
-                        round_number=1,
-                        assistant_message="",
-                        collected_inputs={},
-                        clarify_questions=[],
-                        pending_docs={},
-                        published_docs={},
-                    )
-                pending_docs = {
-                    str(k): str(v or "")
-                    for k, v in dict(state.get("pending_docs", {})).items()
-                }
-                pending_docs[doc_key] = content
-                collected_inputs = {
-                    str(k): str(v or "")
-                    for k, v in dict(state.get("collected_inputs", {})).items()
-                }
-                clarify_questions = [
-                    str(item).strip()
-                    for item in list(state.get("clarify_questions", []))
-                    if str(item).strip()
-                ]
-                published_docs = {
-                    str(k): str(v or "")
-                    for k, v in dict(state.get("published_docs", {})).items()
-                }
-                self.repository.upsert_workflow_doc_state(
-                    project_id,
-                    workflow_mode=str(state.get("workflow_mode", "")).strip() or "original",
-                    workflow_stage=str(state.get("workflow_stage", "")).strip() or "idle",
-                    workflow_initialized=bool(state.get("workflow_initialized", False)),
-                    round_number=max(0, int(state.get("round_number", 0) or 0)),
-                    assistant_message=str(state.get("assistant_message", "") or ""),
-                    collected_inputs=collected_inputs,
-                    clarify_questions=clarify_questions,
-                    pending_docs=pending_docs,
-                    published_docs=published_docs,
-                )
-                persisted = self._persist_workflow_doc_to_project_settings(
-                    project_id=project_id,
-                    doc_key=doc_key,
-                    content=content,
-                )
-                payload = {
-                    "document_type": doc_type,
-                    "status": "written",
-                    "chars": len(content),
-                    "project_settings_updated": persisted,
-                }
-                return payload, 0, {
-                    "ok": True,
-                    "document_written": True,
-                    "project_settings_updated": persisted,
-                }
-            if normalized == "skip_document":
-                if not allow_skip_document:
-                    return (
-                        {"error": "skip_document_tool_disabled"},
-                        0,
-                        {"ok": False, "reason": "skip_document_tool_disabled"},
-                    )
-                doc_type = str(normalized_args.get("document_type", "")).strip().lower()
-                if doc_type not in {"constitution", "clarify", "specification", "plan"}:
-                    return (
-                        {"error": "invalid document_type"},
-                        0,
-                        {"ok": False, "reason": "invalid_arguments"},
-                    )
-                payload = {
-                    "document_type": doc_type,
-                    "status": "pending_user_confirm",
-                    "reason": str(normalized_args.get("reason", "")).strip(),
-                    "requires_user_confirmation": True,
-                }
-                return payload, 0, {
-                    "ok": True,
-                    "skip_document_requested": True,
-                    "skip_document_type": doc_type,
-                    "requires_user_confirmation": True,
-                }
-            return (
-                {"error": f"unknown_tool:{normalized}"},
-                0,
-                {"ok": False, "reason": "unknown_tool"},
-            )
-        except Exception as exc:
-            return (
-                {"error": str(exc)},
-                0,
-                {"ok": False, "reason": "execution_error", "error": str(exc)},
-            )
-
-    def _persist_workflow_doc_to_project_settings(
-        self,
-        *,
-        project_id: str,
-        doc_key: str,
-        content: str,
-    ) -> bool:
-        clean_doc_key = str(doc_key or "").strip()
-        if clean_doc_key not in {
-            "constitution_markdown",
-            "clarify_markdown",
-            "specification_markdown",
-            "plan_markdown",
-        }:
-            return False
-        text = str(content or "").strip()
-        project = self.repository.get_project(project_id)
-        if project is None:
-            return False
-        setattr(project.settings, clean_doc_key, text)
-        current_skips = list(getattr(project.settings, "guide_skipped_docs", []) or [])
-        filtered_skips: list[str] = []
-        for item in current_skips:
-            slot = _GUIDE_DOC_ALIASES.get(str(item or "").strip().lower(), "")
-            if not slot or slot == clean_doc_key:
-                continue
-            if slot not in filtered_skips:
-                filtered_skips.append(slot)
-        project.settings.guide_skipped_docs = filtered_skips
-        project.updated_at = utc_now()
-        project.active_revision += 1
-        self.repository.update_project(project)
-        return True
 
     def _tool_result_for_prompt(
         self,
