@@ -1306,7 +1306,7 @@ export default function App() {
           t={t}
         />
 
-        <main className="flex-1 relative">
+        <main className="flex-1 min-h-0 relative">
           {activeTab === 'workspace' && (
             <Workspace
               projectId={projectId}
@@ -1332,7 +1332,7 @@ export default function App() {
           )}
 
           {activeTab === 'outline' && (
-            <div className="h-full overflow-y-auto p-6">
+            <div className="h-full min-h-0 overflow-y-auto p-6">
               <div className="max-w-5xl mx-auto bg-white rounded-2xl border border-slate-200 shadow-sm p-6">
                 <h2 className="text-xl font-bold text-slate-800">{t('web.outline.view_title')}</h2>
                 <p className="text-sm text-slate-500 mt-1">{t('web.outline.view_description')}</p>
@@ -1425,7 +1425,7 @@ export default function App() {
           )}
 
           {activeTab === 'settings' && (
-            <div className="h-full overflow-y-auto p-6">
+            <div className="h-full min-h-0 overflow-y-auto p-6">
               <div className="max-w-4xl mx-auto bg-white rounded-2xl border border-slate-200 shadow-sm p-6">
                 <h2 className="text-xl font-bold text-slate-800">{t('web.section.runtime')}</h2>
                 <p className="text-sm text-slate-500 mt-1">{t('web.runtime.panel_hint')}</p>
