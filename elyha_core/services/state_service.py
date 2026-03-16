@@ -528,6 +528,107 @@ class StateService:
             "world_variables": self.get_world_variable_status(project_id, world_variable_keys),
         }
 
+    def generate_arc_summary(
+        self,
+        project_id: str,
+        *,
+        node_count_threshold: int = 50,
+        max_summary_chars: int = 4000,
+    ) -> str | None:
+        """Generate a condensed arc-level summary from node chunk summaries.
+
+        Returns None if auto-summary is disabled or node count is below threshold.
+        """
+        project = self.repository.get_project(project_id)
+        if project is None:
+            return None
+        if not getattr(project.settings, "enable_auto_arc_summary", False):
+            return None
+
+        with self.repository.store.read_only() as conn:
+            node_count_row = conn.execute(
+                "SELECT COUNT(1) AS n FROM nodes WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            node_count = int(node_count_row["n"]) if node_count_row else 0
+            if node_count < node_count_threshold:
+                return None
+
+            # Check if we already have a cached summary that is still fresh
+            cached_row = conn.execute(
+                "SELECT value_json, updated_at FROM world_variable_status "
+                "WHERE project_id = ? AND variable_key = '__arc_summary__' LIMIT 1",
+                (project_id,),
+            ).fetchone()
+            if cached_row:
+                cached_summary = self._load_json(str(cached_row["value_json"]), "")
+                if isinstance(cached_summary, str) and cached_summary.strip():
+                    return cached_summary.strip()
+
+            # Build fresh summary from chunk summaries
+            rows = conn.execute(
+                "SELECT n.title, c.summary FROM node_chunks c "
+                "JOIN nodes n ON n.id = c.node_id AND n.project_id = c.project_id "
+                "WHERE c.project_id = ? AND c.summary != '' "
+                "ORDER BY n.created_at ASC, c.chunk_index ASC",
+                (project_id,),
+            ).fetchall()
+
+        if not rows:
+            return None
+
+        # Condense: take first line of each chunk summary, group by node title
+        segments: list[str] = []
+        current_title = ""
+        budget = max_summary_chars
+        for row in rows:
+            title = str(row["title"]).strip()
+            summary_line = str(row["summary"]).strip().split("\n")[0][:200]
+            if not summary_line:
+                continue
+            if title != current_title:
+                current_title = title
+                header = f"[{title}]"
+                if len(header) + 2 > budget:
+                    break
+                segments.append(header)
+                budget -= len(header) + 1
+            if len(summary_line) > budget:
+                break
+            segments.append(f"  {summary_line}")
+            budget -= len(summary_line) + 3
+
+        arc_text = "\n".join(segments).strip()
+        if not arc_text:
+            return None
+
+        # Persist for caching
+        self._upsert_arc_summary_cache(project_id, arc_text)
+        return arc_text
+
+    def _upsert_arc_summary_cache(self, project_id: str, summary_text: str) -> None:
+        now_iso = self._now_iso()
+        summary_json = self._dump_json(summary_text)
+        with self.repository.store.transaction() as conn:
+            existing = conn.execute(
+                "SELECT 1 FROM world_variable_status "
+                "WHERE project_id = ? AND variable_key = '__arc_summary__' LIMIT 1",
+                (project_id,),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE world_variable_status SET value_json = ?, updated_at = ? "
+                    "WHERE project_id = ? AND variable_key = '__arc_summary__'",
+                    (summary_json, now_iso, project_id),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO world_variable_status "
+                    "(project_id, variable_key, value_json, last_event_id, updated_at) "
+                    "VALUES (?, '__arc_summary__', ?, '', ?)",
+                    (project_id, summary_json, now_iso),
+                )
+
     def list_state_conflicts(
         self,
         project_id: str,

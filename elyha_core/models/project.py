@@ -101,6 +101,7 @@ class ProjectSettings:
     agent_tool_loop_total_read_char_limit: int = 20000
     agent_tool_loop_no_progress_limit: int = 2
     agent_tool_write_proposal_enabled: bool = False
+    enable_auto_arc_summary: bool = False
 
     def __post_init__(self) -> None:
         if self.auto_snapshot_minutes <= 0:
@@ -254,6 +255,10 @@ def project_settings_from_payload(raw: Any) -> ProjectSettings:
         ),
         agent_tool_write_proposal_enabled=_coerce_bool(
             payload.get("agent_tool_write_proposal_enabled"),
+            False,
+        ),
+        enable_auto_arc_summary=_coerce_bool(
+            payload.get("enable_auto_arc_summary"),
             False,
         ),
     )

@@ -3728,6 +3728,7 @@ class AIService:
                     "list_nodes",
                     "get_node",
                     "create_node",
+                    "split_node",
                     "update_node",
                     "create_edge",
                     "delete_node(confirm required)",
@@ -3974,12 +3975,16 @@ class AIService:
         result_json = json.dumps(result_payload, ensure_ascii=False, sort_keys=True)
         if len(result_json) > 1200:
             result_json = result_json[:1200] + "...(truncated)"
-        return (
+            
+        base_str = (
             f"round={round_no} tool={tool_name}\n"
             f"args={args_json}\n"
             f"result={result_json}"
         )
-
+        if isinstance(result_payload, dict) and "error" in result_payload:
+            base_str += "\n[SystemNote] Tool call failed due to argument/execution error. Please fix and retry."
+            
+        return base_str
     def _build_agent_loop_metrics(
         self,
         *,

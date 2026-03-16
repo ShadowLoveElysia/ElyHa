@@ -141,7 +141,12 @@ class ReadableContentToolService:
             relationship_pairs=relationship_pairs or None,
             world_variable_keys=world_variable_keys or None,
         )
-        return {"project_id": project_id, "state_snapshot": snapshot}
+        result: dict[str, Any] = {"project_id": project_id, "state_snapshot": snapshot}
+        # Conditionally attach arc summary for long-term memory
+        arc_summary = self.state_service.generate_arc_summary(project_id)
+        if arc_summary:
+            result["arc_summary"] = arc_summary
+        return result
 
     def get_effective_directives(self, *, project_id: str) -> dict[str, Any]:
         project = self.repository.get_project(project_id)

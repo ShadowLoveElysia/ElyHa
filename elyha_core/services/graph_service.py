@@ -138,6 +138,45 @@ class GraphService:
             payload={"node_id": node_id},
         )
 
+    def split_node(
+        self,
+        project_id: str,
+        source_node_id: str,
+        source_patch: Mapping[str, Any],
+        new_node_input: NodeCreate,
+        edge_label: str = "",
+    ) -> tuple[Node, Node, Edge]:
+        """Perform a composite split action inside a single transaction.
+        Updates the source node, creates a new node, and links them.
+        Rolls back all changes if any step fails.
+        """
+        project = self._require_project(project_id)
+        with self.repository.store.transaction():
+            # 1. Update source node
+            updated_source = self.update_node(project_id, source_node_id, source_patch)
+            
+            # 2. Add new node
+            new_node = self.add_node(project_id, new_node_input)
+            
+            # 3. Create connecting edge
+            new_edge = self.add_edge(
+                project_id,
+                source_id=updated_source.id,
+                target_id=new_node.id,
+                label=edge_label,
+            )
+            
+            self._record_graph_operation(
+                project,
+                op_type="graph_split_node",
+                payload={
+                    "source_node_id": updated_source.id,
+                    "new_node_id": new_node.id,
+                    "edge_id": new_edge.id,
+                },
+            )
+            return updated_source, new_node, new_edge
+
     def get_node(self, project_id: str, node_id: str) -> Node:
         node = self.repository.get_node(project_id, node_id)
         if node is None:

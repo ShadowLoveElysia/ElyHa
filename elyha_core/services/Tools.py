@@ -138,6 +138,55 @@ class ToolService:
                     "required": [],
                 },
             },
+            {
+                "name": "prose_rewrite",
+                "description": "Rewrite prose according to specific styles or constraints.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "rewrite_mode": {
+                            "type": "string",
+                            "description": "One of: sensory, pov, iceberg, show_dont_tell, cinematic, spatial, style",
+                        },
+                        "target_text": {"type": "string"},
+                        "instructions": {"type": "string"},
+                    },
+                    "required": ["rewrite_mode", "target_text", "instructions"],
+                },
+            },
+            {
+                "name": "story_analysis_report",
+                "description": "Analyze narrative structures, pacing, or reader reactions.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "analysis_type": {
+                            "type": "string",
+                            "description": "One of: framework, pacing, reader_reaction, editorial",
+                        },
+                        "scope_node_ids": {"type": "array", "items": {"type": "string"}},
+                        "focus_question": {"type": "string"},
+                    },
+                    "required": ["analysis_type"],
+                },
+            },
+            {
+                "name": "foreshadowing_engine",
+                "description": "Register, track, or trigger payoff for foreshadowing elements.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "description": "One of: register, propose_payoff, inject_motif, extract_sensory",
+                        },
+                        "element_id": {"type": "string"},
+                        "description": {"type": "string"},
+                        "target_node_id": {"type": "string"},
+                    },
+                    "required": ["action"],
+                },
+            },
         ]
         if node_tools_enabled:
             tools.extend(
@@ -182,6 +231,26 @@ class ToolService:
                                 "edge_label": {"type": "string"},
                             },
                             "required": ["title"],
+                        },
+                    },
+                    {
+                        "name": "split_node",
+                        "description": "Split a node atomically into two pieces by modifying the original and creating a new linked target.",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {
+                                "source_node_id": {"type": "string"},
+                                "source_patch": {
+                                    "type": "object", 
+                                    "description": "Fields to modify on source_node_id"
+                                },
+                                "new_node_title": {"type": "string"},
+                                "new_node_type": {"type": "string", "description": "Default is branch"},
+                                "new_node_status": {"type": "string"},
+                                "new_node_metadata": {"type": "object"},
+                                "edge_label": {"type": "string", "description": "Label for edge between source and new node"},
+                            },
+                            "required": ["source_node_id", "source_patch", "new_node_title"],
                         },
                     },
                     {
@@ -520,6 +589,48 @@ class ToolService:
                 return {}, "source_id and target_id are required"
             label = _clean_text(raw.get("label"), limit=120)
             return {"source_id": source_id, "target_id": target_id, "label": label}, ""
+        if normalized == "split_node":
+            source_node_id = _clean_text(raw.get("source_node_id") or tool_context_node_id, limit=128)
+            if not source_node_id:
+                return {}, "source_node_id is required"
+            source_patch_raw = raw.get("source_patch", {})
+            if not isinstance(source_patch_raw, dict):
+                return {}, "source_patch must be object"
+            source_patch: dict[str, Any] = {}
+            if "title" in source_patch_raw:
+                source_patch["title"] = _clean_text(source_patch_raw.get("title"), limit=200)
+            if "status" in source_patch_raw:
+                source_patch["status"] = _clean_text(source_patch_raw.get("status"), limit=32).lower()
+            if "metadata" in source_patch_raw and isinstance(source_patch_raw["metadata"], dict):
+                source_patch["metadata"] = dict(source_patch_raw["metadata"])
+            
+            new_node_title = _clean_text(raw.get("new_node_title"), limit=200)
+            if not new_node_title:
+                return {}, "new_node_title is required"
+            
+            new_node_type = _clean_text(raw.get("new_node_type", "branch"), limit=32).lower()
+            if new_node_type not in _NODE_TYPE_VALUES:
+                new_node_type = "branch"
+            
+            new_node_status = _clean_text(raw.get("new_node_status", "draft"), limit=32).lower()
+            if new_node_status not in _NODE_STATUS_VALUES:
+                new_node_status = "draft"
+                
+            new_metadata = raw.get("new_node_metadata", {})
+            if not isinstance(new_metadata, dict):
+                new_metadata = {}
+                
+            edge_label = _clean_text(raw.get("edge_label", ""), limit=120)
+            
+            return {
+                "source_node_id": source_node_id,
+                "source_patch": source_patch,
+                "new_node_title": new_node_title,
+                "new_node_type": new_node_type,
+                "new_node_status": new_node_status,
+                "new_node_metadata": new_metadata,
+                "edge_label": edge_label,
+            }, ""
         if normalized == "delete_node":
             node_id = _clean_text(
                 raw.get("node_id")
@@ -585,6 +696,51 @@ class ToolService:
             return {
                 "document_type": document_type,
                 "reason": reason,
+            }, ""
+        if normalized == "prose_rewrite":
+            rewrite_mode = _clean_text(raw.get("rewrite_mode"), limit=64).lower()
+            valid_modes = {"sensory", "pov", "iceberg", "show_dont_tell", "cinematic", "spatial", "style"}
+            if rewrite_mode not in valid_modes:
+                return {}, f"rewrite_mode must be one of [{', '.join(valid_modes)}]"
+            target_text = _clean_text(raw.get("target_text"), limit=8000)
+            if not target_text:
+                return {}, "target_text is required"
+            instructions = _clean_text(raw.get("instructions"), limit=2000)
+            if not instructions:
+                return {}, "instructions is required"
+            return {
+                "rewrite_mode": rewrite_mode,
+                "target_text": target_text,
+                "instructions": instructions,
+            }, ""
+        if normalized == "story_analysis_report":
+            analysis_type = _clean_text(raw.get("analysis_type"), limit=64).lower()
+            valid_types = {"framework", "pacing", "reader_reaction", "editorial"}
+            if analysis_type not in valid_types:
+                return {}, f"analysis_type must be one of [{', '.join(valid_types)}]"
+            scope_raw = raw.get("scope_node_ids")
+            scope_node_ids: list[str] = []
+            if isinstance(scope_raw, list):
+                scope_node_ids = [_clean_text(i, limit=128) for i in scope_raw if _clean_text(i, limit=128)]
+            focus_question = _clean_text(raw.get("focus_question"), limit=500)
+            return {
+                "analysis_type": analysis_type,
+                "scope_node_ids": scope_node_ids[:20],
+                "focus_question": focus_question,
+            }, ""
+        if normalized == "foreshadowing_engine":
+            action = _clean_text(raw.get("action"), limit=64).lower()
+            valid_actions = {"register", "propose_payoff", "inject_motif", "extract_sensory"}
+            if action not in valid_actions:
+                return {}, f"action must be one of [{', '.join(valid_actions)}]"
+            element_id = _clean_text(raw.get("element_id"), limit=128)
+            description = _clean_text(raw.get("description"), limit=2000)
+            target_node_id = _clean_text(raw.get("target_node_id"), limit=128)
+            return {
+                "action": action,
+                "element_id": element_id,
+                "description": description,
+                "target_node_id": target_node_id,
             }, ""
         return {}, "unknown_tool"
 
@@ -918,6 +1074,50 @@ class ToolService:
                 )
                 payload = {"edge": self._serialize_edge(edge)}
                 return payload, 0, {"ok": True, "edge_created": True}
+            if normalized == "split_node":
+                if not node_tools_enabled:
+                    return (
+                        {"error": "node_tools_disabled"},
+                        0,
+                        {"ok": False, "reason": "node_tools_disabled"},
+                    )
+                    
+                source_node_id = str(normalized_args.get("source_node_id", "")).strip()
+                source_patch = cast(dict[str, Any], normalized_args.get("source_patch", {}))
+                edge_label = str(normalized_args.get("edge_label", "")).strip()
+                
+                new_node_type = NodeType(str(normalized_args.get("new_node_type", "branch")).lower())
+                new_node_status = NodeStatus(str(normalized_args.get("new_node_status", "draft")).lower())
+                
+                # Fetch original node to inherit storyline and position safely if not provided
+                original_node = self.graph_service.get_node(project_id, source_node_id)
+                new_pos_x = original_node.pos_x + 280.0
+                new_pos_y = original_node.pos_y
+                
+                new_node_input = NodeCreate(
+                    title=str(normalized_args.get("new_node_title", "")),
+                    type=new_node_type,
+                    status=new_node_status,
+                    storyline_id=original_node.storyline_id,
+                    pos_x=new_pos_x,
+                    pos_y=new_pos_y,
+                    metadata=cast(dict[str, Any], normalized_args.get("new_node_metadata", {})),
+                )
+                
+                updated_source, new_node, new_edge = self.graph_service.split_node(
+                    project_id=project_id,
+                    source_node_id=source_node_id,
+                    source_patch=source_patch,
+                    new_node_input=new_node_input,
+                    edge_label=edge_label,
+                )
+                
+                payload = {
+                    "source_node": self._serialize_node(updated_source, include_metadata=True),
+                    "new_node": self._serialize_node(new_node, include_metadata=True),
+                    "edge": self._serialize_edge(new_edge),
+                }
+                return payload, 0, {"ok": True, "node_split": True}
             if normalized == "delete_node":
                 if not node_tools_enabled:
                     return (
@@ -1090,6 +1290,28 @@ class ToolService:
                     "skip_document_type": doc_type,
                     "requires_user_confirmation": True,
                 }
+            if normalized == "prose_rewrite":
+                payload = {
+                    "status": "acknowledged",
+                    "rewrite_mode": normalized_args.get("rewrite_mode"),
+                    "note": "Parameters parsed successfully. Provide the rewritten text in your final response.",
+                }
+                return payload, 0, {"ok": True, "action": "prose_rewrite"}
+            if normalized == "story_analysis_report":
+                payload = {
+                    "status": "acknowledged",
+                    "analysis_type": normalized_args.get("analysis_type"),
+                    "note": "Parameters parsed successfully. Please output your analysis in markdown format in your final response.",
+                }
+                return payload, 0, {"ok": True, "action": "story_analysis_report"}
+            if normalized == "foreshadowing_engine":
+                payload = {
+                    "status": "acknowledged",
+                    "action_type": normalized_args.get("action"),
+                    "element_id": normalized_args.get("element_id"),
+                    "note": "Foreshadowing action registered. Output the narrative changes in your final response.",
+                }
+                return payload, 0, {"ok": True, "action": "foreshadowing_engine"}
             return (
                 {"error": f"unknown_tool:{normalized}"},
                 0,
