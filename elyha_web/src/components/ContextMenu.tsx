@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { FolderPlus, FilePlus, Trash2, Settings, Link, Sparkles } from 'lucide-react';
+import { FolderPlus, FilePlus, Trash2, Settings, Link, Sparkles, Minimize2 } from 'lucide-react';
 import type {TranslationVars} from '../i18n';
 
 interface ContextMenuProps {
@@ -49,6 +49,9 @@ export function ContextMenu({ x, y, type, onClose, onAction, t }: ContextMenuPro
           </button>
           <button onClick={() => onAction('toggle-type')} className="w-full px-4 py-2 text-left text-sm text-slate-700 hover:bg-slate-50 flex items-center gap-2 transition-colors">
             <Sparkles size={16} /> {t('web.context_menu.toggle_type')}
+          </button>
+          <button onClick={() => onAction('reset-size')} className="w-full px-4 py-2 text-left text-sm text-slate-700 hover:bg-slate-50 flex items-center gap-2 transition-colors">
+            <Minimize2 size={16} /> {t('web.context_menu.reset_size')}
           </button>
           <div className="h-px bg-slate-200 my-1" />
           <button onClick={() => onAction('delete')} className="w-full px-4 py-2 text-left text-sm text-red-600 hover:bg-red-50 flex items-center gap-2 transition-colors">

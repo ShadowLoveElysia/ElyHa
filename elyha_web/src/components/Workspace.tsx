@@ -20,6 +20,11 @@ import {ContextMenu} from './ContextMenu';
 import type {CreateNodePayload, GraphEdgePayload, GraphNodePayload, NodeType, UpdateNodePayload} from '../types';
 import type {TranslationVars} from '../i18n';
 
+const DEFAULT_GROUP_WIDTH = 360;
+const DEFAULT_GROUP_HEIGHT = 420;
+const DEFAULT_NODE_WIDTH = 288;
+const DEFAULT_NODE_HEIGHT = 260;
+
 interface WorkspaceProps {
   projectId: string;
   nodes: GraphNodePayload[];
@@ -140,8 +145,8 @@ export function Workspace({
     return nodes.map((node) => {
       const metadata = normalizeMeta(node.metadata);
       if (node.type === 'group') {
-        const width = Math.max(260, readNumber(metadata, 'group_width', 360));
-        const height = Math.max(120, readNumber(metadata, 'group_height', 420));
+        const width = Math.max(260, readNumber(metadata, 'group_width', DEFAULT_GROUP_WIDTH));
+        const height = Math.max(120, readNumber(metadata, 'group_height', DEFAULT_GROUP_HEIGHT));
         return {
           id: node.id,
           type: 'group',
@@ -162,6 +167,10 @@ export function Workspace({
         type: 'custom',
         position: {x: node.pos_x, y: node.pos_y},
         selected: node.id === selectedNodeId,
+        style: {
+          width: Math.max(250, readNumber(metadata, 'node_width', DEFAULT_NODE_WIDTH)),
+          height: Math.max(190, readNumber(metadata, 'node_height', DEFAULT_NODE_HEIGHT)),
+        },
         data: {
           label: node.title,
           type: visualKind(node),
@@ -300,6 +309,27 @@ export function Workspace({
           await onUpdateNode(menu.nodeId, {type: nextType});
         }
 
+        if (action === 'reset-size') {
+          const metadata = normalizeMeta(targetNode.metadata);
+          if (targetNode.type === 'group') {
+            await onUpdateNode(menu.nodeId, {
+              metadata: {
+                ...metadata,
+                group_width: DEFAULT_GROUP_WIDTH,
+                group_height: DEFAULT_GROUP_HEIGHT,
+              },
+            });
+          } else {
+            await onUpdateNode(menu.nodeId, {
+              metadata: {
+                ...metadata,
+                node_width: DEFAULT_NODE_WIDTH,
+                node_height: DEFAULT_NODE_HEIGHT,
+              },
+            });
+          }
+        }
+
         if (action === 'settings') {
           const fieldChoices: Array<{value: string; label: string}> = [
             {value: 'title', label: t('web.node.editor.field.title')},
@@ -308,6 +338,7 @@ export function Workspace({
           ];
           if (targetNode.type !== 'group') {
             fieldChoices.splice(1, 0, {value: 'content', label: t('web.node.editor.field.content')});
+            fieldChoices.splice(2, 0, {value: 'outline', label: t('web.node.editor.field.outline')});
             fieldChoices.push({value: 'type', label: t('web.node.editor.field.type')});
           }
 
@@ -349,6 +380,25 @@ export function Workspace({
                   ...normalizeMeta(targetNode.metadata),
                   content: nextContent,
                   summary: nextContent.slice(0, 200),
+                },
+              });
+            }
+          }
+
+          if (selectedField === 'outline' && targetNode.type !== 'group') {
+            const currentOutline = readString(normalizeMeta(targetNode.metadata), 'outline_markdown');
+            const nextOutline = await onPrompt({
+              title: t('web.node.editor.outline_prompt_title'),
+              message: t('web.node.editor.outline_prompt_body'),
+              defaultValue: currentOutline,
+              placeholder: t('web.node.editor.outline_prompt_placeholder'),
+              multiline: true,
+            });
+            if (nextOutline !== null && nextOutline !== currentOutline) {
+              await onUpdateNode(menu.nodeId, {
+                metadata: {
+                  ...normalizeMeta(targetNode.metadata),
+                  outline_markdown: nextOutline,
                 },
               });
             }
@@ -441,16 +491,35 @@ export function Workspace({
           continue;
         }
         const source = nodeMap.get(change.id);
-        if (!source || source.type !== 'group') {
+        if (!source) {
           continue;
         }
         const width = Math.round(Number(change.dimensions.width) || 360);
         const height = Math.round(Number(change.dimensions.height) || 420);
-        const metadata = {
-          ...normalizeMeta(source.metadata),
-          group_width: width,
-          group_height: height,
-        };
+        const baseMetadata = normalizeMeta(source.metadata);
+        const currentWidth =
+          source.type === 'group'
+            ? Math.round(Math.max(260, readNumber(baseMetadata, 'group_width', DEFAULT_GROUP_WIDTH)))
+            : Math.round(Math.max(250, readNumber(baseMetadata, 'node_width', DEFAULT_NODE_WIDTH)));
+        const currentHeight =
+          source.type === 'group'
+            ? Math.round(Math.max(120, readNumber(baseMetadata, 'group_height', DEFAULT_GROUP_HEIGHT)))
+            : Math.round(Math.max(190, readNumber(baseMetadata, 'node_height', DEFAULT_NODE_HEIGHT)));
+        if (currentWidth === width && currentHeight === height) {
+          continue;
+        }
+        const metadata =
+          source.type === 'group'
+            ? {
+                ...baseMetadata,
+                group_width: width,
+                group_height: height,
+              }
+            : {
+                ...baseMetadata,
+                node_width: width,
+                node_height: height,
+              };
         void onUpdateNode(source.id, {metadata});
       }
     },

@@ -64,6 +64,10 @@ function nodeMainText(metadata: unknown, emptyText: string): string {
     return emptyText;
   }
   const record = metadata as Record<string, unknown>;
+  const outline = typeof record.outline_markdown === 'string' ? record.outline_markdown : '';
+  if (outline.trim()) {
+    return outline;
+  }
   const content = typeof record.content === 'string' ? record.content : '';
   if (content.trim()) {
     return content;

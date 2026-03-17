@@ -1,5 +1,5 @@
 import React, {useEffect, useState} from 'react';
-import {Handle, Position} from '@xyflow/react';
+import {Handle, NodeResizer, Position} from '@xyflow/react';
 import {FileText, Sparkles, Settings2, Play, ChevronDown, ChevronUp, Save} from 'lucide-react';
 import {cn} from '../utils';
 import type {TranslationVars} from '../i18n';
@@ -70,10 +70,11 @@ export function CustomNode({data, selected, t}: CustomNodeProps) {
   return (
     <div
       className={cn(
-        'bg-white border rounded-xl shadow-sm w-72 overflow-hidden transition-all duration-200',
+        'bg-white border rounded-xl shadow-sm w-full h-full min-h-[190px] overflow-hidden transition-all duration-200 flex flex-col',
         selected ? 'ring-2 ring-pink-500 border-pink-500/50 shadow-md' : 'border-slate-200 hover:border-slate-300',
       )}
     >
+      <NodeResizer color="#ec4899" isVisible={selected} minWidth={250} minHeight={190} />
       <Handle type="target" position={Position.Left} className="w-3 h-3 bg-white border-2 border-slate-300" />
 
       <div className="flex items-center justify-between px-4 py-3 border-b border-slate-100 bg-slate-50/50">
@@ -97,7 +98,7 @@ export function CustomNode({data, selected, t}: CustomNodeProps) {
         </button>
       </div>
 
-      <div className="p-4 space-y-3">
+      <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3">
         {editing ? (
           <div className="space-y-2">
             <textarea

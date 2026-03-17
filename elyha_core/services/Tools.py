@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any, cast
 
 from elyha_core.models.node import NodeStatus, NodeType
@@ -11,6 +12,7 @@ from elyha_core.services.graph_service import GraphService, NodeCreate
 from elyha_core.services.readable_content_tool_service import ReadableContentToolService
 from elyha_core.storage.repository import SQLiteRepository
 from elyha_core.utils.clock import utc_now
+from elyha_core.utils.ids import generate_id
 
 _DOC_TYPE_ALIASES = {
     "constitution_markdown": "constitution",
@@ -32,6 +34,8 @@ _GUIDE_DOC_ALIASES = {
 
 _NODE_TYPE_VALUES = {"chapter", "group", "branch", "merge", "parallel", "checkpoint"}
 _NODE_STATUS_VALUES = {"draft", "generated", "reviewed", "approved"}
+_PROPOSAL_TYPE_VALUES = ("global_directive", "retcon", "clarify_fix", "world_rule")
+_PROPOSAL_TYPE_SET = set(_PROPOSAL_TYPE_VALUES)
 
 
 class ToolService:
@@ -59,6 +63,7 @@ class ToolService:
         write_proposal_enabled: bool,
         write_document_enabled: bool,
         allow_skip_document: bool,
+        node_tools_visible: bool = False,
         node_tools_enabled: bool = False,
     ) -> list[dict[str, Any]]:
         tools: list[dict[str, Any]] = [
@@ -188,7 +193,7 @@ class ToolService:
                 },
             },
         ]
-        if node_tools_enabled:
+        if node_tools_visible or node_tools_enabled:
             tools.extend(
                 [
                     {
@@ -301,13 +306,19 @@ class ToolService:
                         "type": "object",
                         "properties": {
                             "target_scope": {"type": "string", "description": "project or global"},
-                            "proposal_type": {"type": "string"},
+                            "proposal_type": {
+                                "type": "string",
+                                "enum": list(_PROPOSAL_TYPE_VALUES),
+                                "description": "One of: global_directive, retcon, clarify_fix, world_rule",
+                            },
+                            "directive_text": {"type": "string"},
                             "title": {"type": "string"},
                             "content": {"type": "string"},
+                            "note": {"type": "string"},
                             "reason": {"type": "string"},
                             "node_id": {"type": "string"},
                         },
-                        "required": ["proposal_type", "title", "content"],
+                        "required": ["proposal_type", "directive_text"],
                     },
                 }
             )
@@ -646,7 +657,9 @@ class ToolService:
             target_scope = _clean_text(raw.get("target_scope") or "project", limit=32).lower()
             if target_scope not in {"project", "global"}:
                 target_scope = "project"
-            proposal_type = _clean_text(raw.get("proposal_type") or "global_directive", limit=64)
+            proposal_type = _clean_text(raw.get("proposal_type") or "global_directive", limit=64).lower()
+            if proposal_type not in _PROPOSAL_TYPE_SET:
+                return {}, f"proposal_type must be one of [{', '.join(_PROPOSAL_TYPE_VALUES)}]"
             directive_text = _clean_text(
                 raw.get("directive_text") or raw.get("content") or raw.get("value"),
                 limit=4000,
@@ -656,7 +669,7 @@ class ToolService:
             note = _clean_text(raw.get("note") or raw.get("reason"), limit=400)
             return {
                 "target_scope": target_scope,
-                "proposal_type": proposal_type or "global_directive",
+                "proposal_type": proposal_type,
                 "directive_text": directive_text,
                 "note": note,
             }, ""
@@ -760,6 +773,24 @@ class ToolService:
             json.dumps(cache_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()
 
+    def _build_argument_error_payload(self, *, tool_name: str, args_error: str) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "error": args_error,
+            "tool": tool_name,
+        }
+        if args_error == "unknown_tool":
+            payload["error_code"] = "unknown_tool"
+            return payload
+        payload["error_code"] = "invalid_arguments"
+        payload["expected_schema"] = {"tool": tool_name}
+        enum_match = re.match(r"^([a-zA-Z0-9_]+)\s+must\s+be\s+one\s+of\s+\[(.+)\]$", args_error)
+        if enum_match:
+            payload["expected_schema"] = {"tool": tool_name, "field": enum_match.group(1)}
+            values = [item.strip() for item in enum_match.group(2).split(",") if item.strip()]
+            if values:
+                payload["allowed_values"] = values
+        return payload
+
     def execute_tool_call(
         self,
         *,
@@ -792,10 +823,19 @@ class ToolService:
 
         if args_error:
             reason = "unknown_tool" if args_error == "unknown_tool" else "invalid_arguments"
+            error_payload = self._build_argument_error_payload(
+                tool_name=normalized,
+                args_error=args_error,
+            )
             return (
-                {"error": args_error, "tool": normalized},
+                error_payload,
                 0,
-                {"ok": False, "reason": reason, "error": args_error},
+                {
+                    "ok": False,
+                    "reason": reason,
+                    "error": args_error,
+                    "error_code": str(error_payload.get("error_code", reason)),
+                },
             )
         cacheable_tools = {
             "search_text",
@@ -1081,43 +1121,69 @@ class ToolService:
                         0,
                         {"ok": False, "reason": "node_tools_disabled"},
                     )
-                    
+                transaction_id = generate_id("tx")
                 source_node_id = str(normalized_args.get("source_node_id", "")).strip()
                 source_patch = cast(dict[str, Any], normalized_args.get("source_patch", {}))
                 edge_label = str(normalized_args.get("edge_label", "")).strip()
-                
-                new_node_type = NodeType(str(normalized_args.get("new_node_type", "branch")).lower())
-                new_node_status = NodeStatus(str(normalized_args.get("new_node_status", "draft")).lower())
-                
-                # Fetch original node to inherit storyline and position safely if not provided
-                original_node = self.graph_service.get_node(project_id, source_node_id)
-                new_pos_x = original_node.pos_x + 280.0
-                new_pos_y = original_node.pos_y
-                
-                new_node_input = NodeCreate(
-                    title=str(normalized_args.get("new_node_title", "")),
-                    type=new_node_type,
-                    status=new_node_status,
-                    storyline_id=original_node.storyline_id,
-                    pos_x=new_pos_x,
-                    pos_y=new_pos_y,
-                    metadata=cast(dict[str, Any], normalized_args.get("new_node_metadata", {})),
-                )
-                
-                updated_source, new_node, new_edge = self.graph_service.split_node(
-                    project_id=project_id,
-                    source_node_id=source_node_id,
-                    source_patch=source_patch,
-                    new_node_input=new_node_input,
-                    edge_label=edge_label,
-                )
-                
+
+                try:
+                    new_node_type = NodeType(str(normalized_args.get("new_node_type", "branch")).lower())
+                    new_node_status = NodeStatus(str(normalized_args.get("new_node_status", "draft")).lower())
+
+                    # Inherit storyline and position from source when splitting.
+                    original_node = self.graph_service.get_node(project_id, source_node_id)
+                    new_pos_x = original_node.pos_x + 280.0
+                    new_pos_y = original_node.pos_y
+                    new_node_input = NodeCreate(
+                        title=str(normalized_args.get("new_node_title", "")),
+                        type=new_node_type,
+                        status=new_node_status,
+                        storyline_id=original_node.storyline_id,
+                        pos_x=new_pos_x,
+                        pos_y=new_pos_y,
+                        metadata=cast(dict[str, Any], normalized_args.get("new_node_metadata", {})),
+                    )
+                    updated_source, new_node, new_edge = self.graph_service.split_node(
+                        project_id=project_id,
+                        source_node_id=source_node_id,
+                        source_patch=source_patch,
+                        new_node_input=new_node_input,
+                        edge_label=edge_label,
+                    )
+                except Exception as exc:
+                    return (
+                        {
+                            "error": str(exc),
+                            "error_code": "split_node_failed",
+                            "transaction_id": transaction_id,
+                            "rollback_status": "rolled_back_or_aborted",
+                        },
+                        0,
+                        {
+                            "ok": False,
+                            "reason": "execution_error",
+                            "error": str(exc),
+                            "error_code": "split_node_failed",
+                            "transaction_id": transaction_id,
+                            "rollback_status": "rolled_back_or_aborted",
+                        },
+                    )
                 payload = {
                     "source_node": self._serialize_node(updated_source, include_metadata=True),
                     "new_node": self._serialize_node(new_node, include_metadata=True),
                     "edge": self._serialize_edge(new_edge),
+                    "transaction": {
+                        "transaction_id": transaction_id,
+                        "status": "committed",
+                        "steps": ["update_node", "create_node", "create_edge"],
+                    },
                 }
-                return payload, 0, {"ok": True, "node_split": True}
+                return payload, 0, {
+                    "ok": True,
+                    "node_split": True,
+                    "transaction_id": transaction_id,
+                    "transaction_status": "committed",
+                }
             if normalized == "delete_node":
                 if not node_tools_enabled:
                     return (
@@ -1319,9 +1385,14 @@ class ToolService:
             )
         except Exception as exc:
             return (
-                {"error": str(exc)},
+                {"error": str(exc), "error_code": "execution_error"},
                 0,
-                {"ok": False, "reason": "execution_error", "error": str(exc)},
+                {
+                    "ok": False,
+                    "reason": "execution_error",
+                    "error": str(exc),
+                    "error_code": "execution_error",
+                },
             )
 
     def persist_workflow_doc_to_project_settings(

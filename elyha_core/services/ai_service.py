@@ -300,6 +300,40 @@ class AIService:
         self.setting_proposal_service = service
         self.tool_service.set_setting_proposal_service(service)
 
+    def _execute_tool_call(
+        self,
+        *,
+        tool_name: str,
+        arguments: dict[str, Any],
+        project_id: str,
+        tool_context_node_id: str = "",
+        tool_thread_id: str = "",
+        write_proposal_enabled: bool = False,
+        write_document_enabled: bool = False,
+        allow_skip_document: bool = False,
+        node_tools_enabled: bool = False,
+        tool_response_cache: dict[str, tuple[Any, int, dict[str, Any]]] | None = None,
+        single_read_char_limit: int = 4000,
+        total_read_char_limit: int = 20000,
+        total_read_chars: int = 0,
+    ) -> tuple[Any, int, dict[str, Any]]:
+        cache = tool_response_cache if isinstance(tool_response_cache, dict) else {}
+        return self.tool_service.execute_tool_call(
+            tool_name=tool_name,
+            arguments=arguments,
+            project_id=project_id,
+            tool_context_node_id=tool_context_node_id,
+            tool_thread_id=tool_thread_id,
+            write_proposal_enabled=write_proposal_enabled,
+            write_document_enabled=write_document_enabled,
+            allow_skip_document=allow_skip_document,
+            node_tools_enabled=node_tools_enabled,
+            tool_response_cache=cache,
+            single_read_char_limit=single_read_char_limit,
+            total_read_char_limit=total_read_char_limit,
+            total_read_chars=total_read_chars,
+        )
+
     def generate_chapter_draft(
         self,
         project_id: str,
@@ -617,6 +651,7 @@ class AIService:
         message: str,
         node_id: str | None = None,
         thread_id: str | None = None,
+        allow_node_write: bool = False,
         guide_mode: bool = False,
         token_budget: int = 1800,
     ) -> ChatAssistResult:
@@ -634,7 +669,14 @@ class AIService:
             if node is None:
                 route = "planner"
             else:
-                route = "writer"
+                route = (
+                    "outline"
+                    if self._should_route_to_outline(
+                        message=cleaned_message,
+                        node_metadata=node_metadata,
+                    )
+                    else "writer"
+                )
         review_bypassed = node is not None and auto_review_passed and route == "writer"
         requested_thread_id = str(thread_id or "").strip()
         clean_thread_id = requested_thread_id or generate_id("chat")
@@ -683,6 +725,8 @@ class AIService:
                         "write_document_enabled": True,
                         "write_document_required": False,
                         "allow_skip_document": True,
+                        "node_tools_visible": True,
+                        "node_tools_enabled": bool(allow_node_write),
                     },
                     project_id=project_id,
                 )
@@ -747,6 +791,8 @@ class AIService:
                 loop_platform_config: dict[str, Any] = {
                     "token_budget": token_budget,
                     "enable_tool_loop": True,
+                    "node_tools_visible": True,
+                    "node_tools_enabled": bool(allow_node_write),
                 }
                 if gate_decision["write_document_enabled"]:
                     loop_platform_config["write_document_enabled"] = True
@@ -854,6 +900,65 @@ class AIService:
                 revision=self._project_revision(project_id),
             )
 
+        if route == "outline":
+            outline_prompt, outline_bundle = self._chat_outline_prompt(
+                project_id,
+                node,
+                context,
+                cleaned_message,
+                node_metadata,
+                conversation_context=chat_context,
+                token_budget=token_budget,
+            )
+            response = self._generate(
+                task_type="chat_outline",
+                prompt=outline_prompt,
+                platform_config={"token_budget": token_budget, "tool_context_node_id": str(node.id)},
+                llm_route=llm_route,
+                project_id=project_id,
+            )
+            outline_text = response.content.strip()
+            if not outline_text:
+                raise RuntimeError(tr("ai.error.empty_response"))
+            updated_node_id: str | None = None
+            if allow_node_write:
+                patched_metadata = node_metadata.copy()
+                patched_metadata["outline_markdown"] = outline_text
+                patched_metadata["ai_chat_last_route"] = route
+                patched_metadata["ai_last_human_edit_at"] = utc_now().isoformat()
+                patched_metadata["ai_prompt_version"] = outline_bundle.prompt_version
+                patched_metadata["ai_prompt_sections"] = outline_bundle.sections_payload()
+                patched_metadata["ai_prompt_dropped_sections"] = outline_bundle.dropped_sections
+                patched_metadata["ai_prompt_constraints"] = outline_bundle.key_constraints
+                patched_metadata["ai_last_prompt"] = outline_bundle.final_prompt
+                patched_metadata["ai_prompt_token_counter_backend"] = (
+                    outline_bundle.token_counter_backend
+                )
+                patched_metadata["ai_prompt_cache_monitor"] = outline_bundle.cache_monitor
+                self.graph_service.update_node(
+                    project_id,
+                    node.id,
+                    {
+                        "metadata": patched_metadata,
+                    },
+                )
+                updated_node_id = node.id
+            self.repository.append_chat_message(
+                clean_thread_id,
+                role="assistant",
+                content=outline_text,
+            )
+            return ChatAssistResult(
+                project_id=project_id,
+                node_id=node.id,
+                thread_id=clean_thread_id,
+                route="outline",
+                reply=outline_text,
+                review_bypassed=False,
+                updated_node_id=updated_node_id,
+                revision=self._project_revision(project_id),
+            )
+
         if route == "writer":
             current_outline = str(node_metadata.get("outline_markdown", "")).strip()
             if not current_outline:
@@ -892,29 +997,31 @@ class AIService:
         content = response.content.strip()
         if not content:
             raise RuntimeError(tr("ai.error.empty_response"))
-
-        patched_metadata = node_metadata.copy()
-        patched_metadata["content"] = content
-        patched_metadata["summary"] = content[:200]
-        patched_metadata["ai_chat_last_route"] = route
-        patched_metadata["ai_last_human_edit_at"] = utc_now().isoformat()
-        patched_metadata["ai_review_passed_once"] = auto_review_passed
-        patched_metadata["ai_prompt_version"] = writer_bundle.prompt_version
-        patched_metadata["ai_prompt_sections"] = writer_bundle.sections_payload()
-        patched_metadata["ai_prompt_dropped_sections"] = writer_bundle.dropped_sections
-        patched_metadata["ai_prompt_constraints"] = writer_bundle.key_constraints
-        patched_metadata["ai_last_prompt"] = writer_bundle.final_prompt
-        patched_metadata["ai_prompt_token_counter_backend"] = writer_bundle.token_counter_backend
-        patched_metadata["ai_prompt_cache_monitor"] = writer_bundle.cache_monitor
-        self.graph_service.update_node(
-            project_id,
-            node.id,
-            {
-                "status": "generated",
-                "metadata": patched_metadata,
-            },
-        )
-        self.repository.replace_node_chunks(node.id, split_text_by_chars(content))
+        updated_node_id: str | None = None
+        if allow_node_write:
+            patched_metadata = node_metadata.copy()
+            patched_metadata["content"] = content
+            patched_metadata["summary"] = content[:200]
+            patched_metadata["ai_chat_last_route"] = route
+            patched_metadata["ai_last_human_edit_at"] = utc_now().isoformat()
+            patched_metadata["ai_review_passed_once"] = auto_review_passed
+            patched_metadata["ai_prompt_version"] = writer_bundle.prompt_version
+            patched_metadata["ai_prompt_sections"] = writer_bundle.sections_payload()
+            patched_metadata["ai_prompt_dropped_sections"] = writer_bundle.dropped_sections
+            patched_metadata["ai_prompt_constraints"] = writer_bundle.key_constraints
+            patched_metadata["ai_last_prompt"] = writer_bundle.final_prompt
+            patched_metadata["ai_prompt_token_counter_backend"] = writer_bundle.token_counter_backend
+            patched_metadata["ai_prompt_cache_monitor"] = writer_bundle.cache_monitor
+            self.graph_service.update_node(
+                project_id,
+                node.id,
+                {
+                    "status": "generated",
+                    "metadata": patched_metadata,
+                },
+            )
+            self.repository.replace_node_chunks(node.id, split_text_by_chars(content))
+            updated_node_id = node.id
         self.repository.append_chat_message(
             clean_thread_id,
             role="assistant",
@@ -927,7 +1034,7 @@ class AIService:
             route="writer",
             reply=content,
             review_bypassed=review_bypassed,
-            updated_node_id=node.id,
+            updated_node_id=updated_node_id,
             revision=self._project_revision(project_id),
         )
 
@@ -2819,6 +2926,48 @@ class AIService:
         )
         return bundle.final_prompt, bundle
 
+    def _chat_outline_prompt(
+        self,
+        project_id: str,
+        node: Any,
+        context: ContextPack,
+        user_message: str,
+        metadata: dict[str, Any],
+        *,
+        conversation_context: str = "",
+        token_budget: int,
+    ) -> tuple[str, PromptBundle]:
+        current_content = str(metadata.get("content", "")).strip() or tr("ai.chat.empty_fallback")
+        current_outline = str(metadata.get("outline_markdown", "")).strip() or tr("ai.chat.empty_fallback")
+        request_text = str(user_message or "").strip()
+        context_text = str(conversation_context or "").strip()
+        if context_text:
+            request_text = f"{request_text}\n\n{context_text}"
+        instruction = self._render_prompt_template(
+            "chat_outline_prompt",
+            fallback_key="ai.chat.outline_prompt",
+            title=node.title,
+            request=request_text,
+            current_outline=current_outline,
+            current_content=current_content,
+            context="(see structured context sections below)",
+        )
+        bundle = self._build_prompt_bundle(
+            project_id=project_id,
+            node=node,
+            context=context,
+            token_budget=token_budget,
+            task_mode="generate",
+            task_type="chat_outline",
+            task_instruction=instruction,
+            extra_node_context={
+                "current_outline": current_outline,
+                "current_content_excerpt": current_content[:1000],
+                "conversation_context": context_text,
+            },
+        )
+        return bundle.final_prompt, bundle
+
     def _build_outline_detail_nodes_from_lines(
         self,
         lines: list[str],
@@ -2912,6 +3061,8 @@ class AIService:
             "plan": "planner",
             "planner": "planner",
             "writer": "writer",
+            "outline": "outline",
+            "outliner": "outline",
         }
 
         def _replace(match: re.Match[str]) -> str:
@@ -2926,6 +3077,51 @@ class AIService:
         cleaned = re.sub(r"(?<![A-Za-z0-9_])@([A-Za-z_]+)\b", _replace, text)
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         return cleaned, route
+
+    def _should_route_to_outline(
+        self,
+        *,
+        message: str,
+        node_metadata: dict[str, Any],
+    ) -> bool:
+        current_outline = str(node_metadata.get("outline_markdown", "")).strip()
+        if not current_outline:
+            return True
+
+        raw = str(message or "").strip()
+        lowered = raw.lower()
+        if not raw:
+            return False
+
+        # Keep writer route when user explicitly asks for prose based on outline.
+        if ("根据大纲" in raw or "按大纲" in raw or "依照大纲" in raw) and (
+            "正文" in raw or "本文" in raw
+        ):
+            return False
+        if ("based on outline" in lowered or "follow the outline" in lowered) and (
+            "prose" in lowered or "content" in lowered or "draft" in lowered
+        ):
+            return False
+
+        outline_action_patterns = (
+            r"(补充|完善|生成|创建|写|更新|修改|重写|扩写).{0,8}(大纲|细纲|章纲)",
+            r"(大纲|细纲|章纲).{0,8}(补充|完善|生成|创建|写|更新|修改|重写|扩写)",
+            r"(update|revise|rewrite|generate|create|edit)\s+(the\s+)?outline",
+            r"outline\s+(update|revise|rewrite|generate|create|edit)",
+            r"(大綱|アウトライン).{0,8}(更新|作成|修正|生成|書き|追記)",
+        )
+        for pattern in outline_action_patterns:
+            if re.search(pattern, raw, flags=re.IGNORECASE):
+                return True
+
+        has_outline_keyword = any(
+            marker in raw
+            for marker in ("大纲", "细纲", "章纲", "大綱", "アウトライン", "プロットビート")
+        ) or any(marker in lowered for marker in ("outline", "beat list", "beats"))
+        has_prose_keyword = any(marker in raw for marker in ("正文", "本文", "章节正文")) or any(
+            marker in lowered for marker in ("prose", "draft", "chapter content", "full text")
+        )
+        return has_outline_keyword and not has_prose_keyword
 
     def _build_global_tool_gate_specs(self) -> list[dict[str, Any]]:
         return [
@@ -3464,6 +3660,7 @@ class AIService:
         tool_thread_id = str(platform_config.get("tool_thread_id", "") or "").strip()
         write_document_enabled = bool(platform_config.get("write_document_enabled", False))
         allow_skip_document = bool(platform_config.get("allow_skip_document", False))
+        node_tools_visible = bool(platform_config.get("node_tools_visible", False))
         node_tools_enabled = bool(platform_config.get("node_tools_enabled", False))
         write_document_required_default = (
             write_document_enabled and task_type in {"workflow_docs_draft", "workflow_docs_revise"}
@@ -3476,6 +3673,7 @@ class AIService:
             write_proposal_enabled=write_proposal_enabled,
             write_document_enabled=write_document_enabled,
             allow_skip_document=allow_skip_document,
+            node_tools_visible=node_tools_visible,
             node_tools_enabled=node_tools_enabled,
         )
         if native_tools:
@@ -3495,7 +3693,7 @@ class AIService:
                 write_document_enabled=write_document_enabled,
                 write_document_required=write_document_required,
                 allow_skip_document=allow_skip_document,
-                node_tools_enabled=node_tools_enabled,
+                node_tools_visible=node_tools_visible,
             )
             prompt_hash = hashlib.sha256(round_prompt.encode("utf-8")).hexdigest()
             request = LLMRequest(
@@ -3712,7 +3910,7 @@ class AIService:
         write_document_enabled: bool = False,
         write_document_required: bool = False,
         allow_skip_document: bool = False,
-        node_tools_enabled: bool = False,
+        node_tools_visible: bool = False,
     ) -> str:
         tool_names = [
             "search_text",
@@ -3722,7 +3920,7 @@ class AIService:
             "get_world_state",
             "get_effective_directives",
         ]
-        if node_tools_enabled:
+        if node_tools_visible:
             tool_names.extend(
                 [
                     "list_nodes",
@@ -3788,7 +3986,7 @@ class AIService:
                     "Do not skip docs by assumption.",
                 ]
             )
-        if node_tools_enabled:
+        if node_tools_visible:
             lines.extend(
                 [
                     "[GraphMutationRule]",

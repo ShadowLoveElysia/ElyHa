@@ -134,6 +134,20 @@ class SessionOrchestratorService:
         session["state_update_retry_summary"] = retry_summary
         return session
 
+    def get_latest_session_for_project(self, project_id: str) -> dict[str, Any] | None:
+        clean_project = str(project_id or "").strip()
+        if not clean_project:
+            raise ValueError("project_id cannot be empty")
+        if self.repository.get_project(clean_project) is None:
+            raise KeyError(f"project not found: {clean_project}")
+        thread_id = self.repository.get_latest_agent_session_thread(clean_project)
+        if not thread_id:
+            return None
+        return {
+            "thread_id": thread_id,
+            "session": self.get_session_state(thread_id),
+        }
+
     def cancel_session(self, thread_id: str) -> dict[str, Any]:
         session = self._load_session_or_raise(thread_id)
         updated = self._transition_session(
@@ -412,6 +426,7 @@ class SessionOrchestratorService:
         decision_id: str,
         accepted_hunk_ids: list[str] | None = None,
         rejected_hunk_ids: list[str] | None = None,
+        edited_hunks: list[dict[str, Any]] | None = None,
         expected_base_revision: int | None = None,
         expected_base_hash: str | None = None,
         expected_state_version: int | None = None,
@@ -424,6 +439,7 @@ class SessionOrchestratorService:
 
         accepted = self._normalize_hunk_ids(accepted_hunk_ids or [])
         rejected = self._normalize_hunk_ids(rejected_hunk_ids or [])
+        edited_hunk_texts = self._normalize_hunk_text_overrides(edited_hunks or [])
         overlap = set(accepted) & set(rejected)
         if overlap:
             raise ValueError(f"accepted_hunk_ids and rejected_hunk_ids overlap: {sorted(overlap)}")
@@ -436,6 +452,7 @@ class SessionOrchestratorService:
                 "diff_id": str(diff_id or "").strip(),
                 "accepted_hunk_ids": accepted,
                 "rejected_hunk_ids": rejected,
+                "edited_hunk_ids": sorted(edited_hunk_texts.keys()),
                 "expected_base_revision": expected_base_revision,
                 "expected_base_hash": str(expected_base_hash or "").strip(),
             },
@@ -475,12 +492,14 @@ class SessionOrchestratorService:
             diff_patch=diff_patch,
             accepted_hunk_ids=accepted,
             rejected_hunk_ids=rejected,
+            edited_hunk_texts=edited_hunk_texts,
         )
         updated_meta = dict(pending_meta)
         updated_meta["diff_apply_status"] = apply_result["status"]
         updated_meta["diff_accepted_hunk_ids"] = apply_result["accepted_hunk_ids"]
         updated_meta["diff_rejected_hunk_ids"] = apply_result["rejected_hunk_ids"]
         updated_meta["diff_applied_hunk_ids"] = apply_result["applied_hunk_ids"]
+        updated_meta["diff_edited_hunk_ids"] = apply_result["edited_hunk_ids"]
         updated_meta["diff_applied_at"] = utc_now().isoformat()
         updated_meta["diff_result_content_hash"] = self._text_hash(str(apply_result["content"]))
         updated_meta["diff_apply_message"] = apply_result["message"]
@@ -504,6 +523,7 @@ class SessionOrchestratorService:
                 "applied_hunk_ids": apply_result["applied_hunk_ids"],
                 "accepted_hunk_ids": apply_result["accepted_hunk_ids"],
                 "rejected_hunk_ids": apply_result["rejected_hunk_ids"],
+                "edited_hunk_ids": apply_result["edited_hunk_ids"],
                 "base_revision": base_revision,
                 "base_content_hash": base_hash,
             },
@@ -820,6 +840,10 @@ class SessionOrchestratorService:
             pending_meta = self._draft_to_meta(draft)
             pending_meta["agent_loop_rounds_count"] = len(getattr(draft, "agent_loop_rounds", []) or [])
             pending_meta["agent_tool_calls_count"] = len(getattr(draft, "agent_tool_calls", []) or [])
+            pending_meta["agent_tool_calls_preview"] = self._build_tool_calls_preview(
+                getattr(draft, "agent_tool_calls", []),
+                limit=8,
+            )
             pending_meta["chapter_done_evaluation"] = self._build_chapter_done_evaluation(
                 session=running,
                 draft=draft,
@@ -1709,6 +1733,19 @@ class SessionOrchestratorService:
             normalized.append(text)
         return normalized
 
+    def _normalize_hunk_text_overrides(self, values: list[dict[str, Any]]) -> dict[str, str]:
+        overrides: dict[str, str] = {}
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            hunk_id = str(item.get("hunk_id") or "").strip()
+            if not hunk_id:
+                continue
+            if "new_text" not in item:
+                continue
+            overrides[hunk_id] = str(item.get("new_text") or "")
+        return overrides
+
     def _apply_diff_patch(
         self,
         *,
@@ -1716,6 +1753,7 @@ class SessionOrchestratorService:
         diff_patch: dict[str, Any],
         accepted_hunk_ids: list[str],
         rejected_hunk_ids: list[str],
+        edited_hunk_texts: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         raw_hunks = diff_patch.get("hunks")
         if not isinstance(raw_hunks, list):
@@ -1734,14 +1772,20 @@ class SessionOrchestratorService:
                 "accepted_hunk_ids": [],
                 "rejected_hunk_ids": [],
                 "applied_hunk_ids": [],
+                "edited_hunk_ids": [],
             }
 
-        unknown_accepted = [item for item in accepted_hunk_ids if item not in set(all_hunk_ids)]
-        unknown_rejected = [item for item in rejected_hunk_ids if item not in set(all_hunk_ids)]
+        all_hunk_id_set = set(all_hunk_ids)
+        unknown_accepted = [item for item in accepted_hunk_ids if item not in all_hunk_id_set]
+        unknown_rejected = [item for item in rejected_hunk_ids if item not in all_hunk_id_set]
         if unknown_accepted:
             raise ValueError(f"unknown accepted_hunk_ids: {unknown_accepted}")
         if unknown_rejected:
             raise ValueError(f"unknown rejected_hunk_ids: {unknown_rejected}")
+        overrides = edited_hunk_texts if isinstance(edited_hunk_texts, dict) else {}
+        unknown_edited = [item for item in overrides.keys() if item not in all_hunk_id_set]
+        if unknown_edited:
+            raise ValueError(f"unknown edited_hunk_ids: {sorted(unknown_edited)}")
 
         rejected_set = set(rejected_hunk_ids)
         if accepted_hunk_ids:
@@ -1759,11 +1803,13 @@ class SessionOrchestratorService:
                 "accepted_hunk_ids": selected_ids,
                 "rejected_hunk_ids": normalized_rejected,
                 "applied_hunk_ids": [],
+                "edited_hunk_ids": [],
             }
 
         lines = self._split_lines(base_content)
         offset = 0
         applied: list[str] = []
+        edited_applied_ids: list[str] = []
         for hunk in hunks:
             hunk_id = str(hunk.get("hunk_id") or "").strip()
             if not hunk_id or hunk_id not in selected_set:
@@ -1774,7 +1820,10 @@ class SessionOrchestratorService:
             start_idx = max(0, start_line - 1 + offset)
             end_idx = max(start_idx, end_line + offset)
             old_lines = self._split_lines(str(hunk.get("old_text") or ""))
-            new_lines = self._split_lines(str(hunk.get("new_text") or ""))
+            if hunk_id in overrides:
+                new_lines = self._split_lines(str(overrides.get(hunk_id) or ""))
+            else:
+                new_lines = self._split_lines(str(hunk.get("new_text") or ""))
 
             if op in {"replace", "delete"}:
                 current = lines[start_idx:end_idx]
@@ -1796,6 +1845,8 @@ class SessionOrchestratorService:
             else:
                 raise ValueError(f"unsupported diff op: {op}")
             applied.append(hunk_id)
+            if hunk_id in overrides:
+                edited_applied_ids.append(hunk_id)
 
         content = "\n".join(lines)
         return {
@@ -1805,6 +1856,7 @@ class SessionOrchestratorService:
             "accepted_hunk_ids": selected_ids,
             "rejected_hunk_ids": normalized_rejected,
             "applied_hunk_ids": applied,
+            "edited_hunk_ids": edited_applied_ids,
         }
 
     def _text_hash(self, text: str) -> str:
@@ -1835,6 +1887,30 @@ class SessionOrchestratorService:
             seen.add(proposal_id)
             proposal_ids.append(proposal_id)
         return proposal_ids
+
+    def _build_tool_calls_preview(self, calls: Any, *, limit: int = 8) -> list[dict[str, Any]]:
+        if not isinstance(calls, list):
+            return []
+        safe_limit = max(1, min(int(limit), 20))
+        preview: list[dict[str, Any]] = []
+        for item in calls[:safe_limit]:
+            if not isinstance(item, dict):
+                continue
+            args = item.get("args")
+            if not isinstance(args, dict):
+                args = {}
+            result_meta = item.get("result_meta")
+            if not isinstance(result_meta, dict):
+                result_meta = {}
+            preview.append(
+                {
+                    "round_no": int(self._safe_int(item.get("round_no"), fallback=0)),
+                    "tool_name": str(item.get("tool_name") or "").strip(),
+                    "args": args,
+                    "result_meta": result_meta,
+                }
+            )
+        return preview
 
     def _draft_to_meta(self, draft: ChapterDraftResult) -> dict[str, Any]:
         return {

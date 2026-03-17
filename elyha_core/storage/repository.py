@@ -1065,6 +1065,26 @@ class SQLiteRepository:
             "updated_at": str(row["updated_at"] or ""),
         }
 
+    def get_latest_agent_session_thread(self, project_id: str) -> str | None:
+        clean_project = str(project_id or "").strip()
+        if not clean_project:
+            return None
+        with self.store.read_only() as conn:
+            row = conn.execute(
+                """
+                SELECT thread_id
+                FROM agent_sessions
+                WHERE project_id = ?
+                ORDER BY updated_at DESC, thread_id DESC
+                LIMIT 1
+                """,
+                (clean_project,),
+            ).fetchone()
+        if row is None:
+            return None
+        thread_id = str(row["thread_id"] or "").strip()
+        return thread_id or None
+
     def list_chat_threads(self, project_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
         clean_project = str(project_id or "").strip()
         if not clean_project:

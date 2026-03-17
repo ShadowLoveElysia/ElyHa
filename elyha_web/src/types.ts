@@ -158,6 +158,7 @@ export interface AiChatPayload {
   message: string;
   node_id?: string;
   thread_id?: string;
+  allow_node_write?: boolean;
   guide_mode?: boolean;
   token_budget?: number;
 }
@@ -208,6 +209,12 @@ export interface ChatThreadsResponse {
   project_id: string;
   count: number;
   threads: ChatThreadSummary[];
+}
+
+export interface ChatThreadCreateResponse {
+  project_id: string;
+  thread_id: string;
+  thread: ChatThreadSummary;
 }
 
 export interface ChatThreadMessagesResponse {
@@ -326,9 +333,19 @@ export interface SubmitAgentDiffReviewPayload {
   decision_id: string;
   accepted_hunk_ids?: string[];
   rejected_hunk_ids?: string[];
+  edited_hunks?: Array<{
+    hunk_id: string;
+    new_text: string;
+  }>;
   expected_base_revision?: number;
   expected_base_hash?: string;
   expected_state_version?: number;
+}
+
+export interface LatestProjectAgentSessionResponse {
+  project_id: string;
+  thread_id: string;
+  session: AgentSessionPayload | null;
 }
 
 export interface AgentSessionResponse {

@@ -39,6 +39,7 @@ from elyha_core.services.validation_service import ValidationService
 from elyha_core.services.workflow_doc_service import WorkflowDocumentService
 from elyha_core.storage.repository import SQLiteRepository
 from elyha_core.storage.sqlite_store import SQLiteStore
+from elyha_core.utils.ids import generate_id
 
 API_KEY_CONFIGURED_PLACEHOLDER = "__ELYHA_API_KEY_CONFIGURED__"
 
@@ -228,6 +229,7 @@ class ChatAssistRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     node_id: str | None = None
     thread_id: str | None = Field(default=None, min_length=1, max_length=128)
+    allow_node_write: bool = False
     guide_mode: bool = False
     token_budget: int = Field(default=1800, ge=1)
 
@@ -351,6 +353,7 @@ class SubmitDiffReviewRequest(BaseModel):
     decision_id: str = Field(min_length=1, max_length=128)
     accepted_hunk_ids: list[str] = Field(default_factory=list)
     rejected_hunk_ids: list[str] = Field(default_factory=list)
+    edited_hunks: list[dict[str, Any]] = Field(default_factory=list)
     expected_base_revision: int | None = Field(default=None, ge=0)
     expected_base_hash: str | None = Field(default=None, max_length=128)
     expected_state_version: int | None = Field(default=None, ge=1)
@@ -364,6 +367,11 @@ class ReviewSettingProposalsBatchRequest(BaseModel):
     note: str = ""
     decision_id: str = Field(min_length=1, max_length=128)
     expected_state_version: int | None = Field(default=None, ge=1)
+
+
+class CreateChatThreadRequest(BaseModel):
+    thread_id: str | None = Field(default=None, max_length=128)
+    node_id: str = Field(default="", max_length=128)
 
 
 class UpdateRuntimeSettingsRequest(BaseModel):
@@ -1540,6 +1548,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 message=payload.message,
                 node_id=payload.node_id,
                 thread_id=payload.thread_id,
+                allow_node_write=payload.allow_node_write,
                 guide_mode=payload.guide_mode,
                 token_budget=payload.token_budget,
             )
@@ -1572,6 +1581,31 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             "project_id": project_id,
             "count": len(rows),
             "threads": rows,
+        }
+
+    @api.post("/api/projects/{project_id}/chat/threads")
+    def create_project_chat_thread(project_id: str, payload: CreateChatThreadRequest) -> dict[str, Any]:
+        if repository.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail=f"project not found: {project_id}")
+        requested_thread = str(payload.thread_id or "").strip()
+        thread_id = requested_thread or generate_id("chat")
+        try:
+            repository.upsert_chat_thread(
+                thread_id,
+                project_id=project_id,
+                node_id=str(payload.node_id or "").strip(),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        thread = repository.get_chat_thread(thread_id) or {
+            "thread_id": thread_id,
+            "project_id": project_id,
+            "node_id": str(payload.node_id or "").strip(),
+        }
+        return {
+            "project_id": project_id,
+            "thread_id": thread_id,
+            "thread": thread,
         }
 
     @api.get("/api/projects/{project_id}/chat/threads/{thread_id}/messages")
@@ -1789,6 +1823,22 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             "session": session,
         }
 
+    @api.get("/api/projects/{project_id}/agent/session/latest")
+    def get_latest_project_agent_session(project_id: str) -> dict[str, Any]:
+        try:
+            payload = services.session_orchestrator_service.get_latest_session_for_project(project_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not payload:
+            return {"project_id": project_id, "thread_id": "", "session": None}
+        return {
+            "project_id": project_id,
+            "thread_id": str(payload.get("thread_id", "") or ""),
+            "session": payload.get("session"),
+        }
+
     @api.get("/api/agent/session/{thread_id}/audits")
     def get_agent_session_audits(thread_id: str) -> dict[str, Any]:
         try:
@@ -1924,6 +1974,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 decision_id=payload.decision_id,
                 accepted_hunk_ids=payload.accepted_hunk_ids,
                 rejected_hunk_ids=payload.rejected_hunk_ids,
+                edited_hunks=payload.edited_hunks,
                 expected_base_revision=payload.expected_base_revision,
                 expected_base_hash=payload.expected_base_hash,
                 expected_state_version=payload.expected_state_version,

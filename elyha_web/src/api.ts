@@ -3,6 +3,7 @@ import type {
   AgentSessionResponse,
   AiChatPayload,
   AiChatResponse,
+  ChatThreadCreateResponse,
   ChatThreadMessagesResponse,
   ChatThreadsResponse,
   ClarificationQuestionPayload,
@@ -11,6 +12,7 @@ import type {
   GenerateChapterResponse,
   GraphEdgePayload,
   GraphNodePayload,
+  LatestProjectAgentSessionResponse,
   LlmPresetPayload,
   ProjectInsights,
   ProjectPayload,
@@ -41,6 +43,13 @@ export class ApiTimeoutError extends Error {
     super(`API_TIMEOUT:${timeoutSeconds}`);
     this.name = 'ApiTimeoutError';
     this.timeoutSeconds = timeoutSeconds;
+  }
+}
+
+export class ApiAbortError extends Error {
+  constructor() {
+    super('API_ABORTED');
+    this.name = 'ApiAbortError';
   }
 }
 
@@ -138,7 +147,20 @@ export async function apiRequest<T>(path: string, options: ApiRequestOptions = {
   }
 
   const controller = new AbortController();
-  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  let timedOut = false;
+  const timer = window.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  const externalSignal = options.signal;
+  const abortByExternal = () => controller.abort();
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      controller.abort();
+    } else {
+      externalSignal.addEventListener('abort', abortByExternal, {once: true});
+    }
+  }
   init.signal = controller.signal;
 
   try {
@@ -150,10 +172,16 @@ export async function apiRequest<T>(path: string, options: ApiRequestOptions = {
     return payload as T;
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') {
-      throw new ApiTimeoutError(timeoutMs);
+      if (timedOut) {
+        throw new ApiTimeoutError(timeoutMs);
+      }
+      throw new ApiAbortError();
     }
     throw error;
   } finally {
+    if (externalSignal) {
+      externalSignal.removeEventListener('abort', abortByExternal);
+    }
     window.clearTimeout(timer);
   }
 }
@@ -256,11 +284,15 @@ export async function rollbackProject(projectId: string, revision: number): Prom
   });
 }
 
-export async function sendAiChat(payload: AiChatPayload): Promise<AiChatResponse> {
+export async function sendAiChat(
+  payload: AiChatPayload,
+  options: {signal?: AbortSignal} = {},
+): Promise<AiChatResponse> {
   return apiRequest<AiChatResponse>('/api/ai/chat', {
     method: 'POST',
     body: payload,
     timeoutMs: 180_000,
+    signal: options.signal,
   });
 }
 
@@ -271,6 +303,16 @@ export async function listProjectChatThreads(
   return apiRequest<ChatThreadsResponse>(
     `/api/projects/${projectId}/chat/threads?limit=${encodeURIComponent(String(limit))}`,
   );
+}
+
+export async function createProjectChatThread(
+  projectId: string,
+  payload: {thread_id?: string; node_id?: string} = {},
+): Promise<ChatThreadCreateResponse> {
+  return apiRequest<ChatThreadCreateResponse>(`/api/projects/${projectId}/chat/threads`, {
+    method: 'POST',
+    body: payload,
+  });
 }
 
 export async function getProjectChatThreadMessages(
@@ -312,6 +354,10 @@ export async function resumeAgentSession(payload: ResumeAgentSessionPayload): Pr
 
 export async function getAgentSession(threadId: string): Promise<AgentSessionResponse> {
   return apiRequest<AgentSessionResponse>(`/api/agent/session/${threadId}`);
+}
+
+export async function getLatestProjectAgentSession(projectId: string): Promise<LatestProjectAgentSessionResponse> {
+  return apiRequest<LatestProjectAgentSessionResponse>(`/api/projects/${projectId}/agent/session/latest`);
 }
 
 export async function submitAgentDecision(payload: SubmitAgentDecisionPayload): Promise<AgentSessionResponse> {
