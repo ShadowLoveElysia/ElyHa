@@ -1,4 +1,4 @@
-import React, {useEffect, useMemo, useState} from 'react';
+import React, {useEffect, useMemo, useRef, useState} from 'react';
 import {Network, Database, RefreshCw, BarChart3, GitBranch, Link2, Users, Globe} from 'lucide-react';
 import type {
   CharacterStatusPayload,
@@ -33,6 +33,11 @@ interface SatelliteItem {
   hopTarget?: string;
 }
 
+interface OrbitOffset {
+  x: number;
+  y: number;
+}
+
 export function KnowledgeGraph({
   projectId = '',
   insights,
@@ -51,6 +56,26 @@ export function KnowledgeGraph({
   const [saving, setSaving] = useState(false);
   const [focusCharacter, setFocusCharacter] = useState('');
   const [orbitTransitioning, setOrbitTransitioning] = useState(false);
+  const [orbitScale, setOrbitScale] = useState(1);
+  const [orbitAutoRotate, setOrbitAutoRotate] = useState(false);
+  const [orbitRotation, setOrbitRotation] = useState(0);
+  const [draggingSatelliteId, setDraggingSatelliteId] = useState('');
+  const [satelliteOffsets, setSatelliteOffsets] = useState<Record<string, OrbitOffset>>({});
+  const dragStateRef = useRef<{
+    pointerId: number;
+    itemId: string;
+    startClientX: number;
+    startClientY: number;
+    startOffsetX: number;
+    startOffsetY: number;
+    moved: boolean;
+  } | null>(null);
+  const suppressClickRef = useRef<{
+    itemId: string;
+    at: number;
+  } | null>(null);
+  const rotationFrameRef = useRef<number | null>(null);
+  const lastRotationTsRef = useRef(0);
 
   const metrics = useMemo(() => {
     if (!insights) {
@@ -153,6 +178,44 @@ export function KnowledgeGraph({
     }, 260);
     return () => window.clearTimeout(timer);
   }, [focusCharacter]);
+
+  useEffect(() => {
+    setSatelliteOffsets({});
+    setDraggingSatelliteId('');
+    dragStateRef.current = null;
+    suppressClickRef.current = null;
+  }, [focusCharacter]);
+
+  useEffect(() => {
+    if (!orbitAutoRotate) {
+      if (rotationFrameRef.current !== null) {
+        window.cancelAnimationFrame(rotationFrameRef.current);
+        rotationFrameRef.current = null;
+      }
+      lastRotationTsRef.current = 0;
+      return;
+    }
+    const tick = (ts: number) => {
+      if (lastRotationTsRef.current <= 0) {
+        lastRotationTsRef.current = ts;
+      }
+      const deltaSec = (ts - lastRotationTsRef.current) / 1000;
+      lastRotationTsRef.current = ts;
+      setOrbitRotation((value) => {
+        const next = value + deltaSec * 0.32;
+        return next >= Math.PI * 2 ? next - Math.PI * 2 : next;
+      });
+      rotationFrameRef.current = window.requestAnimationFrame(tick);
+    };
+    rotationFrameRef.current = window.requestAnimationFrame(tick);
+    return () => {
+      if (rotationFrameRef.current !== null) {
+        window.cancelAnimationFrame(rotationFrameRef.current);
+        rotationFrameRef.current = null;
+      }
+      lastRotationTsRef.current = 0;
+    };
+  }, [orbitAutoRotate]);
 
   const focusState = useMemo(() => {
     const target = String(focusCharacter || '').trim();
@@ -261,6 +324,93 @@ export function KnowledgeGraph({
 
     return items.slice(0, 28);
   }, [focusCharacter, focusState, itemStates, relationships, t]);
+
+  useEffect(() => {
+    const validIds = new Set(satelliteItems.map((item) => item.id));
+    setSatelliteOffsets((prev) => {
+      const next: Record<string, OrbitOffset> = {};
+      for (const [key, value] of Object.entries(prev) as Array<[string, OrbitOffset]>) {
+        if (validIds.has(key)) {
+          next[key] = value;
+        }
+      }
+      return next;
+    });
+  }, [satelliteItems]);
+
+  const handleOrbitWheel = (event: React.WheelEvent<HTMLDivElement>) => {
+    if (!event.altKey) {
+      return;
+    }
+    event.preventDefault();
+    const direction = event.deltaY < 0 ? 1 : -1;
+    setOrbitScale((value) => {
+      const next = value + direction * 0.08;
+      if (next < 0.6) {
+        return 0.6;
+      }
+      if (next > 2.2) {
+        return 2.2;
+      }
+      return next;
+    });
+  };
+
+  const handleSatellitePointerDown = (
+    itemId: string,
+    event: React.PointerEvent<HTMLButtonElement>,
+  ) => {
+    if (event.button !== 0) {
+      return;
+    }
+    const offset = satelliteOffsets[itemId] || {x: 0, y: 0};
+    dragStateRef.current = {
+      pointerId: event.pointerId,
+      itemId,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      startOffsetX: offset.x,
+      startOffsetY: offset.y,
+      moved: false,
+    };
+    setDraggingSatelliteId(itemId);
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const handleSatellitePointerMove = (event: React.PointerEvent<HTMLButtonElement>) => {
+    const dragState = dragStateRef.current;
+    if (!dragState || dragState.pointerId !== event.pointerId) {
+      return;
+    }
+    const safeScale = Math.max(0.2, orbitScale);
+    const deltaX = (event.clientX - dragState.startClientX) / safeScale;
+    const deltaY = (event.clientY - dragState.startClientY) / safeScale;
+    if (!dragState.moved && Math.hypot(deltaX, deltaY) > 2) {
+      dragState.moved = true;
+    }
+    setSatelliteOffsets((prev) => ({
+      ...prev,
+      [dragState.itemId]: {
+        x: dragState.startOffsetX + deltaX,
+        y: dragState.startOffsetY + deltaY,
+      },
+    }));
+  };
+
+  const finishSatellitePointer = (event: React.PointerEvent<HTMLButtonElement>) => {
+    const dragState = dragStateRef.current;
+    if (!dragState || dragState.pointerId !== event.pointerId) {
+      return;
+    }
+    if (dragState.moved) {
+      suppressClickRef.current = {
+        itemId: dragState.itemId,
+        at: Date.now(),
+      };
+    }
+    dragStateRef.current = null;
+    setDraggingSatelliteId('');
+  };
 
   const focusSummary = useMemo(() => {
     if (!focusState) {
@@ -396,7 +546,16 @@ export function KnowledgeGraph({
             <section className="rounded-2xl bg-white border border-sky-200 shadow-sm p-4">
               <div className="flex items-center justify-between gap-3">
                 <h3 className="font-semibold text-slate-800">{t('web.insight.state_satellite_title')}</h3>
-                <div className="flex items-center gap-2 text-xs text-slate-600">
+                <div className="flex items-center gap-3 text-xs text-slate-600">
+                  <label className="inline-flex items-center gap-1.5 select-none">
+                    <input
+                      type="checkbox"
+                      checked={orbitAutoRotate}
+                      onChange={(event) => setOrbitAutoRotate(event.target.checked)}
+                      className="h-3.5 w-3.5 rounded border-slate-300"
+                    />
+                    <span>{t('web.insight.state_satellite_auto_rotate')}</span>
+                  </label>
                   <span>{t('web.insight.state_satellite_focus_label')}</span>
                   <select
                     value={focusCharacter}
@@ -418,48 +577,81 @@ export function KnowledgeGraph({
               <p className="text-xs text-sky-700 mt-1">{t('web.insight.state_satellite_hint')}</p>
               {focusCharacter ? (
                 <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-3">
+                  <div className="mb-2 flex items-center justify-between text-[11px] text-slate-500">
+                    <span>{t('web.insight.state_satellite_drag_zoom_tip')}</span>
+                    <span>{Math.round(orbitScale * 100)}%</span>
+                  </div>
                   <div
                     className={[
                       'relative h-[420px] w-full overflow-hidden rounded-lg border border-slate-200 bg-white transition-all duration-300 ease-out',
                       orbitTransitioning ? 'opacity-70 scale-[0.985]' : 'opacity-100 scale-100',
                     ].join(' ')}
+                    onWheel={handleOrbitWheel}
                   >
-                    <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-20 w-40 rounded-xl border border-sky-300 bg-sky-50 px-3 py-2 text-center shadow-sm transition-all duration-300">
-                      <div className="text-sm font-semibold text-sky-800 truncate">{focusCharacter}</div>
-                      <div className="mt-1 text-[11px] text-slate-600 leading-snug">{focusSummary}</div>
+                    <div
+                      className="absolute inset-0"
+                      style={{
+                        transform: `scale(${orbitScale})`,
+                        transformOrigin: '50% 50%',
+                      }}
+                    >
+                      <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-20 w-40 rounded-xl border border-sky-300 bg-sky-50 px-3 py-2 text-center shadow-sm transition-all duration-300">
+                        <div className="text-sm font-semibold text-sky-800 truncate">{focusCharacter}</div>
+                        <div className="mt-1 text-[11px] text-slate-600 leading-snug">{focusSummary}</div>
+                      </div>
+                      {satelliteItems.map((item, index) => {
+                        const total = Math.max(1, satelliteItems.length);
+                        const angle = (index / total) * Math.PI * 2 - Math.PI / 2 + orbitRotation;
+                        const ring = index % 2 === 0 ? 132 : 186;
+                        const baseX = Math.cos(angle) * ring;
+                        const baseY = Math.sin(angle) * ring;
+                        const offset = satelliteOffsets[item.id] || {x: 0, y: 0};
+                        const x = baseX + offset.x;
+                        const y = baseY + offset.y;
+                        const toneClass = toneToClass(item.tone);
+                        const isDragging = draggingSatelliteId === item.id;
+                        return (
+                          <button
+                            key={item.id}
+                            type="button"
+                            onClick={() => {
+                              const suppressed = suppressClickRef.current;
+                              if (
+                                suppressed &&
+                                suppressed.itemId === item.id &&
+                                Date.now() - suppressed.at < 260
+                              ) {
+                                suppressClickRef.current = null;
+                                return;
+                              }
+                              if (item.hopTarget && focusCandidates.includes(item.hopTarget)) {
+                                setFocusCharacter(item.hopTarget);
+                              }
+                            }}
+                            onPointerDown={(event) => handleSatellitePointerDown(item.id, event)}
+                            onPointerMove={handleSatellitePointerMove}
+                            onPointerUp={finishSatellitePointer}
+                            onPointerCancel={finishSatellitePointer}
+                            onLostPointerCapture={finishSatellitePointer}
+                            className={[
+                              'absolute z-10 w-32 rounded-lg border px-2.5 py-1.5 text-left text-[11px] shadow-sm',
+                              toneClass,
+                              isDragging ? 'cursor-grabbing select-none' : 'cursor-grab',
+                              item.hopTarget ? 'hover:scale-[1.03]' : '',
+                            ].join(' ')}
+                            style={{
+                              left: '50%',
+                              top: '50%',
+                              transform: `translate(-50%, -50%) translate(${x}px, ${y}px)`,
+                              transition: isDragging ? 'none' : 'transform 240ms ease',
+                            }}
+                          >
+                            <div className="font-semibold truncate">{item.title}</div>
+                            <div className="mt-0.5 text-[10px] opacity-80 truncate">{item.subtitle}</div>
+                          </button>
+                        );
+                      })}
                     </div>
-                    {satelliteItems.map((item, index) => {
-                      const total = Math.max(1, satelliteItems.length);
-                      const angle = (index / total) * Math.PI * 2 - Math.PI / 2;
-                      const ring = index % 2 === 0 ? 132 : 186;
-                      const x = Math.cos(angle) * ring;
-                      const y = Math.sin(angle) * ring;
-                      const toneClass = toneToClass(item.tone);
-                      return (
-                        <button
-                          key={item.id}
-                          type="button"
-                          onClick={() => {
-                            if (item.hopTarget && focusCandidates.includes(item.hopTarget)) {
-                              setFocusCharacter(item.hopTarget);
-                            }
-                          }}
-                          className={[
-                            'absolute z-10 w-32 rounded-lg border px-2.5 py-1.5 text-left text-[11px] shadow-sm transition-all duration-500',
-                            toneClass,
-                            item.hopTarget ? 'cursor-pointer hover:scale-[1.03]' : 'cursor-default',
-                          ].join(' ')}
-                          style={{
-                            left: '50%',
-                            top: '50%',
-                            transform: `translate(-50%, -50%) translate(${x}px, ${y}px)`,
-                          }}
-                        >
-                          <div className="font-semibold truncate">{item.title}</div>
-                          <div className="mt-0.5 text-[10px] opacity-80 truncate">{item.subtitle}</div>
-                        </button>
-                      );
-                    })}
                   </div>
                 </div>
               ) : (
