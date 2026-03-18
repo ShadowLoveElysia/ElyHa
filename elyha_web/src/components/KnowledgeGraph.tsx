@@ -1,12 +1,19 @@
-import React, {useMemo, useState} from 'react';
+import React, {useEffect, useMemo, useState} from 'react';
 import {Network, Database, RefreshCw, BarChart3, GitBranch, Link2, Users, Globe} from 'lucide-react';
-import type {ProjectInsights, RelationshipStatusPayload} from '../types';
+import type {
+  CharacterStatusPayload,
+  ItemStatusPayload,
+  ProjectInsights,
+  RelationshipStatusPayload,
+} from '../types';
 import type {TranslationVars} from '../i18n';
 
 interface KnowledgeGraphProps {
   projectId?: string;
   insights: ProjectInsights | null;
   relationships: RelationshipStatusPayload[];
+  characterStates: CharacterStatusPayload[];
+  itemStates: ItemStatusPayload[];
   loading: boolean;
   onRefresh: () => Promise<void>;
   onUpsertRelationship: (payload: {
@@ -18,10 +25,20 @@ interface KnowledgeGraphProps {
   t: (key: string, vars?: TranslationVars) => string;
 }
 
+interface SatelliteItem {
+  id: string;
+  title: string;
+  subtitle: string;
+  tone: 'rose' | 'sky' | 'emerald' | 'amber' | 'slate';
+  hopTarget?: string;
+}
+
 export function KnowledgeGraph({
   projectId = '',
   insights,
   relationships,
+  characterStates,
+  itemStates,
   loading,
   onRefresh,
   onUpsertRelationship,
@@ -32,6 +49,8 @@ export function KnowledgeGraph({
   const [relationType, setRelationType] = useState('');
   const [sourceExcerpt, setSourceExcerpt] = useState('');
   const [saving, setSaving] = useState(false);
+  const [focusCharacter, setFocusCharacter] = useState('');
+  const [orbitTransitioning, setOrbitTransitioning] = useState(false);
 
   const metrics = useMemo(() => {
     if (!insights) {
@@ -81,6 +100,182 @@ export function KnowledgeGraph({
       setSaving(false);
     }
   };
+
+  const focusCandidates = useMemo(() => {
+    const values = new Set<string>();
+    for (const row of characterStates) {
+      const id = String(row.character_id || '').trim();
+      if (id) {
+        values.add(id);
+      }
+    }
+    for (const row of relationships) {
+      const subjectId = String(row.subject_character_id || '').trim();
+      const objectId = String(row.object_character_id || '').trim();
+      if (subjectId) {
+        values.add(subjectId);
+      }
+      if (objectId) {
+        values.add(objectId);
+      }
+    }
+    if (insights) {
+      for (const row of insights.characters) {
+        const name = String(row.name || '').trim();
+        if (name) {
+          values.add(name);
+        }
+      }
+    }
+    return Array.from(values).sort((a, b) => a.localeCompare(b));
+  }, [characterStates, insights, relationships]);
+
+  useEffect(() => {
+    if (!focusCandidates.length) {
+      if (focusCharacter) {
+        setFocusCharacter('');
+      }
+      return;
+    }
+    if (!focusCharacter || !focusCandidates.includes(focusCharacter)) {
+      setFocusCharacter(focusCandidates[0]);
+    }
+  }, [focusCandidates, focusCharacter]);
+
+  useEffect(() => {
+    if (!focusCharacter) {
+      setOrbitTransitioning(false);
+      return;
+    }
+    setOrbitTransitioning(true);
+    const timer = window.setTimeout(() => {
+      setOrbitTransitioning(false);
+    }, 260);
+    return () => window.clearTimeout(timer);
+  }, [focusCharacter]);
+
+  const focusState = useMemo(() => {
+    const target = String(focusCharacter || '').trim();
+    if (!target) {
+      return null;
+    }
+    return characterStates.find((row) => String(row.character_id || '').trim() === target) || null;
+  }, [characterStates, focusCharacter]);
+
+  const satelliteItems = useMemo<SatelliteItem[]>(() => {
+    const target = String(focusCharacter || '').trim();
+    if (!target) {
+      return [];
+    }
+    const items: SatelliteItem[] = [];
+
+    for (const row of relationships) {
+      const left = String(row.subject_character_id || '').trim();
+      const right = String(row.object_character_id || '').trim();
+      if (!left || !right) {
+        continue;
+      }
+      if (left !== target && right !== target) {
+        continue;
+      }
+      const other = left === target ? right : left;
+      const relation = String(row.relation_type || '').trim() || 'related';
+      const direction = left === target ? '\u2192' : '\u2190';
+      items.push({
+        id: `rel-${left}-${right}-${relation}`,
+        title: other,
+        subtitle: `${direction} ${relation}`,
+        tone: 'rose',
+        hopTarget: other,
+      });
+    }
+
+    if (focusState) {
+      items.push({
+        id: `alive-${target}`,
+        title: focusState.alive ? t('web.insight.state_alive') : t('web.insight.state_dead'),
+        subtitle: t('web.insight.state_alive_label'),
+        tone: 'emerald',
+      });
+      const location = String(focusState.location || '').trim();
+      if (location) {
+        items.push({
+          id: `loc-${target}`,
+          title: location,
+          subtitle: t('web.insight.state_location'),
+          tone: 'sky',
+        });
+      }
+      const faction = String(focusState.faction || '').trim();
+      if (faction) {
+        items.push({
+          id: `fac-${target}`,
+          title: faction,
+          subtitle: t('web.insight.state_faction'),
+          tone: 'amber',
+        });
+      }
+      for (const itemId of focusState.held_items || []) {
+        const cleanItem = String(itemId || '').trim();
+        if (!cleanItem) {
+          continue;
+        }
+        items.push({
+          id: `hold-${target}-${cleanItem}`,
+          title: cleanItem,
+          subtitle: t('web.insight.state_holding'),
+          tone: 'slate',
+        });
+      }
+      const attrs = focusState.state_attributes || {};
+      for (const [key, value] of Object.entries(attrs).slice(0, 6)) {
+        const label = `${key}: ${String(value ?? '')}`.trim();
+        if (!label) {
+          continue;
+        }
+        items.push({
+          id: `attr-${target}-${key}`,
+          title: label,
+          subtitle: t('web.insight.state_attribute'),
+          tone: 'emerald',
+        });
+      }
+    }
+
+    for (const row of itemStates) {
+      const owner = String(row.owner_character_id || '').trim();
+      if (!owner || owner !== target) {
+        continue;
+      }
+      const itemId = String(row.item_id || '').trim();
+      if (!itemId) {
+        continue;
+      }
+      items.push({
+        id: `own-${target}-${itemId}`,
+        title: itemId,
+        subtitle: row.destroyed ? t('web.insight.state_destroyed') : t('web.insight.state_owned_item'),
+        tone: row.destroyed ? 'amber' : 'slate',
+      });
+    }
+
+    return items.slice(0, 28);
+  }, [focusCharacter, focusState, itemStates, relationships, t]);
+
+  const focusSummary = useMemo(() => {
+    if (!focusState) {
+      return t('web.insight.state_unknown');
+    }
+    const location = String(focusState.location || '').trim() || '-';
+    const faction = String(focusState.faction || '').trim() || '-';
+    const heldCount = Array.isArray(focusState.held_items) ? focusState.held_items.length : 0;
+    return t('web.insight.state_center_summary', {
+      alive: focusState.alive ? t('web.insight.state_alive') : t('web.insight.state_dead'),
+      location,
+      faction,
+      held: heldCount,
+    });
+  }, [focusState, t]);
 
   if (!projectId) {
     return (
@@ -198,6 +393,80 @@ export function KnowledgeGraph({
               </div>
             </section>
 
+            <section className="rounded-2xl bg-white border border-sky-200 shadow-sm p-4">
+              <div className="flex items-center justify-between gap-3">
+                <h3 className="font-semibold text-slate-800">{t('web.insight.state_satellite_title')}</h3>
+                <div className="flex items-center gap-2 text-xs text-slate-600">
+                  <span>{t('web.insight.state_satellite_focus_label')}</span>
+                  <select
+                    value={focusCharacter}
+                    onChange={(event) => setFocusCharacter(event.target.value)}
+                    className="h-8 rounded-md border border-slate-200 bg-white px-2 text-xs"
+                  >
+                    {focusCandidates.length === 0 ? (
+                      <option value="">{t('web.insight.state_satellite_empty')}</option>
+                    ) : (
+                      focusCandidates.map((name) => (
+                        <option key={name} value={name}>
+                          {name}
+                        </option>
+                      ))
+                    )}
+                  </select>
+                </div>
+              </div>
+              <p className="text-xs text-sky-700 mt-1">{t('web.insight.state_satellite_hint')}</p>
+              {focusCharacter ? (
+                <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-3">
+                  <div
+                    className={[
+                      'relative h-[420px] w-full overflow-hidden rounded-lg border border-slate-200 bg-white transition-all duration-300 ease-out',
+                      orbitTransitioning ? 'opacity-70 scale-[0.985]' : 'opacity-100 scale-100',
+                    ].join(' ')}
+                  >
+                    <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-20 w-40 rounded-xl border border-sky-300 bg-sky-50 px-3 py-2 text-center shadow-sm transition-all duration-300">
+                      <div className="text-sm font-semibold text-sky-800 truncate">{focusCharacter}</div>
+                      <div className="mt-1 text-[11px] text-slate-600 leading-snug">{focusSummary}</div>
+                    </div>
+                    {satelliteItems.map((item, index) => {
+                      const total = Math.max(1, satelliteItems.length);
+                      const angle = (index / total) * Math.PI * 2 - Math.PI / 2;
+                      const ring = index % 2 === 0 ? 132 : 186;
+                      const x = Math.cos(angle) * ring;
+                      const y = Math.sin(angle) * ring;
+                      const toneClass = toneToClass(item.tone);
+                      return (
+                        <button
+                          key={item.id}
+                          type="button"
+                          onClick={() => {
+                            if (item.hopTarget && focusCandidates.includes(item.hopTarget)) {
+                              setFocusCharacter(item.hopTarget);
+                            }
+                          }}
+                          className={[
+                            'absolute z-10 w-32 rounded-lg border px-2.5 py-1.5 text-left text-[11px] shadow-sm transition-all duration-500',
+                            toneClass,
+                            item.hopTarget ? 'cursor-pointer hover:scale-[1.03]' : 'cursor-default',
+                          ].join(' ')}
+                          style={{
+                            left: '50%',
+                            top: '50%',
+                            transform: `translate(-50%, -50%) translate(${x}px, ${y}px)`,
+                          }}
+                        >
+                          <div className="font-semibold truncate">{item.title}</div>
+                          <div className="mt-0.5 text-[10px] opacity-80 truncate">{item.subtitle}</div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : (
+                <div className="mt-3 text-xs text-slate-500">{t('web.insight.state_satellite_empty')}</div>
+              )}
+            </section>
+
             <section className="rounded-2xl bg-white border border-amber-200 shadow-sm p-4">
               <h3 className="font-semibold text-slate-800">{t('web.insight.relationship_editor_title')}</h3>
               <p className="text-xs text-amber-700 mt-1">{t('web.insight.relationship_editor_warning')}</p>
@@ -230,9 +499,7 @@ export function KnowledgeGraph({
                 />
               </div>
               <div className="mt-3 flex items-center justify-between gap-2">
-                <span className="text-xs text-slate-500">
-                  {t('web.insight.relationship_sync_note')}
-                </span>
+                <span className="text-xs text-slate-500">{t('web.insight.relationship_sync_note')}</span>
                 <button
                   onClick={() => void saveRelationship()}
                   disabled={!canSaveRelationship}
@@ -251,9 +518,9 @@ export function KnowledgeGraph({
                       className="text-xs rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-slate-700"
                     >
                       <span className="font-medium">{row.subject_character_id}</span>
-                      <span className="mx-1 text-slate-400">→</span>
+                      <span className="mx-1 text-slate-400">\u2192</span>
                       <span className="font-medium">{row.object_character_id}</span>
-                      <span className="mx-1 text-slate-400">·</span>
+                      <span className="mx-1 text-slate-400">\u00b7</span>
                       <span className="text-amber-700">{row.relation_type || 'related'}</span>
                     </div>
                   ))
@@ -265,6 +532,22 @@ export function KnowledgeGraph({
       </div>
     </div>
   );
+}
+
+function toneToClass(tone: SatelliteItem['tone']): string {
+  if (tone === 'rose') {
+    return 'border-rose-200 bg-rose-50 text-rose-700';
+  }
+  if (tone === 'sky') {
+    return 'border-sky-200 bg-sky-50 text-sky-700';
+  }
+  if (tone === 'emerald') {
+    return 'border-emerald-200 bg-emerald-50 text-emerald-700';
+  }
+  if (tone === 'amber') {
+    return 'border-amber-200 bg-amber-50 text-amber-700';
+  }
+  return 'border-slate-200 bg-slate-50 text-slate-700';
 }
 
 function MetricCard({icon, label, value}: {icon: React.ReactNode; label: string; value: string}) {

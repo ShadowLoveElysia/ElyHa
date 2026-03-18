@@ -919,7 +919,13 @@ class AIService:
             response = self._generate(
                 task_type="chat_outline",
                 prompt=outline_prompt,
-                platform_config={"token_budget": token_budget, "tool_context_node_id": str(node.id)},
+                platform_config={
+                    "token_budget": token_budget,
+                    "tool_context_node_id": str(node.id),
+                    "enable_tool_loop": True,
+                    "node_tools_visible": True,
+                    "node_tools_enabled": bool(allow_node_write),
+                },
                 llm_route=llm_route,
                 project_id=project_id,
             )
@@ -996,7 +1002,12 @@ class AIService:
         response = self._generate(
             task_type="chat_writer",
             prompt=writer_prompt,
-            platform_config={"token_budget": token_budget, "tool_context_node_id": str(node.id)},
+            platform_config={
+                "token_budget": token_budget,
+                "tool_context_node_id": str(node.id),
+                "node_tools_visible": True,
+                "node_tools_enabled": bool(allow_node_write),
+            },
             llm_route=llm_route,
             project_id=project_id,
         )
@@ -1826,19 +1837,110 @@ class AIService:
                 "applied_count": 0,
             }
         try:
-            extracted = self.state_service.extract_state_events(project_id, node_id, clean_content)
-            events = [item for item in extracted.get("events", []) if isinstance(item, dict)]
-            if not events:
+            llm_gate = self._plan_state_sync_with_llm(
+                project_id=project_id,
+                node_id=node_id,
+                content=clean_content,
+            )
+            gate_reason = str(llm_gate.get("reason") or "").strip()
+            if bool(llm_gate.get("ok")) and not bool(llm_gate.get("should_write_state")):
                 return {
                     "state_events": 0,
                     "proposal_count": 0,
                     "applied_count": 0,
+                    "decision_source": "llm_gate_skip",
+                    "reason": gate_reason,
                 }
+
+            llm_events = [item for item in llm_gate.get("events", []) if isinstance(item, dict)]
+            llm_event_apply: dict[str, Any] | None = None
+            if llm_events:
+                llm_event_apply = self._apply_state_events(
+                    project_id=project_id,
+                    node_id=node_id,
+                    thread_id=clean_thread,
+                    events=llm_events,
+                )
+                if "error" not in llm_event_apply:
+                    return {
+                        **llm_event_apply,
+                        "decision_source": "llm_events",
+                        "reason": gate_reason,
+                    }
+
+            extracted = self.state_service.extract_state_events(project_id, node_id, clean_content)
+            events = [item for item in extracted.get("events", []) if isinstance(item, dict)]
+            if not events:
+                source = "rules_only"
+                if bool(llm_gate.get("ok")):
+                    source = "llm_gate_no_events"
+                return {
+                    "state_events": 0,
+                    "proposal_count": 0,
+                    "applied_count": 0,
+                    "decision_source": source,
+                    "reason": gate_reason,
+                }
+
+            rule_apply = self._apply_state_events(
+                project_id=project_id,
+                node_id=node_id,
+                thread_id=clean_thread,
+                events=events,
+            )
+            if "error" in rule_apply:
+                return rule_apply
+            if llm_event_apply and "error" in llm_event_apply:
+                return {
+                    **rule_apply,
+                    "decision_source": "llm_events_fallback_rules",
+                    "reason": gate_reason,
+                }
+            if bool(llm_gate.get("ok")):
+                return {
+                    **rule_apply,
+                    "decision_source": "llm_gate_then_rules",
+                    "reason": gate_reason,
+                }
+            return {
+                **rule_apply,
+                "decision_source": "rules_only",
+            }
+        except Exception:
+            return {
+                "state_events": 0,
+                "proposal_count": 0,
+                "applied_count": 0,
+                "error": "state_sync_failed",
+            }
+
+    def _apply_state_events(
+        self,
+        *,
+        project_id: str,
+        node_id: str,
+        thread_id: str,
+        events: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if self.state_service is None:
+            return {
+                "state_events": 0,
+                "proposal_count": 0,
+                "applied_count": 0,
+            }
+        normalized_events = [item for item in events if isinstance(item, dict)]
+        if not normalized_events:
+            return {
+                "state_events": 0,
+                "proposal_count": 0,
+                "applied_count": 0,
+            }
+        try:
             proposals = self.state_service.create_state_change_proposals(
                 project_id,
                 node_id,
-                clean_thread,
-                events,
+                thread_id,
+                normalized_events,
             )
             proposal_ids: list[str] = []
             for proposal in proposals:
@@ -1855,29 +1957,134 @@ class AIService:
                     proposal_ids.append(proposal_id)
             if not proposal_ids:
                 return {
-                    "state_events": len(events),
+                    "state_events": len(normalized_events),
                     "proposal_count": len(proposals),
                     "applied_count": 0,
                 }
             apply_result = self.state_service.apply_approved_state_changes(
                 project_id,
                 node_id,
-                clean_thread,
+                thread_id,
                 proposal_ids=proposal_ids,
             )
             return {
-                "state_events": len(events),
+                "state_events": len(normalized_events),
                 "proposal_count": len(proposals),
                 "applied_count": int(apply_result.get("applied_count", 0)),
                 "conflict_count": int(apply_result.get("conflict_count", 0)),
             }
         except Exception:
             return {
-                "state_events": 0,
+                "state_events": len(normalized_events),
                 "proposal_count": 0,
                 "applied_count": 0,
                 "error": "state_sync_failed",
             }
+
+    def _plan_state_sync_with_llm(
+        self,
+        *,
+        project_id: str,
+        node_id: str,
+        content: str,
+    ) -> dict[str, Any]:
+        clean_content = str(content or "").strip()
+        if not clean_content:
+            return {
+                "ok": True,
+                "should_write_state": False,
+                "reason": "empty_content",
+                "events": [],
+            }
+        snippet = clean_content[:2200]
+        prompt = (
+            "你是剧情世界状态同步决策器。请基于新写入正文判断是否需要写入状态库。"
+            "\n\n只输出 JSON，不要代码块，不要解释。格式：\n"
+            "{\n"
+            '  "should_write_state": true,\n'
+            '  "reason": "一句话原因",\n'
+            '  "events": [\n'
+            "    {\n"
+            '      "entity_type": "character|item|relationship|world_variable",\n'
+            '      "event_type": "事件类型",\n'
+            '      "canonical_id": "角色或物品ID（character/item时可填）",\n'
+            '      "subject_character_id": "关系主体（relationship时可填）",\n'
+            '      "object_character_id": "关系客体（relationship时可填）",\n'
+            '      "variable_key": "世界变量key（world_variable时可填）",\n'
+            '      "payload": {},\n'
+            '      "source_excerpt": "证据原句",\n'
+            '      "confidence": 0.0\n'
+            "    }\n"
+            "  ]\n"
+            "}\n\n"
+            "要求：\n"
+            "1) 若正文没有明确、可持续的状态变化，should_write_state 必须是 false，events 为空数组。\n"
+            "2) 只有高置信度且有文本证据的变化才写入 events。\n"
+            "3) relation_type 可以是任意文本，不限制枚举。\n"
+            "4) 若不确定，宁可不写。\n\n"
+            "[node_id]\n"
+            f"{node_id}\n\n"
+            "[new_content]\n"
+            f"{snippet}\n"
+        )
+        try:
+            response = self._generate(
+                task_type="state_sync_gate",
+                prompt=prompt,
+                platform_config={
+                    "token_budget": 420,
+                    "disable_tool_loop": True,
+                },
+                project_id=project_id,
+            )
+            parsed = self._parse_outline_guide_payload(
+                response.content,
+                strict_json_fence=False,
+            )
+            if not isinstance(parsed, dict) or not parsed:
+                return {
+                    "ok": False,
+                    "should_write_state": False,
+                    "reason": "state_gate_unparsed",
+                    "events": [],
+                }
+            raw_events = parsed.get("events")
+            events: list[dict[str, Any]] = []
+            if isinstance(raw_events, list):
+                for item in raw_events[:32]:
+                    if isinstance(item, dict):
+                        events.append(item)
+            has_flag = "should_write_state" in parsed
+            should_write_state = bool(events)
+            if has_flag:
+                should_write_state = self._coerce_bool(parsed.get("should_write_state"), default=False)
+            reason = str(parsed.get("reason") or "").strip()
+            return {
+                "ok": True,
+                "should_write_state": should_write_state,
+                "reason": reason,
+                "events": events,
+            }
+        except Exception:
+            return {
+                "ok": False,
+                "should_write_state": False,
+                "reason": "state_gate_error",
+                "events": [],
+            }
+
+    def _coerce_bool(self, value: Any, *, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in {"1", "true", "yes", "on", "y"}:
+                return True
+            if text in {"0", "false", "no", "off", "n"}:
+                return False
+        return default
 
     def _collect_world_state_snapshot(self, project_id: str, node: Any) -> dict[str, Any]:
         if self.state_service is None:

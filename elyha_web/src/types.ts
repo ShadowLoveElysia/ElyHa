@@ -437,6 +437,29 @@ export interface RelationshipStatusPayload {
   updated_at: string;
 }
 
+export interface CharacterStatusPayload {
+  project_id: string;
+  character_id: string;
+  alive: boolean;
+  location: string;
+  faction: string;
+  held_items: string[];
+  state_attributes: Record<string, unknown>;
+  last_event_id: string;
+  updated_at: string;
+}
+
+export interface ItemStatusPayload {
+  project_id: string;
+  item_id: string;
+  owner_character_id: string;
+  location: string;
+  destroyed: boolean;
+  state_attributes: Record<string, unknown>;
+  last_event_id: string;
+  updated_at: string;
+}
+
 export interface UpsertRelationshipPayload {
   project_id: string;
   subject_character_id: string;

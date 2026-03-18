@@ -3,6 +3,7 @@ import type {
   AgentSessionResponse,
   AiChatPayload,
   AiChatResponse,
+  CharacterStatusPayload,
   ChatThreadCreateResponse,
   ChatThreadMessagesResponse,
   ChatThreadsResponse,
@@ -14,6 +15,7 @@ import type {
   GraphNodePayload,
   LatestProjectAgentSessionResponse,
   LlmPresetPayload,
+  ItemStatusPayload,
   ProjectInsights,
   ProjectPayload,
   ProjectSettings,
@@ -465,6 +467,30 @@ export async function listProjectRelationships(projectId: string): Promise<{
     count: number;
     relationships: RelationshipStatusPayload[];
   }>(`/api/projects/${projectId}/state/relationships`);
+}
+
+export async function listProjectCharacterStates(projectId: string): Promise<{
+  project_id: string;
+  count: number;
+  characters: CharacterStatusPayload[];
+}> {
+  return apiRequest<{
+    project_id: string;
+    count: number;
+    characters: CharacterStatusPayload[];
+  }>(`/api/projects/${projectId}/state/characters`);
+}
+
+export async function listProjectItemStates(projectId: string): Promise<{
+  project_id: string;
+  count: number;
+  items: ItemStatusPayload[];
+}> {
+  return apiRequest<{
+    project_id: string;
+    count: number;
+    items: ItemStatusPayload[];
+  }>(`/api/projects/${projectId}/state/items`);
 }
 
 export async function upsertProjectRelationship(

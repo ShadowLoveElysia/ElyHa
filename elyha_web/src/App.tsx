@@ -21,6 +21,8 @@ import {
   getProjectBundle,
   getRuntimeSettings,
   listLlmPresets,
+  listProjectCharacterStates,
+  listProjectItemStates,
   listProjectRelationships,
   listProjects,
   listSnapshots,
@@ -34,9 +36,11 @@ import {
 } from './api';
 import type {
   AiSuggestedOption,
+  CharacterStatusPayload,
   CreateNodePayload,
   GraphEdgePayload,
   GraphNodePayload,
+  ItemStatusPayload,
   LlmPresetPayload,
   ProjectInsights,
   ProjectPayload,
@@ -294,6 +298,8 @@ export default function App() {
 
   const [insights, setInsights] = useState<ProjectInsights | null>(null);
   const [relationshipRows, setRelationshipRows] = useState<RelationshipStatusPayload[]>([]);
+  const [characterStateRows, setCharacterStateRows] = useState<CharacterStatusPayload[]>([]);
+  const [itemStateRows, setItemStateRows] = useState<ItemStatusPayload[]>([]);
   const [insightsLoading, setInsightsLoading] = useState(false);
 
   const [runtimeSettings, setRuntimeSettings] = useState<RuntimeSettingsPayload | null>(null);
@@ -1100,16 +1106,22 @@ export default function App() {
     if (!projectId) {
       setInsights(null);
       setRelationshipRows([]);
+      setCharacterStateRows([]);
+      setItemStateRows([]);
       return;
     }
     setInsightsLoading(true);
     try {
-      const [insightPayload, relationshipPayload] = await Promise.all([
+      const [insightPayload, relationshipPayload, characterPayload, itemPayload] = await Promise.all([
         fetchProjectInsights(projectId),
         listProjectRelationships(projectId),
+        listProjectCharacterStates(projectId),
+        listProjectItemStates(projectId),
       ]);
       setInsights(insightPayload);
       setRelationshipRows(relationshipPayload.relationships || []);
+      setCharacterStateRows(characterPayload.characters || []);
+      setItemStateRows(itemPayload.items || []);
     } catch (error) {
       setStatus(`${t('web.error.graph_load_failed')}: ${errorToText(error, t, t('web.error.unknown'))}`, true);
     } finally {
@@ -1481,6 +1493,8 @@ export default function App() {
               projectId={projectId}
               insights={insights}
               relationships={relationshipRows}
+              characterStates={characterStateRows}
+              itemStates={itemStateRows}
               loading={insightsLoading}
               onRefresh={refreshInsights}
               onUpsertRelationship={handleUpsertRelationship}
