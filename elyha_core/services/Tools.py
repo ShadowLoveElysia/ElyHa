@@ -133,6 +133,38 @@ class ToolService:
                 },
             },
             {
+                "name": "list_relationship_status",
+                "description": "Read relationship-state rows from relationship graph state table.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "subject_character_id": {"type": "string"},
+                        "object_character_id": {"type": "string"},
+                        "limit": {"type": "integer"},
+                    },
+                    "required": [],
+                },
+            },
+            {
+                "name": "upsert_relationship_status",
+                "description": "Create or update one relationship-state row (relation type is unrestricted).",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "subject_character_id": {"type": "string"},
+                        "object_character_id": {"type": "string"},
+                        "relation_type": {"type": "string"},
+                        "node_id": {"type": "string"},
+                        "source_excerpt": {"type": "string"},
+                        "confidence": {"type": "number"},
+                        "state_attributes": {"type": "object"},
+                    },
+                    "required": ["subject_character_id", "object_character_id", "relation_type"],
+                },
+            },
+            {
                 "name": "get_effective_directives",
                 "description": "Read effective writing directives and constraints.",
                 "input_schema": {
@@ -479,6 +511,61 @@ class ToolService:
                 if normalized_pairs:
                     normalized_keys["relationship_pairs"] = normalized_pairs[:30]
             return {"keys": normalized_keys}, ""
+        if normalized == "list_relationship_status":
+            target_project_id = _clean_text(raw.get("project_id"), limit=128)
+            subject = _clean_text(
+                raw.get("subject_character_id") or raw.get("subject") or raw.get("a"),
+                limit=128,
+            )
+            object_ = _clean_text(
+                raw.get("object_character_id") or raw.get("object") or raw.get("b"),
+                limit=128,
+            )
+            limit = _as_int(raw.get("limit", 100), 100, lower=1, upper=500)
+            return {
+                "project_id": target_project_id,
+                "subject_character_id": subject,
+                "object_character_id": object_,
+                "limit": limit,
+            }, ""
+        if normalized == "upsert_relationship_status":
+            target_project_id = _clean_text(raw.get("project_id"), limit=128)
+            subject = _clean_text(
+                raw.get("subject_character_id") or raw.get("subject") or raw.get("a"),
+                limit=128,
+            )
+            object_ = _clean_text(
+                raw.get("object_character_id") or raw.get("object") or raw.get("b"),
+                limit=128,
+            )
+            relation_type = _clean_text(
+                raw.get("relation_type") or raw.get("relation") or raw.get("type"),
+                limit=128,
+            )
+            if not subject or not object_ or not relation_type:
+                return {}, "subject_character_id, object_character_id, relation_type are required"
+            node_id = _clean_text(raw.get("node_id") or tool_context_node_id, limit=128)
+            source_excerpt = _clean_text(raw.get("source_excerpt"), limit=800)
+            confidence = _as_float(raw.get("confidence"), 1.0)
+            if confidence < 0:
+                confidence = 0.0
+            if confidence > 1:
+                confidence = 1.0
+            state_attributes = raw.get("state_attributes")
+            if state_attributes is None:
+                state_attributes = {}
+            if not isinstance(state_attributes, dict):
+                return {}, "state_attributes must be object"
+            return {
+                "project_id": target_project_id,
+                "subject_character_id": subject,
+                "object_character_id": object_,
+                "relation_type": relation_type,
+                "node_id": node_id,
+                "source_excerpt": source_excerpt,
+                "confidence": confidence,
+                "state_attributes": dict(state_attributes),
+            }, ""
         if normalized == "get_effective_directives":
             target_project_id = _clean_text(raw.get("project_id"), limit=128)
             return {"project_id": target_project_id}, ""
@@ -843,6 +930,7 @@ class ToolService:
             "read_neighbors",
             "get_chapter_outline",
             "get_world_state",
+            "list_relationship_status",
             "list_nodes",
             "get_node",
         }
@@ -986,6 +1074,66 @@ class ToolService:
                 result_meta = {"ok": True, "cache_hit": False}
                 tool_response_cache[cache_key] = (payload, returned_chars, dict(result_meta))
                 return payload, returned_chars, result_meta
+            if normalized == "list_relationship_status":
+                state_service = getattr(self.readable_tool_service, "state_service", None)
+                if state_service is None:
+                    return (
+                        {"error": "state_service_unavailable"},
+                        0,
+                        {"ok": False, "reason": "state_service_unavailable"},
+                    )
+                target_project_id = str(normalized_args.get("project_id") or project_id).strip()
+                subject = str(normalized_args.get("subject_character_id") or "").strip()
+                object_ = str(normalized_args.get("object_character_id") or "").strip()
+                pairs = [(subject, object_)] if subject and object_ else None
+                rows = state_service.get_relationship_status(target_project_id, pairs=pairs)
+                limit = int(normalized_args.get("limit", 100))
+                payload = {
+                    "project_id": target_project_id,
+                    "count": len(rows),
+                    "truncated": len(rows) > limit,
+                    "relationships": rows[:limit],
+                }
+                returned_chars = _payload_chars(payload)
+                if total_read_chars + returned_chars > total_read_char_limit:
+                    return (
+                        {
+                            "error": "total_read_char_limit_exceeded",
+                            "remaining_chars": max(0, total_read_char_limit - total_read_chars),
+                        },
+                        0,
+                        {"ok": False, "reason": "total_read_char_limit_exceeded"},
+                    )
+                result_meta = {"ok": True, "cache_hit": False}
+                tool_response_cache[cache_key] = (payload, returned_chars, dict(result_meta))
+                return payload, returned_chars, result_meta
+            if normalized == "upsert_relationship_status":
+                state_service = getattr(self.readable_tool_service, "state_service", None)
+                if state_service is None:
+                    return (
+                        {"error": "state_service_unavailable"},
+                        0,
+                        {"ok": False, "reason": "state_service_unavailable"},
+                    )
+                target_project_id = str(normalized_args.get("project_id") or project_id).strip()
+                row = state_service.upsert_relationship_status(
+                    target_project_id,
+                    subject_character_id=str(normalized_args.get("subject_character_id") or "").strip(),
+                    object_character_id=str(normalized_args.get("object_character_id") or "").strip(),
+                    relation_type=str(normalized_args.get("relation_type") or "").strip(),
+                    node_id=str(normalized_args.get("node_id") or tool_context_node_id).strip(),
+                    source_excerpt=str(normalized_args.get("source_excerpt") or "").strip(),
+                    confidence=float(normalized_args.get("confidence", 1.0) or 1.0),
+                    state_attributes=cast(
+                        dict[str, Any],
+                        normalized_args.get("state_attributes", {}),
+                    ),
+                )
+                payload = {
+                    "status": "written",
+                    "relationship": row,
+                }
+                return payload, 0, {"ok": True, "relationship_written": True}
             if normalized == "get_effective_directives":
                 target_project_id = str(normalized_args.get("project_id") or project_id).strip()
                 payload = self.readable_tool_service.get_effective_directives(project_id=target_project_id)

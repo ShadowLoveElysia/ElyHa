@@ -3451,7 +3451,8 @@ class AIService:
         base = str(prompt or "").strip()
         available_tools = (
             "search_text, read_chunk, read_neighbors, get_chapter_outline, "
-            "get_world_state, get_effective_directives, write_document(optional), "
+            "get_world_state, list_relationship_status, upsert_relationship_status, "
+            "get_effective_directives, write_document(optional), "
             "graph_tools(optional)"
         )
         lines = [
