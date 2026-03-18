@@ -731,7 +731,7 @@ class AIService:
                         "write_document_enabled": True,
                         "write_document_required": False,
                         "allow_skip_document": True,
-                        "node_tools_visible": True,
+                        "node_tools_visible": False,
                         "node_tools_enabled": False,
                     },
                     project_id=project_id,
@@ -797,7 +797,7 @@ class AIService:
                 loop_platform_config: dict[str, Any] = {
                     "token_budget": token_budget,
                     "enable_tool_loop": True,
-                    "node_tools_visible": True,
+                    "node_tools_visible": False,
                     "node_tools_enabled": False,
                 }
                 if gate_decision["write_document_enabled"]:
