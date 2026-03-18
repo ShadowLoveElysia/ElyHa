@@ -170,6 +170,16 @@ class InsightService:
                     char_counter[owner] += 1
                     char_nodes[owner].add(node_id)
 
+        for row in self._list_relationship_rows(project_id):
+            subject = self._normalize_name(row.get("subject_character_id"))
+            object_ = self._normalize_name(row.get("object_character_id"))
+            relation = self._normalize_name(row.get("relation_type")) or "related"
+            if not subject or not object_ or subject == object_:
+                continue
+            relation_counter[(subject, object_, relation)] += 1
+            char_counter[subject] += 1
+            char_counter[object_] += 1
+
         for edge in edges:
             source_storyline = node_storyline.get(edge.source_id, "")
             storyline_edges[source_storyline] += 1
@@ -255,6 +265,19 @@ class InsightService:
             except json.JSONDecodeError:
                 return {}
         return {}
+
+    def _list_relationship_rows(self, project_id: str) -> list[dict[str, Any]]:
+        with self.repository.store.read_only() as conn:
+            rows = conn.execute(
+                """
+                SELECT subject_character_id, object_character_id, relation_type
+                FROM relationship_status
+                WHERE project_id = ?
+                ORDER BY updated_at DESC, subject_character_id ASC, object_character_id ASC
+                """,
+                (project_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def _compose_text_blob(self, row: dict[str, Any], metadata: dict[str, Any]) -> str:
         parts = [

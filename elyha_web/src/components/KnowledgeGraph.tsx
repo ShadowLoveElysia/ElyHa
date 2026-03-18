@@ -1,17 +1,38 @@
-import React, {useMemo} from 'react';
+import React, {useMemo, useState} from 'react';
 import {Network, Database, RefreshCw, BarChart3, GitBranch, Link2, Users, Globe} from 'lucide-react';
-import type {ProjectInsights} from '../types';
+import type {ProjectInsights, RelationshipStatusPayload} from '../types';
 import type {TranslationVars} from '../i18n';
 
 interface KnowledgeGraphProps {
   projectId?: string;
   insights: ProjectInsights | null;
+  relationships: RelationshipStatusPayload[];
   loading: boolean;
   onRefresh: () => Promise<void>;
+  onUpsertRelationship: (payload: {
+    subject_character_id: string;
+    object_character_id: string;
+    relation_type: string;
+    source_excerpt?: string;
+  }) => Promise<boolean>;
   t: (key: string, vars?: TranslationVars) => string;
 }
 
-export function KnowledgeGraph({projectId = '', insights, loading, onRefresh, t}: KnowledgeGraphProps) {
+export function KnowledgeGraph({
+  projectId = '',
+  insights,
+  relationships,
+  loading,
+  onRefresh,
+  onUpsertRelationship,
+  t,
+}: KnowledgeGraphProps) {
+  const [subject, setSubject] = useState('');
+  const [objectValue, setObjectValue] = useState('');
+  const [relationType, setRelationType] = useState('');
+  const [sourceExcerpt, setSourceExcerpt] = useState('');
+  const [saving, setSaving] = useState(false);
+
   const metrics = useMemo(() => {
     if (!insights) {
       return {
@@ -32,6 +53,34 @@ export function KnowledgeGraph({projectId = '', insights, loading, onRefresh, t}
       relationEdgeCount: insights.relation_graph.edges.length,
     };
   }, [insights]);
+
+  const canSaveRelationship = Boolean(
+    projectId &&
+      subject.trim() &&
+      objectValue.trim() &&
+      relationType.trim() &&
+      !saving,
+  );
+
+  const saveRelationship = async () => {
+    if (!canSaveRelationship) {
+      return;
+    }
+    setSaving(true);
+    try {
+      const ok = await onUpsertRelationship({
+        subject_character_id: subject.trim(),
+        object_character_id: objectValue.trim(),
+        relation_type: relationType.trim(),
+        source_excerpt: sourceExcerpt.trim(),
+      });
+      if (ok) {
+        setSourceExcerpt('');
+      }
+    } finally {
+      setSaving(false);
+    }
+  };
 
   if (!projectId) {
     return (
@@ -114,9 +163,101 @@ export function KnowledgeGraph({projectId = '', insights, loading, onRefresh, t}
             <section className="rounded-2xl bg-white border border-slate-200 shadow-sm p-4">
               <h3 className="font-semibold text-slate-800 mb-3">{t('web.insight.entity_stats')}</h3>
               <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                <EntityPanel title={t('web.insight.characters')} icon={<Users size={14} />} rows={insights.characters} t={t} />
-                <EntityPanel title={t('web.insight.worldviews')} icon={<Globe size={14} />} rows={insights.worldviews} t={t} />
-                <EntityPanel title={t('web.insight.items')} icon={<Database size={14} />} rows={insights.items} t={t} />
+                <EntityPanel
+                  title={t('web.insight.characters')}
+                  icon={<Users size={14} />}
+                  rows={insights.characters.map((item) => ({
+                    id: item.name,
+                    label: item.name,
+                    count: item.count,
+                  }))}
+                  t={t}
+                />
+                <EntityPanel
+                  title={t('web.insight.worldviews')}
+                  icon={<Globe size={14} />}
+                  rows={insights.worldviews.map((item) => ({
+                    id: item.name,
+                    label: item.name,
+                    count: item.count,
+                  }))}
+                  t={t}
+                />
+                <EntityPanel
+                  title={t('web.insight.items')}
+                  icon={<Database size={14} />}
+                  rows={insights.items.map((item) => ({
+                    id: item.name,
+                    label: item.owner
+                      ? t('web.insight.item_owner_row', {name: item.name, owner: item.owner})
+                      : item.name,
+                    count: item.count,
+                  }))}
+                  t={t}
+                />
+              </div>
+            </section>
+
+            <section className="rounded-2xl bg-white border border-amber-200 shadow-sm p-4">
+              <h3 className="font-semibold text-slate-800">{t('web.insight.relationship_editor_title')}</h3>
+              <p className="text-xs text-amber-700 mt-1">{t('web.insight.relationship_editor_warning')}</p>
+              <div className="mt-3 grid grid-cols-1 md:grid-cols-3 gap-2">
+                <input
+                  value={subject}
+                  onChange={(event) => setSubject(event.target.value)}
+                  placeholder={t('web.insight.relationship_subject_placeholder')}
+                  className="h-9 rounded-lg border border-slate-200 px-3 text-sm bg-white"
+                />
+                <input
+                  value={objectValue}
+                  onChange={(event) => setObjectValue(event.target.value)}
+                  placeholder={t('web.insight.relationship_object_placeholder')}
+                  className="h-9 rounded-lg border border-slate-200 px-3 text-sm bg-white"
+                />
+                <input
+                  value={relationType}
+                  onChange={(event) => setRelationType(event.target.value)}
+                  placeholder={t('web.insight.relationship_type_placeholder')}
+                  className="h-9 rounded-lg border border-slate-200 px-3 text-sm bg-white"
+                />
+              </div>
+              <div className="mt-2">
+                <input
+                  value={sourceExcerpt}
+                  onChange={(event) => setSourceExcerpt(event.target.value)}
+                  placeholder={t('web.insight.relationship_source_placeholder')}
+                  className="w-full h-9 rounded-lg border border-slate-200 px-3 text-sm bg-white"
+                />
+              </div>
+              <div className="mt-3 flex items-center justify-between gap-2">
+                <span className="text-xs text-slate-500">
+                  {t('web.insight.relationship_sync_note')}
+                </span>
+                <button
+                  onClick={() => void saveRelationship()}
+                  disabled={!canSaveRelationship}
+                  className="h-9 px-4 rounded-lg bg-amber-500 text-white text-sm font-semibold hover:bg-amber-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {saving ? t('web.insight.relationship_saving') : t('web.insight.relationship_save')}
+                </button>
+              </div>
+              <div className="mt-3 space-y-1.5 max-h-52 overflow-y-auto pr-1">
+                {relationships.length === 0 ? (
+                  <div className="text-xs text-slate-500">{t('web.insight.relationship_empty')}</div>
+                ) : (
+                  relationships.slice(0, 120).map((row) => (
+                    <div
+                      key={`${row.subject_character_id}-${row.object_character_id}-${row.updated_at}`}
+                      className="text-xs rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-slate-700"
+                    >
+                      <span className="font-medium">{row.subject_character_id}</span>
+                      <span className="mx-1 text-slate-400">→</span>
+                      <span className="font-medium">{row.object_character_id}</span>
+                      <span className="mx-1 text-slate-400">·</span>
+                      <span className="text-amber-700">{row.relation_type || 'related'}</span>
+                    </div>
+                  ))
+                )}
               </div>
             </section>
           </div>

@@ -17,6 +17,7 @@ import type {
   ProjectInsights,
   ProjectPayload,
   ProjectSettings,
+  RelationshipStatusPayload,
   RequestAgentClarificationPayload,
   ResumeAgentSessionPayload,
   ReviewAgentSettingProposalPayload,
@@ -28,6 +29,7 @@ import type {
   SubmitAgentClarificationAnswerPayload,
   SubmitAgentDiffReviewPayload,
   SubmitAgentDecisionPayload,
+  UpsertRelationshipPayload,
   UpdateNodePayload,
   ValidationReport,
   WorkflowMode,
@@ -451,6 +453,27 @@ export async function generateChapter(
 
 export async function fetchProjectInsights(projectId: string): Promise<ProjectInsights> {
   return apiRequest<ProjectInsights>(`/api/projects/${projectId}/insights`);
+}
+
+export async function listProjectRelationships(projectId: string): Promise<{
+  project_id: string;
+  count: number;
+  relationships: RelationshipStatusPayload[];
+}> {
+  return apiRequest<{
+    project_id: string;
+    count: number;
+    relationships: RelationshipStatusPayload[];
+  }>(`/api/projects/${projectId}/state/relationships`);
+}
+
+export async function upsertProjectRelationship(
+  payload: UpsertRelationshipPayload,
+): Promise<RelationshipStatusPayload> {
+  return apiRequest<RelationshipStatusPayload>('/api/state/relationships', {
+    method: 'PUT',
+    body: payload,
+  });
 }
 
 export async function getRuntimeSettings(): Promise<RuntimeSettingsPayload> {

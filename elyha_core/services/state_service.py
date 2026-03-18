@@ -477,6 +477,76 @@ class StateService:
             )
         return result
 
+    def upsert_relationship_status(
+        self,
+        project_id: str,
+        *,
+        subject_character_id: str,
+        object_character_id: str,
+        relation_type: str,
+        node_id: str = "",
+        source_excerpt: str = "",
+        confidence: float = 1.0,
+        state_attributes: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self._require_project(project_id)
+        subject = str(subject_character_id or "").strip()
+        object_ = str(object_character_id or "").strip()
+        relation = str(relation_type or "").strip()
+        if not subject:
+            raise ValueError("subject_character_id cannot be empty")
+        if not object_:
+            raise ValueError("object_character_id cannot be empty")
+        if not relation:
+            raise ValueError("relation_type cannot be empty")
+        if subject == object_:
+            raise ValueError("subject_character_id and object_character_id cannot be the same")
+        clean_node_id = str(node_id or "").strip()
+        if clean_node_id:
+            self._require_node(project_id, clean_node_id)
+        else:
+            nodes = self.repository.list_nodes(project_id)
+            clean_node_id = nodes[0].id if nodes else ""
+        payload: dict[str, Any] = {
+            "relation_type": relation,
+        }
+        attrs = state_attributes if isinstance(state_attributes, dict) else {}
+        if attrs:
+            payload["state_attributes"] = attrs
+        event = {
+            "entity_type": "relationship",
+            "event_type": "relation_change",
+            "subject_character_id": subject,
+            "object_character_id": object_,
+            "payload": payload,
+            "source_excerpt": str(source_excerpt or "").strip(),
+            "confidence": self._normalize_confidence(confidence),
+        }
+        with self.repository.store.transaction() as conn:
+            applied = self._apply_relationship_event(
+                conn,
+                project_id=project_id,
+                node_id=clean_node_id,
+                proposal_id=generate_id("stp_manual"),
+                event=event,
+                event_id=generate_id("stre_manual"),
+                persist_event=True,
+            )
+        if not applied:
+            raise ValueError("relationship update rejected")
+        rows = self.get_relationship_status(project_id, pairs=[(subject, object_)])
+        if rows:
+            return rows[0]
+        return {
+            "project_id": project_id,
+            "subject_character_id": subject,
+            "object_character_id": object_,
+            "relation_type": relation,
+            "state_attributes": attrs,
+            "last_event_id": "",
+            "updated_at": "",
+        }
+
     def get_world_variable_status(
         self,
         project_id: str,
@@ -2404,8 +2474,84 @@ class StateService:
             return []
         events: list[dict[str, Any]] = []
         lines = [line.strip() for line in content.splitlines() if line.strip()]
+        relationship_patterns: list[tuple[re.Pattern[str], str, float]] = [
+            (
+                re.compile(
+                    r"(?P<a>[A-Za-z0-9_\-\u4e00-\u9fff]{1,32})\s*(?:与|和)\s*"
+                    r"(?P<b>[A-Za-z0-9_\-\u4e00-\u9fff]{1,32}?)\s*(?:成为|变成|成了|是|结为)?\s*"
+                    r"(?:盟友|同盟|伙伴|朋友|搭档)",
+                    flags=re.IGNORECASE,
+                ),
+                "ally",
+                0.42,
+            ),
+            (
+                re.compile(
+                    r"(?P<a>[A-Za-z0-9_\-\u4e00-\u9fff]{1,32})\s*(?:与|和)\s*"
+                    r"(?P<b>[A-Za-z0-9_\-\u4e00-\u9fff]{1,32}?)\s*(?:关系)?\s*"
+                    r"(?:敌对|交恶|反目|仇视|为敌|仇敌)",
+                    flags=re.IGNORECASE,
+                ),
+                "hostile",
+                0.42,
+            ),
+            (
+                re.compile(
+                    r"(?P<a>[A-Za-z0-9_\-\u4e00-\u9fff]{1,32}?)\s*(?:对|對)?\s*(?:很)?\s*(?:信任|相信|依赖)\s*"
+                    r"(?P<b>[A-Za-z0-9_\-\u4e00-\u9fff]{1,32})",
+                    flags=re.IGNORECASE,
+                ),
+                "trust",
+                0.4,
+            ),
+            (
+                re.compile(
+                    r"(?P<a>[A-Za-z0-9_\-\u4e00-\u9fff]{1,32})\s+(?:and|with)\s+"
+                    r"(?P<b>[A-Za-z0-9_\-\u4e00-\u9fff]{1,32})\s+"
+                    r"(?:become|became|are|is)\s+(?:allies?|friends?)",
+                    flags=re.IGNORECASE,
+                ),
+                "ally",
+                0.42,
+            ),
+            (
+                re.compile(
+                    r"(?P<a>[A-Za-z0-9_\-\u4e00-\u9fff]{1,32})\s+"
+                    r"(?:hates?|distrusts?|mistrusts?|is\s+hostile\s+to)\s+"
+                    r"(?P<b>[A-Za-z0-9_\-\u4e00-\u9fff]{1,32})",
+                    flags=re.IGNORECASE,
+                ),
+                "hostile",
+                0.4,
+            ),
+        ]
 
         for line in lines:
+            matched_relationship = False
+            for pattern, relation_type, confidence in relationship_patterns:
+                relation = pattern.search(line)
+                if not relation:
+                    continue
+                subject = str(relation.group("a") or "").strip()
+                object_ = str(relation.group("b") or "").strip()
+                if not subject or not object_ or subject == object_:
+                    continue
+                events.append(
+                    {
+                        "entity_type": "relationship",
+                        "event_type": "relation_change",
+                        "subject_character_id": subject,
+                        "object_character_id": object_,
+                        "payload": {"relation_type": relation_type},
+                        "source_excerpt": line,
+                        "confidence": confidence,
+                    }
+                )
+                matched_relationship = True
+                break
+            if matched_relationship:
+                continue
+
             death = re.search(r"(?P<char>[A-Za-z0-9_\-\u4e00-\u9fff]{1,32}).{0,8}(死亡|死去|阵亡|被杀)", line)
             if death:
                 mention = str(death.group("char"))

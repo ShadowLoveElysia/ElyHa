@@ -94,6 +94,7 @@ const CHAT_ZOOM_MIN = 0.72;
 const CHAT_ZOOM_MAX = 1.45;
 const CHAT_ZOOM_STEP = 0.06;
 const LAST_CHAT_THREAD_STORAGE_KEY = 'elyha.chat.last_thread_by_project.v1';
+const ALLOW_NODE_WRITE_STORAGE_KEY = 'elyha.chat.allow_node_write.v1';
 
 function clampNumber(value: number, min: number, max: number): number {
   if (max <= min) {
@@ -381,6 +382,32 @@ function getLastThreadForProject(projectId: string): string {
   }
 }
 
+function readAllowNodeWritePreference(): boolean {
+  if (typeof window === 'undefined') {
+    return true;
+  }
+  try {
+    const raw = String(window.localStorage.getItem(ALLOW_NODE_WRITE_STORAGE_KEY) || '').trim().toLowerCase();
+    if (!raw) {
+      return true;
+    }
+    return raw !== '0' && raw !== 'false' && raw !== 'off' && raw !== 'no';
+  } catch {
+    return true;
+  }
+}
+
+function writeAllowNodeWritePreference(value: boolean): void {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  try {
+    window.localStorage.setItem(ALLOW_NODE_WRITE_STORAGE_KEY, value ? '1' : '0');
+  } catch {
+    // Ignore storage errors and continue with in-memory session.
+  }
+}
+
 function setLastThreadForProject(projectId: string, threadId: string): void {
   const cleanProject = String(projectId || '').trim();
   const cleanThread = String(threadId || '').trim();
@@ -463,7 +490,7 @@ export function AIChat({
   const [chatThreads, setChatThreads] = useState<ChatThreadSummary[]>([]);
   const [threadsBusy, setThreadsBusy] = useState(false);
   const [restoringThread, setRestoringThread] = useState(false);
-  const [allowNodeWrite, setAllowNodeWrite] = useState(false);
+  const [allowNodeWrite, setAllowNodeWrite] = useState<boolean>(() => readAllowNodeWritePreference());
   const [agentSession, setAgentSession] = useState<AgentSessionPayload | null>(null);
   const [sessionBusy, setSessionBusy] = useState(false);
   const [proposalBusy, setProposalBusy] = useState(false);
@@ -485,6 +512,11 @@ export function AIChat({
   const processingQueueRef = useRef(false);
   const stopRequestedRef = useRef(false);
   const activeChatAbortRef = useRef<AbortController | null>(null);
+
+  const setAllowNodeWriteWithPersist = useCallback((next: boolean) => {
+    setAllowNodeWrite(next);
+    writeAllowNodeWritePreference(next);
+  }, []);
 
   const clampWindowRect = useCallback((next: ChatWindowRect): ChatWindowRect => {
     const viewport = readViewportSize();
@@ -770,7 +802,7 @@ export function AIChat({
       setBusy(false);
       setChatThreadId('');
       setChatThreadProjectId('');
-      setAllowNodeWrite(false);
+      setAllowNodeWrite(readAllowNodeWritePreference());
       setAgentSession(null);
       setSessionBusy(false);
       setProposalBusy(false);
@@ -871,7 +903,7 @@ export function AIChat({
     setMessages([{id: 'boot', role: 'assistant', content: bootMessage}]);
     setInput('');
     setQueuedInputCount(0);
-    setAllowNodeWrite(false);
+    setAllowNodeWrite(readAllowNodeWritePreference());
     setChatZoom(1);
     setAgentSession(null);
     setProposalQueue([]);
@@ -968,7 +1000,7 @@ export function AIChat({
           project_id: projectId,
           message: t('web.chat.guide_kickoff_request'),
           thread_id: activeChatThreadId || undefined,
-          allow_node_write: allowNodeWrite,
+          allow_node_write: guideMode ? false : allowNodeWrite,
           guide_mode: guideMode,
           token_budget: 1400,
         });
@@ -1119,7 +1151,7 @@ export function AIChat({
             message,
             node_id: selectedNodeId || undefined,
             thread_id: threadForSend || undefined,
-            allow_node_write: allowNodeWrite,
+            allow_node_write: guideMode ? false : allowNodeWrite,
             guide_mode: guideMode,
             token_budget: 1800,
           },
@@ -1696,11 +1728,11 @@ export function AIChat({
           <span className="truncate">{t('web.chat.project_label', {project: projectId || t('web.top.project_unselected')})}</span>
           {!guideMode ? (
             <label className="flex items-center gap-1.5 cursor-pointer select-none">
-              <input
-                type="checkbox"
-                checked={allowNodeWrite}
-                onChange={(event) => setAllowNodeWrite(event.target.checked)}
-              />
+                <input
+                  type="checkbox"
+                  checked={allowNodeWrite}
+                  onChange={(event) => setAllowNodeWriteWithPersist(event.target.checked)}
+                />
               <span className="inline-flex items-center gap-1">
                 <ShieldCheck size={12} />
                 {t('web.chat.allow_node_write')}

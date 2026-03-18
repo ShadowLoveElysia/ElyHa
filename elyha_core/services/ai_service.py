@@ -562,6 +562,12 @@ class AIService:
             },
         )
         self.repository.replace_node_chunks(node_id, split_text_by_chars(draft.content))
+        self._sync_state_after_llm_write(
+            project_id=project_id,
+            node_id=node_id,
+            thread_id=draft.task_id,
+            content=draft.content,
+        )
         revision = self._project_revision(project_id)
         return GenerateResult(
             task_id=draft.task_id,
@@ -651,7 +657,7 @@ class AIService:
         message: str,
         node_id: str | None = None,
         thread_id: str | None = None,
-        allow_node_write: bool = False,
+        allow_node_write: bool = True,
         guide_mode: bool = False,
         token_budget: int = 1800,
     ) -> ChatAssistResult:
@@ -726,7 +732,7 @@ class AIService:
                         "write_document_required": False,
                         "allow_skip_document": True,
                         "node_tools_visible": True,
-                        "node_tools_enabled": bool(allow_node_write),
+                        "node_tools_enabled": False,
                     },
                     project_id=project_id,
                 )
@@ -792,7 +798,7 @@ class AIService:
                     "token_budget": token_budget,
                     "enable_tool_loop": True,
                     "node_tools_visible": True,
-                    "node_tools_enabled": bool(allow_node_write),
+                    "node_tools_enabled": False,
                 }
                 if gate_decision["write_document_enabled"]:
                     loop_platform_config["write_document_enabled"] = True
@@ -1021,6 +1027,12 @@ class AIService:
                 },
             )
             self.repository.replace_node_chunks(node.id, split_text_by_chars(content))
+            self._sync_state_after_llm_write(
+                project_id=project_id,
+                node_id=node.id,
+                thread_id=clean_thread_id,
+                content=content,
+            )
             updated_node_id = node.id
         self.repository.append_chat_message(
             clean_thread_id,
@@ -1790,6 +1802,82 @@ class AIService:
                                 pairs.append((subject, obj))
                             break
         return pairs
+
+    def _sync_state_after_llm_write(
+        self,
+        *,
+        project_id: str,
+        node_id: str,
+        thread_id: str,
+        content: str,
+    ) -> dict[str, Any]:
+        if self.state_service is None:
+            return {
+                "state_events": 0,
+                "proposal_count": 0,
+                "applied_count": 0,
+            }
+        clean_content = str(content or "").strip()
+        clean_thread = str(thread_id or "").strip() or generate_id("thread")
+        if not clean_content:
+            return {
+                "state_events": 0,
+                "proposal_count": 0,
+                "applied_count": 0,
+            }
+        try:
+            extracted = self.state_service.extract_state_events(project_id, node_id, clean_content)
+            events = [item for item in extracted.get("events", []) if isinstance(item, dict)]
+            if not events:
+                return {
+                    "state_events": 0,
+                    "proposal_count": 0,
+                    "applied_count": 0,
+                }
+            proposals = self.state_service.create_state_change_proposals(
+                project_id,
+                node_id,
+                clean_thread,
+                events,
+            )
+            proposal_ids: list[str] = []
+            for proposal in proposals:
+                proposal_id = str(proposal.get("id", "")).strip()
+                if not proposal_id:
+                    continue
+                reviewed = self.state_service.review_state_change_proposal(
+                    proposal_id,
+                    "approved",
+                    "llm_auto",
+                    "auto-approved after LLM write",
+                )
+                if str(reviewed.get("status", "")).strip().lower() == "approved":
+                    proposal_ids.append(proposal_id)
+            if not proposal_ids:
+                return {
+                    "state_events": len(events),
+                    "proposal_count": len(proposals),
+                    "applied_count": 0,
+                }
+            apply_result = self.state_service.apply_approved_state_changes(
+                project_id,
+                node_id,
+                clean_thread,
+                proposal_ids=proposal_ids,
+            )
+            return {
+                "state_events": len(events),
+                "proposal_count": len(proposals),
+                "applied_count": int(apply_result.get("applied_count", 0)),
+                "conflict_count": int(apply_result.get("conflict_count", 0)),
+            }
+        except Exception:
+            return {
+                "state_events": 0,
+                "proposal_count": 0,
+                "applied_count": 0,
+                "error": "state_sync_failed",
+            }
 
     def _collect_world_state_snapshot(self, project_id: str, node: Any) -> dict[str, Any]:
         if self.state_service is None:

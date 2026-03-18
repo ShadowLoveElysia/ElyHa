@@ -35,6 +35,25 @@
 - `GET /api/projects/{project_id}/snapshots`
 - `POST /api/projects/{project_id}/rollback`
 
+- `POST /api/state/extract`
+- `POST /api/state/proposals`
+- `GET /api/projects/{project_id}/state/proposals`
+- `POST /api/state/proposals/{proposal_id}/review`
+- `POST /api/state/apply`
+- `GET /api/projects/{project_id}/state/characters`
+- `GET /api/projects/{project_id}/state/items`
+- `GET /api/projects/{project_id}/state/relationships`
+- `PUT /api/state/relationships`
+- `GET /api/projects/{project_id}/state/world-variables`
+- `POST /api/state/prompt-payload`
+- `GET /api/projects/{project_id}/state/conflicts`
+- `POST /api/projects/{project_id}/state/audit`
+- `POST /api/projects/{project_id}/state/rebuild`
+- `GET /api/projects/{project_id}/state/aliases/resolve`
+- `PUT /api/state/aliases`
+- `PUT /api/state/attribute-schema`
+- `GET /api/projects/{project_id}/state/attribute-schema/{entity_type}`
+
 - `POST /api/generate/chapter`
 - `POST /api/generate/branches`
 - `POST /api/ai/chat`

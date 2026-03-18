@@ -395,20 +395,17 @@ export interface ProjectInsights {
     edge_count: number;
   }>;
   characters: Array<{
-    id: string;
-    label: string;
+    name: string;
     count: number;
     node_ids: string[];
   }>;
   worldviews: Array<{
-    id: string;
-    label: string;
+    name: string;
     count: number;
     node_ids: string[];
   }>;
   items: Array<{
-    id: string;
-    label: string;
+    name: string;
     count: number;
     owner: string;
     node_ids: string[];
@@ -416,15 +413,37 @@ export interface ProjectInsights {
   relation_graph: {
     nodes: Array<{
       id: string;
-      kind: string;
+      type: string;
       label: string;
-      count: number;
+      weight: number;
+      node_ids: string[];
     }>;
     edges: Array<{
       source: string;
       target: string;
       relation: string;
-      count: number;
+      weight: number;
     }>;
   };
+}
+
+export interface RelationshipStatusPayload {
+  project_id: string;
+  subject_character_id: string;
+  object_character_id: string;
+  relation_type: string;
+  state_attributes: Record<string, unknown>;
+  last_event_id: string;
+  updated_at: string;
+}
+
+export interface UpsertRelationshipPayload {
+  project_id: string;
+  subject_character_id: string;
+  object_character_id: string;
+  relation_type: string;
+  node_id?: string;
+  source_excerpt?: string;
+  confidence?: number;
+  state_attributes?: Record<string, unknown>;
 }

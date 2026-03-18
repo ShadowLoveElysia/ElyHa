@@ -191,6 +191,17 @@ class UpsertStateSchemaRequest(BaseModel):
     is_active: bool = True
 
 
+class UpsertRelationshipStatusRequest(BaseModel):
+    project_id: str
+    subject_character_id: str = Field(min_length=1, max_length=128)
+    object_character_id: str = Field(min_length=1, max_length=128)
+    relation_type: str = Field(min_length=1, max_length=128)
+    node_id: str | None = Field(default=None, max_length=128)
+    source_excerpt: str = ""
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    state_attributes: dict[str, Any] = Field(default_factory=dict)
+
+
 class RebuildStateSnapshotRequest(BaseModel):
     upto_revision: int | None = Field(default=None, ge=0)
 
@@ -229,7 +240,7 @@ class ChatAssistRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     node_id: str | None = None
     thread_id: str | None = Field(default=None, min_length=1, max_length=128)
-    allow_node_write: bool = False
+    allow_node_write: bool = True
     guide_mode: bool = False
     token_budget: int = Field(default=1800, ge=1)
 
@@ -1339,6 +1350,24 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             "count": len(rows),
             "relationships": rows,
         }
+
+    @api.put("/api/state/relationships")
+    def upsert_relationship_status(payload: UpsertRelationshipStatusRequest) -> dict[str, Any]:
+        try:
+            return services.state_service.upsert_relationship_status(
+                payload.project_id,
+                subject_character_id=payload.subject_character_id,
+                object_character_id=payload.object_character_id,
+                relation_type=payload.relation_type,
+                node_id=str(payload.node_id or "").strip(),
+                source_excerpt=payload.source_excerpt,
+                confidence=payload.confidence,
+                state_attributes=payload.state_attributes,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @api.get("/api/projects/{project_id}/state/world-variables")
     def get_world_variable_status(

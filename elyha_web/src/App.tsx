@@ -21,11 +21,13 @@ import {
   getProjectBundle,
   getRuntimeSettings,
   listLlmPresets,
+  listProjectRelationships,
   listProjects,
   listSnapshots,
   rollbackProject,
   switchRuntimeProfile,
   updateNode,
+  upsertProjectRelationship,
   updateProjectSettings,
   updateRuntimeSettings,
   validateProject,
@@ -39,6 +41,7 @@ import type {
   ProjectInsights,
   ProjectPayload,
   ProjectSettings,
+  RelationshipStatusPayload,
   RuntimeConfigPayload,
   RuntimeSettingsPayload,
   UpdateNodePayload,
@@ -290,6 +293,7 @@ export default function App() {
   const dialogResolverRef = useRef<((result: DialogResolve) => void) | null>(null);
 
   const [insights, setInsights] = useState<ProjectInsights | null>(null);
+  const [relationshipRows, setRelationshipRows] = useState<RelationshipStatusPayload[]>([]);
   const [insightsLoading, setInsightsLoading] = useState(false);
 
   const [runtimeSettings, setRuntimeSettings] = useState<RuntimeSettingsPayload | null>(null);
@@ -1095,18 +1099,72 @@ export default function App() {
   const refreshInsights = useCallback(async () => {
     if (!projectId) {
       setInsights(null);
+      setRelationshipRows([]);
       return;
     }
     setInsightsLoading(true);
     try {
-      const payload = await fetchProjectInsights(projectId);
-      setInsights(payload);
+      const [insightPayload, relationshipPayload] = await Promise.all([
+        fetchProjectInsights(projectId),
+        listProjectRelationships(projectId),
+      ]);
+      setInsights(insightPayload);
+      setRelationshipRows(relationshipPayload.relationships || []);
     } catch (error) {
       setStatus(`${t('web.error.graph_load_failed')}: ${errorToText(error, t, t('web.error.unknown'))}`, true);
     } finally {
       setInsightsLoading(false);
     }
   }, [projectId, setStatus, t]);
+
+  const handleUpsertRelationship = useCallback(
+    async (payload: {
+      subject_character_id: string;
+      object_character_id: string;
+      relation_type: string;
+      source_excerpt?: string;
+    }): Promise<boolean> => {
+      if (!projectId) {
+        setStatus(t('web.toast.project_required'), true);
+        return false;
+      }
+      const subject = String(payload.subject_character_id || '').trim();
+      const object_ = String(payload.object_character_id || '').trim();
+      const relation = String(payload.relation_type || '').trim();
+      if (!subject || !object_ || !relation) {
+        setStatus(t('web.insight.relationship_edit_invalid'), true);
+        return false;
+      }
+      const confirmed = await askConfirm(
+        t('web.insight.relationship_edit_confirm_title'),
+        t('web.insight.relationship_edit_confirm_body', {subject, object: object_, relation}),
+      );
+      if (!confirmed) {
+        return false;
+      }
+      try {
+        await upsertProjectRelationship({
+          project_id: projectId,
+          subject_character_id: subject,
+          object_character_id: object_,
+          relation_type: relation,
+          node_id: selectedNodeId || undefined,
+          source_excerpt: payload.source_excerpt || '',
+          confidence: 1.0,
+        });
+        await refreshInsights();
+        setStatus(t('web.insight.relationship_edit_saved', {subject, object: object_}));
+        return true;
+      } catch (error) {
+        setStatus(
+          `${t('web.insight.relationship_edit_failed')}: ${errorToText(error, t, t('web.error.unknown'))}`,
+          true,
+        );
+        return false;
+      }
+    },
+    [askConfirm, projectId, refreshInsights, selectedNodeId, setStatus, t],
+  );
 
   useEffect(() => {
     if (activeTab !== 'graph' || !projectId) {
@@ -1422,8 +1480,10 @@ export default function App() {
             <KnowledgeGraph
               projectId={projectId}
               insights={insights}
+              relationships={relationshipRows}
               loading={insightsLoading}
               onRefresh={refreshInsights}
+              onUpsertRelationship={handleUpsertRelationship}
               t={t}
             />
           )}
