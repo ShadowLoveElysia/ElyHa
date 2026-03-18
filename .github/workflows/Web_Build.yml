@@ -1,0 +1,124 @@
+name: Web Build and Bundle
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - ".github/workflows/Web_Build.yml"
+      - "elyha_web/**"
+      - "elyha_api/**"
+      - "i18n/**"
+      - "prepare.bat"
+      - "LaunchWebUI.bat"
+      - "LaunchWebUI.sh"
+      - "pyproject.toml"
+      - "uv.lock"
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: web-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: "elyha_web/package-lock.json"
+
+      - name: Install Web Dependencies
+        working-directory: elyha_web
+        run: npm ci
+
+      - name: Build Web Frontend
+        working-directory: elyha_web
+        run: npm run build
+
+      - name: Sync Dist to Runtime Static Folder
+        run: |
+          rm -rf elyha_web/static
+          mkdir -p elyha_web/static
+          cp -a elyha_web/dist/. elyha_web/static/
+
+      - name: Install Packaging Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip rsync
+
+      - name: Prepare Full Project Bundle
+        id: bundle
+        run: |
+          rm -rf release_bundle
+          mkdir -p release_bundle/ElyHa
+
+          rsync -a \
+            --exclude ".git/" \
+            --exclude "release_bundle/" \
+            --exclude ".venv/" \
+            --exclude ".venv-win/" \
+            --exclude ".venv-win-native/" \
+            --exclude ".uv-cache/" \
+            --exclude "__pycache__/" \
+            --exclude ".mypy_cache/" \
+            --exclude ".pytest_cache/" \
+            --exclude ".ruff_cache/" \
+            --exclude "elyha_web/node_modules/" \
+            --exclude "elyha_web/dist/" \
+            --exclude "exports/" \
+            --exclude "snapshots/" \
+            --exclude "data/*.db*" \
+            ./ release_bundle/ElyHa/
+
+          bundle_name="ElyHa-full-${GITHUB_SHA::7}.zip"
+          (cd release_bundle && zip -r "$bundle_name" ElyHa)
+          echo "bundle_name=$bundle_name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Workflow Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.bundle.outputs.bundle_name }}
+          path: release_bundle/${{ steps.bundle.outputs.bundle_name }}
+          if-no-files-found: error
+
+      - name: Upload Dev Bundle to Nightly Release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev-build
+          name: ElyHa Nightly Full Bundle
+          body: |
+            Auto-built full package with `elyha_web/static` prebuilt.
+            You can start directly with:
+            1) `prepare.bat`
+            2) `LaunchWebUI.bat`
+            Commit: ${{ github.sha }}
+          prerelease: true
+          make_latest: false
+          overwrite_files: true
+          files: release_bundle/${{ steps.bundle.outputs.bundle_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Bundle to Official Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          overwrite_files: true
+          files: release_bundle/${{ steps.bundle.outputs.bundle_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
