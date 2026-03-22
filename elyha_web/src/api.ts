@@ -7,8 +7,6 @@ import type {
   ChatThreadCreateResponse,
   ChatThreadMessagesResponse,
   ChatThreadsResponse,
-  ClarificationQuestionPayload,
-  ClarificationQuestionResponse,
   CreateNodePayload,
   GenerateChapterResponse,
   GraphEdgePayload,
@@ -20,15 +18,11 @@ import type {
   ProjectPayload,
   ProjectSettings,
   RelationshipStatusPayload,
-  RequestAgentClarificationPayload,
-  ResumeAgentSessionPayload,
   ReviewAgentSettingProposalPayload,
-  ReviewAgentSettingProposalsBatchPayload,
   RuntimeConfigPayload,
   RuntimeSettingsPayload,
   SnapshotPayload,
   StartAgentSessionPayload,
-  SubmitAgentClarificationAnswerPayload,
   SubmitAgentDiffReviewPayload,
   SubmitAgentDecisionPayload,
   UpsertRelationshipPayload,
@@ -331,28 +325,11 @@ export async function getProjectChatThreadMessages(
   );
 }
 
-export async function requestClarificationQuestion(
-  payload: ClarificationQuestionPayload,
-): Promise<ClarificationQuestionResponse> {
-  return apiRequest<ClarificationQuestionResponse>('/api/ai/clarification/question', {
-    method: 'POST',
-    body: payload,
-    timeoutMs: 120_000,
-  });
-}
-
 export async function startAgentSession(payload: StartAgentSessionPayload): Promise<AgentSessionResponse> {
   return apiRequest<AgentSessionResponse>('/api/agent/session/start', {
     method: 'POST',
     body: payload,
     timeoutMs: 240_000,
-  });
-}
-
-export async function resumeAgentSession(payload: ResumeAgentSessionPayload): Promise<AgentSessionResponse> {
-  return apiRequest<AgentSessionResponse>('/api/agent/session/resume', {
-    method: 'POST',
-    body: payload,
   });
 }
 
@@ -372,25 +349,6 @@ export async function submitAgentDecision(payload: SubmitAgentDecisionPayload): 
   });
 }
 
-export async function requestAgentClarification(
-  payload: RequestAgentClarificationPayload,
-): Promise<AgentSessionResponse> {
-  return apiRequest<AgentSessionResponse>('/api/agent/session/clarification/question', {
-    method: 'POST',
-    body: payload,
-    timeoutMs: 180_000,
-  });
-}
-
-export async function submitAgentClarificationAnswer(
-  payload: SubmitAgentClarificationAnswerPayload,
-): Promise<AgentSessionResponse> {
-  return apiRequest<AgentSessionResponse>('/api/agent/session/clarification/answer', {
-    method: 'POST',
-    body: payload,
-  });
-}
-
 export async function reviewAgentSettingProposal(
   payload: ReviewAgentSettingProposalPayload,
 ): Promise<AgentSessionResponse> {
@@ -407,16 +365,6 @@ export async function listAgentSettingProposals(
 ): Promise<AgentSettingProposalsResponse> {
   const suffix = status ? `?status=${encodeURIComponent(status)}` : '';
   return apiRequest<AgentSettingProposalsResponse>(`/api/agent/session/${threadId}/setting_proposals${suffix}`);
-}
-
-export async function reviewAgentSettingProposalsBatch(
-  payload: ReviewAgentSettingProposalsBatchPayload,
-): Promise<AgentSessionResponse> {
-  return apiRequest<AgentSessionResponse>('/api/agent/session/setting_proposals/review_batch', {
-    method: 'POST',
-    body: payload,
-    timeoutMs: 180_000,
-  });
 }
 
 export async function submitAgentDiffReview(

@@ -218,7 +218,7 @@ class CoreConfigManager:
         profiles = sorted(set(profiles))
         if CORE_PROFILE in profiles:
             profiles.remove(CORE_PROFILE)
-        return [CORE_PROFILE] + profiles
+        return profiles
 
     def profile_exists(self, profile: str) -> bool:
         normalized = normalize_profile_name(profile)

@@ -224,31 +224,6 @@ export interface ChatThreadMessagesResponse {
   messages: ChatMessagePayload[];
 }
 
-export interface ClarificationQuestionPayload {
-  project_id: string;
-  node_id?: string;
-  context?: string;
-  token_budget?: number;
-}
-
-export interface ClarificationQuestionResponse {
-  project_id: string;
-  clarification_id: string;
-  question_type: string;
-  question: string;
-  options: Array<{
-    value: string;
-    label: string;
-    reason?: string;
-  }>;
-  must_answer: boolean;
-  timeout_sec: number;
-  setting_proposal_status: string;
-  provider: string;
-  prompt_tokens: number;
-  completion_tokens: number;
-}
-
 export interface AgentSessionPayload {
   thread_id: string;
   project_id: string;
@@ -281,10 +256,6 @@ export interface StartAgentSessionPayload {
   thread_id?: string;
 }
 
-export interface ResumeAgentSessionPayload {
-  thread_id: string;
-}
-
 export interface SubmitAgentDecisionPayload {
   thread_id: string;
   action: string;
@@ -293,34 +264,10 @@ export interface SubmitAgentDecisionPayload {
   payload?: Record<string, unknown>;
 }
 
-export interface RequestAgentClarificationPayload {
-  thread_id: string;
-  context?: string;
-  token_budget?: number;
-}
-
-export interface SubmitAgentClarificationAnswerPayload {
-  thread_id: string;
-  clarification_id: string;
-  decision_id: string;
-  selected_option?: string;
-  answer_text?: string;
-}
-
 export interface ReviewAgentSettingProposalPayload {
   thread_id: string;
   proposal_id: string;
   action: string;
-  reviewer?: string;
-  note?: string;
-  decision_id: string;
-  expected_state_version?: number;
-}
-
-export interface ReviewAgentSettingProposalsBatchPayload {
-  thread_id: string;
-  action: string;
-  proposal_ids?: string[];
   reviewer?: string;
   note?: string;
   decision_id: string;

@@ -44,13 +44,14 @@ import type {
   LlmPresetPayload,
   ProjectInsights,
   ProjectPayload,
-  ProjectSettings,
   RelationshipStatusPayload,
   RuntimeConfigPayload,
   RuntimeSettingsPayload,
   UpdateNodePayload,
   WorkflowMode,
 } from './types';
+
+const CORE_PROFILE_NAME = 'core';
 
 function errorToText(
   error: unknown,
@@ -216,22 +217,6 @@ function shortenText(text: string, max = 140): string {
   return `${normalized.slice(0, max)}...`;
 }
 
-function nodePrimaryText(metadata: unknown): string {
-  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
-    return '';
-  }
-  const record = metadata as Record<string, unknown>;
-  const content = normalizeText(record.content);
-  if (content) {
-    return content;
-  }
-  const outline = normalizeText(record.outline_markdown);
-  if (outline) {
-    return outline;
-  }
-  return normalizeText(record.summary);
-}
-
 function parseGuideDocsFromReply(rawReply: string): Record<GuideDocKey, string> | null {
   const raw = String(rawReply || '').trim();
   if (!raw) {
@@ -315,7 +300,7 @@ export default function App() {
     default_workflow_mode: 'multi_agent',
   });
   const [llmPresets, setLlmPresets] = useState<LlmPresetPayload[]>([]);
-  const [selectedLlmScheme, setSelectedLlmScheme] = useState('custom');
+  const [selectedPresetScheme, setSelectedPresetScheme] = useState('custom');
   const [locale, setLocale] = useState('zh');
   const [dict, setDict] = useState<Record<string, string>>({});
 
@@ -486,7 +471,7 @@ export default function App() {
   const applyRuntimeSettings = useCallback((payload: RuntimeSettingsPayload) => {
     setRuntimeSettings(payload);
     setSettingsDraft(toRuntimeDraft(payload.config));
-    setSelectedLlmScheme(`profile:${payload.active_profile}`);
+    setSelectedPresetScheme('custom');
   }, []);
 
   const loadLlmPresetList = useCallback(async () => {
@@ -1234,24 +1219,37 @@ export default function App() {
     }, t('web.error.runtime_save_failed'));
   }, [applyLocale, applyRuntimeSettings, buildRuntimePatch, execute, setStatus, t]);
 
-  const llmSchemeOptions = useMemo(() => {
-    const options: Array<{value: string; label: string}> = [];
-    const profileOptions = (runtimeSettings?.profiles || []).map((profile) => ({
-      value: `profile:${profile}`,
-      label:
-        profile === runtimeSettings?.active_profile
-          ? `${t('web.runtime.profile_prefix')}: ${profile} (${t('web.runtime.profile_active')})`
-          : `${t('web.runtime.profile_prefix')}: ${profile}`,
-    }));
-    const presetOptions = llmPresets.map((preset) => ({
-      value: `preset:${preset.tag}`,
-      label: `${preset.name} (${preset.group})`,
-    }));
-    options.push(...profileOptions);
-    options.push(...presetOptions);
-    options.push({value: 'custom', label: t('web.runtime.preset_none')});
-    return options;
-  }, [llmPresets, runtimeSettings, t]);
+  const profileOptions = useMemo(
+    () =>
+      (runtimeSettings?.profiles || [])
+        .map((item) => String(item || '').trim())
+        .filter((profile) => profile && profile !== CORE_PROFILE_NAME)
+        .map((profile) => ({
+          value: profile,
+          label:
+            profile === runtimeSettings?.active_profile
+              ? `${t('web.runtime.profile_prefix')}: ${profile} (${t('web.runtime.profile_active')})`
+              : `${t('web.runtime.profile_prefix')}: ${profile}`,
+        })),
+    [runtimeSettings, t],
+  );
+
+  const presetOptions = useMemo(
+    () =>
+      llmPresets.map((preset) => ({
+        value: `preset:${preset.tag}`,
+        label: `${preset.name} (${preset.group})`,
+      })),
+    [llmPresets],
+  );
+
+  const selectedProfileValue = useMemo(() => {
+    const activeProfile = String(runtimeSettings?.active_profile || '').trim();
+    if (!activeProfile || activeProfile === CORE_PROFILE_NAME) {
+      return '';
+    }
+    return profileOptions.some((item) => item.value === activeProfile) ? activeProfile : '';
+  }, [profileOptions, runtimeSettings?.active_profile]);
 
   const applyLlmPreset = useCallback(
     (tag: string) => {
@@ -1270,41 +1268,45 @@ export default function App() {
         api_url: preset.api_url || prev.api_url,
         model_name: nextModel || prev.model_name,
       }));
-      setSelectedLlmScheme(`preset:${tag}`);
+      setSelectedPresetScheme(`preset:${tag}`);
       setStatus(t('web.toast.preset_applied', {preset: preset.name}));
     },
     [llmPresets, setStatus, t],
   );
 
-  const handleLlmSchemeChange = useCallback(
-    async (nextValue: string) => {
-      if (!nextValue) {
+  const handleProfileChange = useCallback(
+    async (profile: string) => {
+      const clean = String(profile || '').trim();
+      if (!clean || clean === runtimeSettings?.active_profile) {
         return;
       }
-      if (nextValue === 'custom') {
-        setSelectedLlmScheme(nextValue);
-        return;
-      }
-      if (nextValue.startsWith('preset:')) {
-        applyLlmPreset(nextValue.slice('preset:'.length));
-        return;
-      }
-      if (nextValue.startsWith('profile:')) {
-        const profile = nextValue.slice('profile:'.length);
-        await execute(async () => {
-          const payload = await switchRuntimeProfile(profile, false);
-          applyRuntimeSettings(payload);
-          await applyLocale(payload.config.locale);
-          setStatus(t('web.toast.runtime_profile_switched', {profile}));
-        }, t('web.error.runtime_profile_switch_failed'));
-        return;
-      }
-      setSelectedLlmScheme(nextValue);
+      await execute(async () => {
+        const payload = await switchRuntimeProfile(clean, false);
+        applyRuntimeSettings(payload);
+        await applyLocale(payload.config.locale);
+        setStatus(t('web.toast.runtime_profile_switched', {profile: clean}));
+      }, t('web.error.runtime_profile_switch_failed'));
     },
-    [applyLlmPreset, applyLocale, applyRuntimeSettings, execute, setStatus, t],
+    [applyLocale, applyRuntimeSettings, execute, runtimeSettings?.active_profile, setStatus, t],
   );
 
-  const handleCreateLlmPreset = useCallback(async () => {
+  const handlePresetChange = useCallback(
+    (nextValue: string) => {
+      const clean = String(nextValue || '').trim();
+      if (!clean || clean === 'custom') {
+        setSelectedPresetScheme('custom');
+        return;
+      }
+      if (clean.startsWith('preset:')) {
+        applyLlmPreset(clean.slice('preset:'.length));
+        return;
+      }
+      setSelectedPresetScheme(clean);
+    },
+    [applyLlmPreset],
+  );
+
+  const handleCreateProfile = useCallback(async () => {
     const profileNameRaw = await askPrompt({
       title: t('web.runtime.create_profile_title'),
       message: t('web.runtime.create_profile_body'),
@@ -1315,15 +1317,15 @@ export default function App() {
       return;
     }
     await execute(async () => {
-      await createRuntimeProfile(profileName, runtimeSettings?.active_profile || 'core');
+      await createRuntimeProfile(profileName, CORE_PROFILE_NAME);
       await switchRuntimeProfile(profileName, false);
       const saved = await updateRuntimeSettings(buildRuntimePatch());
       applyRuntimeSettings(saved);
       await applyLocale(saved.config.locale);
-      setSelectedLlmScheme(`profile:${profileName}`);
+      setSelectedPresetScheme('custom');
       setStatus(t('web.toast.runtime_profile_created', {profile: profileName}));
     }, t('web.error.runtime_profile_create_failed'));
-  }, [applyLocale, applyRuntimeSettings, askPrompt, buildRuntimePatch, execute, runtimeSettings?.active_profile, setStatus, t]);
+  }, [applyLocale, applyRuntimeSettings, askPrompt, buildRuntimePatch, execute, setStatus, t]);
 
   const handleSwitchLanguage = useCallback(async () => {
     const selected = await askSelect({
@@ -1512,34 +1514,54 @@ export default function App() {
                   <div className="mt-5 text-slate-500">{t('web.runtime.loading')}</div>
                 ) : (
                   <div className="mt-5 grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <FormRow label={t('web.runtime.active_profile')}>
-                      <input
-                        value={runtimeSettings.active_profile}
-                        readOnly
-                        className="w-full h-10 rounded-lg border border-slate-200 px-3 text-sm bg-slate-100 text-slate-700"
-                      />
-                    </FormRow>
+                    {runtimeSettings.active_profile !== CORE_PROFILE_NAME ? (
+                      <FormRow label={t('web.runtime.active_profile')}>
+                        <input
+                          value={runtimeSettings.active_profile}
+                          readOnly
+                          className="w-full h-10 rounded-lg border border-slate-200 px-3 text-sm bg-slate-100 text-slate-700"
+                        />
+                      </FormRow>
+                    ) : null}
 
-                    <FormRow label={t('web.runtime.preset')}>
+                    <FormRow label={t('web.runtime.profile_prefix')}>
                       <div className="flex items-center gap-2">
                         <select
-                          value={selectedLlmScheme}
-                          onChange={(event) => void handleLlmSchemeChange(event.target.value)}
+                          value={selectedProfileValue}
+                          onChange={(event) => void handleProfileChange(event.target.value)}
                           className="flex-1 h-10 rounded-lg border border-slate-200 px-3 text-sm bg-white"
                         >
-                          {llmSchemeOptions.map((option) => (
+                          <option value="" disabled>
+                            {t('web.runtime.profile_select_placeholder')}
+                          </option>
+                          {profileOptions.map((option) => (
                             <option key={option.value} value={option.value}>
                               {option.label}
                             </option>
                           ))}
                         </select>
                         <button
-                          onClick={() => void handleCreateLlmPreset()}
+                          onClick={() => void handleCreateProfile()}
                           className="h-10 px-3 rounded-lg border border-pink-200 text-pink-600 text-sm font-semibold hover:bg-pink-50"
                         >
                           {t('web.runtime.create_profile')}
                         </button>
                       </div>
+                    </FormRow>
+
+                    <FormRow label={t('web.runtime.preset')}>
+                      <select
+                        value={selectedPresetScheme}
+                        onChange={(event) => handlePresetChange(event.target.value)}
+                        className="w-full h-10 rounded-lg border border-slate-200 px-3 text-sm bg-white"
+                      >
+                        <option value="custom">{t('web.runtime.preset_none')}</option>
+                        {presetOptions.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
                     </FormRow>
 
                     <FormRow label={t('web.runtime.api_url')}>
