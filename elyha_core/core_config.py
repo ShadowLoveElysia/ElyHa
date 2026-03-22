@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
 import re
@@ -11,7 +11,33 @@ from tempfile import NamedTemporaryFile
 
 SUPPORTED_WORKFLOW_MODES = {"single", "multi_agent"}
 PROFILE_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+PRESET_TAG_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 CORE_PROFILE = "core"
+DEFAULT_PROFILE = "default"
+
+
+def normalize_preset_tag(value: str) -> str:
+    tag = str(value or "").strip().lower()
+    if not tag:
+        return ""
+    if not PRESET_TAG_PATTERN.match(tag):
+        return ""
+    return tag
+
+
+def normalize_api_key_store(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, str] = {}
+    for raw_slot, raw_secret in value.items():
+        slot = normalize_preset_tag(str(raw_slot or ""))
+        if not slot:
+            continue
+        secret = str(raw_secret or "").strip()
+        if not secret:
+            continue
+        normalized[slot] = secret
+    return normalized
 
 
 @dataclass(slots=True)
@@ -20,9 +46,11 @@ class CoreRuntimeConfig:
 
     locale: str = "zh"
     llm_provider: str = "mock"
+    preset_tag: str = ""
     llm_transport: str = "httpx"
     api_url: str = ""
     api_key: str = ""
+    api_key_store: dict[str, str] = field(default_factory=dict)
     model_name: str = ""
     auto_complete: bool = True
     think_switch: bool = False
@@ -41,6 +69,7 @@ class CoreRuntimeConfig:
     def normalized(self) -> "CoreRuntimeConfig":
         locale = str(self.locale).strip().lower() or "zh"
         llm_provider = str(self.llm_provider).strip().lower() or "mock"
+        preset_tag = normalize_preset_tag(self.preset_tag)
         llm_transport = str(self.llm_transport).strip().lower() or "httpx"
         if llm_transport in {"openai_sdk", "openai-client", "openai_client"}:
             llm_transport = "openai"
@@ -50,6 +79,12 @@ class CoreRuntimeConfig:
             llm_transport = "httpx"
         api_url = str(self.api_url).strip()
         api_key = str(self.api_key).strip()
+        api_key_store = normalize_api_key_store(self.api_key_store)
+        slot = preset_tag or "default"
+        if api_key:
+            api_key_store[slot] = api_key
+        else:
+            api_key = api_key_store.get(slot) or api_key_store.get("default", "")
         model_name = str(self.model_name).strip()
         raw_auto_complete = self.auto_complete
         if isinstance(raw_auto_complete, str):
@@ -120,9 +155,11 @@ class CoreRuntimeConfig:
         return CoreRuntimeConfig(
             locale=locale,
             llm_provider=llm_provider,
+            preset_tag=preset_tag,
             llm_transport=llm_transport,
             api_url=api_url,
             api_key=api_key,
+            api_key_store=api_key_store,
             model_name=model_name,
             auto_complete=auto_complete,
             think_switch=think_switch,
@@ -159,10 +196,19 @@ class CoreConfigManager:
         self.root_dir = Path(root_dir)
         self.active_profile_path = self.root_dir / active_profile_file
         self._ensure_core_profile()
+        self._ensure_default_profile()
+        if self.get_active_profile() == CORE_PROFILE and self.profile_exists(DEFAULT_PROFILE):
+            self._write_text_atomic(self.active_profile_path, DEFAULT_PROFILE)
 
     def _profile_path(self, profile: str) -> Path:
         safe = normalize_profile_name(profile)
         return self.root_dir / f"{safe}.json"
+
+    def _list_profile_names(self) -> list[str]:
+        names: list[str] = []
+        for path in sorted(self.root_dir.glob("*.json")):
+            names.append(path.stem)
+        return sorted(set(names))
 
     def _write_text_atomic(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -188,6 +234,15 @@ class CoreConfigManager:
         if not core_path.exists():
             self._write_json_atomic(core_path, asdict(CoreRuntimeConfig().normalized()))
 
+    def _ensure_default_profile(self) -> None:
+        self._ensure_core_profile()
+        names = self._list_profile_names()
+        non_core = [name for name in names if name != CORE_PROFILE]
+        if non_core:
+            return
+        base = self._load_profile_unchecked(CORE_PROFILE)
+        self._write_json_atomic(self._profile_path(DEFAULT_PROFILE), asdict(base))
+
     def _load_profile_unchecked(self, profile: str) -> CoreRuntimeConfig:
         path = self._profile_path(profile)
         if not path.exists():
@@ -211,11 +266,8 @@ class CoreConfigManager:
         return config
 
     def list_profiles(self) -> list[str]:
-        self._ensure_core_profile()
-        profiles: list[str] = []
-        for path in sorted(self.root_dir.glob("*.json")):
-            profiles.append(path.stem)
-        profiles = sorted(set(profiles))
+        self._ensure_default_profile()
+        profiles = self._list_profile_names()
         if CORE_PROFILE in profiles:
             profiles.remove(CORE_PROFILE)
         return profiles
@@ -228,19 +280,26 @@ class CoreConfigManager:
         self._ensure_core_profile()
         if not self.active_profile_path.exists():
             self._write_text_atomic(self.active_profile_path, CORE_PROFILE)
-            return CORE_PROFILE
-        raw = self.active_profile_path.read_text(encoding="utf-8").strip()
-        if not raw:
-            self._write_text_atomic(self.active_profile_path, CORE_PROFILE)
-            return CORE_PROFILE
-        try:
-            profile = normalize_profile_name(raw)
-        except ValueError:
-            self._write_text_atomic(self.active_profile_path, CORE_PROFILE)
-            return CORE_PROFILE
-        if not self.profile_exists(profile):
-            self._write_text_atomic(self.active_profile_path, CORE_PROFILE)
-            return CORE_PROFILE
+            profile = CORE_PROFILE
+        else:
+            raw = self.active_profile_path.read_text(encoding="utf-8").strip()
+            if not raw:
+                self._write_text_atomic(self.active_profile_path, CORE_PROFILE)
+                profile = CORE_PROFILE
+            else:
+                try:
+                    profile = normalize_profile_name(raw)
+                except ValueError:
+                    self._write_text_atomic(self.active_profile_path, CORE_PROFILE)
+                    profile = CORE_PROFILE
+                if not self.profile_exists(profile):
+                    self._write_text_atomic(self.active_profile_path, CORE_PROFILE)
+                    profile = CORE_PROFILE
+        if profile == CORE_PROFILE:
+            self._ensure_default_profile()
+            if self.profile_exists(DEFAULT_PROFILE):
+                self._write_text_atomic(self.active_profile_path, DEFAULT_PROFILE)
+                return DEFAULT_PROFILE
         return profile
 
     def set_active_profile(self, profile: str, *, create_if_missing: bool = True) -> CoreRuntimeConfig:
@@ -311,6 +370,9 @@ class CoreConfigManager:
         path.unlink()
         if self.get_active_profile() == normalized:
             self._write_text_atomic(self.active_profile_path, CORE_PROFILE)
+        self._ensure_default_profile()
+        if self.get_active_profile() == CORE_PROFILE and self.profile_exists(DEFAULT_PROFILE):
+            self._write_text_atomic(self.active_profile_path, DEFAULT_PROFILE)
         return normalized
 
     def load_active(self) -> tuple[str, CoreRuntimeConfig]:

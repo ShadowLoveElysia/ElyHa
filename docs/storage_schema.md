@@ -2,6 +2,13 @@
 
 当前 SQLite schema 版本：`v1`
 
+## File-Based Runtime Config
+
+- `data/core_configs/core.json`: Core 默认运行配置（只读模板）。
+- `data/core_configs/default.json`: 首次启动自动创建的默认 Profile（从 Core 复制）。
+- `data/core_configs/<profile>.json`: 用户 Profile（包含敏感项，如 API Key 槽位映射）。
+- `data/llm_presets/<tag>.json`: 用户自定义预设（仅非敏感字段，不保存 API Key）。
+
 ## Tables
 
 - `projects`

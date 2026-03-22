@@ -91,10 +91,12 @@ export interface UpdateNodePayload {
 export interface RuntimeConfigPayload {
   locale: string;
   llm_provider: string;
+  preset_tag: string;
   llm_transport: string;
   api_url: string;
   api_key: string;
   api_key_mask: string;
+  api_key_slot_masks: Record<string, string>;
   model_name: string;
   auto_complete: boolean;
   think_switch: boolean;
@@ -122,12 +124,26 @@ export interface LlmPresetPayload {
   tag: string;
   name: string;
   group: string;
+  source: string;
+  is_user: boolean;
   api_format: string;
   llm_transport: string;
   api_url: string;
   auto_complete: boolean;
   default_model: string;
   models: string[];
+}
+
+export interface CreateLlmPresetPayload {
+  name: string;
+  tag?: string;
+  group?: string;
+  api_format?: string;
+  llm_transport?: string;
+  api_url?: string;
+  default_model?: string;
+  models?: string[];
+  auto_complete?: boolean;
 }
 
 export interface ValidationIssue {

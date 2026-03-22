@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import os
 from pathlib import Path
+import re
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -19,7 +20,12 @@ from elyha_core.i18n import (
     tr,
 )
 from elyha_core.core_config import CORE_PROFILE, CoreConfigManager, CoreRuntimeConfig
-from elyha_core.llm_presets import LLMPreset, load_llm_presets
+from elyha_core.llm_presets import (
+    LLMPreset,
+    UserLLMPresetManager,
+    load_llm_presets,
+    normalize_preset_tag,
+)
 from elyha_core.models.task import TaskStatus
 from elyha_core.services.ai_service import AIService
 from elyha_core.services.context_service import ContextService
@@ -66,6 +72,8 @@ class ServiceContainer:
     session_orchestrator_service: SessionOrchestratorService
     insight_service: InsightService
     core_config_manager: CoreConfigManager
+    builtin_llm_presets: dict[str, LLMPreset]
+    user_preset_manager: UserLLMPresetManager
     llm_presets: dict[str, LLMPreset]
 
 
@@ -388,6 +396,7 @@ class CreateChatThreadRequest(BaseModel):
 class UpdateRuntimeSettingsRequest(BaseModel):
     locale: str | None = None
     llm_provider: str | None = None
+    preset_tag: str | None = None
     llm_transport: str | None = None
     api_url: str | None = None
     api_key: str | None = None
@@ -420,6 +429,23 @@ class CreateRuntimeProfileRequest(BaseModel):
 class RenameRuntimeProfileRequest(BaseModel):
     profile: str
     new_profile: str
+
+
+class CreateLlmPresetRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    tag: str | None = None
+    group: str | None = None
+    api_format: str | None = None
+    llm_transport: str | None = None
+    api_url: str | None = None
+    default_model: str | None = None
+    models: list[str] = Field(default_factory=list)
+    auto_complete: bool = True
+
+
+class RenameLlmPresetRequest(BaseModel):
+    tag: str
+    new_name: str = Field(min_length=1, max_length=120)
 
 
 def _to_project_payload(project) -> dict[str, Any]:
@@ -556,13 +582,20 @@ def _parse_relationship_pairs(values: list[str]) -> list[tuple[str, str]]:
 
 
 def _to_runtime_config_payload(config: CoreRuntimeConfig) -> dict[str, Any]:
+    slot_masks = {
+        slot: _mask_secret(secret)
+        for slot, secret in config.api_key_store.items()
+        if str(secret or "").strip()
+    }
     return {
         "locale": config.locale,
         "llm_provider": config.llm_provider,
+        "preset_tag": config.preset_tag,
         "llm_transport": config.llm_transport,
         "api_url": config.api_url,
         "api_key": "",
         "api_key_mask": _mask_secret(str(config.api_key or "")),
+        "api_key_slot_masks": slot_masks,
         "model_name": config.model_name,
         "auto_complete": config.auto_complete,
         "think_switch": config.think_switch,
@@ -598,6 +631,8 @@ def _to_llm_preset_payload(preset: LLMPreset) -> dict[str, Any]:
         "tag": preset.tag,
         "name": preset.name,
         "group": preset.group,
+        "source": preset.source,
+        "is_user": preset.source == "user",
         "api_format": preset.api_format,
         "llm_transport": preset.llm_transport,
         "api_url": preset.api_url,
@@ -605,6 +640,37 @@ def _to_llm_preset_payload(preset: LLMPreset) -> dict[str, Any]:
         "default_model": preset.model,
         "models": list(preset.models),
     }
+
+
+def _merge_llm_presets(
+    builtin_presets: dict[str, LLMPreset],
+    user_presets: dict[str, LLMPreset],
+) -> dict[str, LLMPreset]:
+    merged = dict(builtin_presets)
+    for tag, preset in user_presets.items():
+        merged[tag] = preset
+    return merged
+
+
+def _sorted_llm_presets(presets: dict[str, LLMPreset]) -> list[LLMPreset]:
+    return sorted(
+        presets.values(),
+        key=lambda item: (
+            0 if item.source == "builtin" else 1,
+            str(item.group or "").lower(),
+            str(item.name or "").lower(),
+            item.tag,
+        ),
+    )
+
+
+def _slugify_preset_tag(name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", str(name or "").strip().lower()).strip("-._")
+    if not slug:
+        slug = "preset"
+    if len(slug) > 64:
+        slug = slug[:64].rstrip("-._")
+    return slug or "preset"
 
 
 def _to_llm_platform_config(config: CoreRuntimeConfig) -> dict[str, Any]:
@@ -664,7 +730,10 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     config_root = Path(os.getenv("ELYHA_CORE_CONFIG_DIR", db_file.parent / "core_configs"))
     core_config_manager = CoreConfigManager(config_root)
     preset_path = Path(os.getenv("ELYHA_PRESET_PATH", Path(__file__).resolve().parent.parent / "preset.json"))
-    llm_presets = load_llm_presets(preset_path)
+    builtin_llm_presets = load_llm_presets(preset_path)
+    user_preset_root = Path(os.getenv("ELYHA_USER_PRESET_DIR", db_file.parent / "llm_presets"))
+    user_preset_manager = UserLLMPresetManager(user_preset_root)
+    llm_presets = _merge_llm_presets(builtin_llm_presets, user_preset_manager.load_presets())
     _, runtime_config = core_config_manager.load_active()
     os.environ["ELYHA_LOCALE"] = runtime_config.locale
     ai_service = _build_ai_service(
@@ -699,6 +768,8 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
         session_orchestrator_service=session_orchestrator_service,
         insight_service=InsightService(repository),
         core_config_manager=core_config_manager,
+        builtin_llm_presets=builtin_llm_presets,
+        user_preset_manager=user_preset_manager,
         llm_presets=llm_presets,
     )
 
@@ -738,6 +809,12 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     def healthz() -> dict[str, str]:
         return {"status": "ok", "service": "elyha_api"}
 
+    def _reload_llm_presets() -> dict[str, LLMPreset]:
+        user_presets = services.user_preset_manager.load_presets()
+        merged = _merge_llm_presets(services.builtin_llm_presets, user_presets)
+        services.llm_presets = merged
+        return merged
+
     def _apply_runtime_config(config: CoreRuntimeConfig) -> None:
         os.environ["ELYHA_LOCALE"] = config.locale
         services.ai_service = _build_ai_service(
@@ -755,10 +832,139 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
 
     @api.get("/api/llm/presets")
     def list_llm_presets() -> list[dict[str, Any]]:
+        presets = _reload_llm_presets()
         return [
             _to_llm_preset_payload(preset)
-            for preset in services.llm_presets.values()
+            for preset in _sorted_llm_presets(presets)
         ]
+
+    @api.post("/api/llm/presets")
+    def create_llm_preset(payload: CreateLlmPresetRequest) -> dict[str, Any]:
+        name = str(payload.name or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="preset name cannot be empty")
+        presets = _reload_llm_presets()
+        if payload.tag is None or not str(payload.tag).strip():
+            base_tag = _slugify_preset_tag(name)
+            tag = base_tag
+            index = 1
+            while tag in presets:
+                suffix = f"-{index}"
+                stem = base_tag[: max(1, 64 - len(suffix))].rstrip("-._")
+                tag = f"{stem}{suffix}" if stem else f"preset{suffix}"
+                index += 1
+        else:
+            try:
+                tag = normalize_preset_tag(payload.tag)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if tag in services.builtin_llm_presets:
+            raise HTTPException(status_code=400, detail=f"preset tag is reserved by builtin preset: {tag}")
+        if tag in presets:
+            raise HTTPException(status_code=400, detail=f"preset already exists: {tag}")
+        llm_transport = str(payload.llm_transport or "").strip().lower()
+        if llm_transport in {"openai_sdk", "openai-client", "openai_client"}:
+            llm_transport = "openai"
+        elif llm_transport in {"anthropic_sdk", "anthropic-client", "anthropic_client"}:
+            llm_transport = "anthropic"
+        elif llm_transport not in {"httpx", "openai", "anthropic"}:
+            llm_transport = "httpx"
+        model = str(payload.default_model or "").strip()
+        models: list[str] = []
+        for item in payload.models:
+            text = str(item or "").strip()
+            if text and text not in models:
+                models.append(text)
+        if model and model not in models:
+            models.insert(0, model)
+        api_format = str(payload.api_format or "").strip()
+        if not api_format:
+            api_format = "Anthropic" if llm_transport == "anthropic" else "OpenAI"
+        candidate = LLMPreset(
+            tag=tag,
+            name=name,
+            group=str(payload.group or "").strip() or "custom",
+            api_format=api_format,
+            llm_transport=llm_transport,
+            api_url=str(payload.api_url or "").strip(),
+            api_key="",
+            model=model,
+            models=models,
+            auto_complete=bool(payload.auto_complete),
+            source="user",
+        )
+        try:
+            saved = services.user_preset_manager.save_preset(candidate, overwrite=False)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _reload_llm_presets()
+        _, active_config = services.core_config_manager.load_active()
+        _apply_runtime_config(active_config)
+        return _to_llm_preset_payload(saved)
+
+    @api.post("/api/llm/presets/rename")
+    def rename_llm_preset(payload: RenameLlmPresetRequest) -> dict[str, Any]:
+        next_name = str(payload.new_name or "").strip()
+        if not next_name:
+            raise HTTPException(status_code=400, detail="preset name cannot be empty")
+        try:
+            tag = normalize_preset_tag(payload.tag)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        presets = _reload_llm_presets()
+        target = presets.get(tag)
+        if target is None:
+            raise HTTPException(status_code=404, detail=f"preset not found: {tag}")
+        if target.source != "user":
+            raise HTTPException(status_code=403, detail="builtin preset cannot be renamed")
+        candidate = LLMPreset(
+            tag=target.tag,
+            name=next_name,
+            group=target.group,
+            api_format=target.api_format,
+            llm_transport=target.llm_transport,
+            api_url=target.api_url,
+            api_key="",
+            model=target.model,
+            models=list(target.models),
+            auto_complete=bool(target.auto_complete),
+            source="user",
+        )
+        try:
+            saved = services.user_preset_manager.save_preset(candidate, overwrite=True)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _reload_llm_presets()
+        _, active_config = services.core_config_manager.load_active()
+        _apply_runtime_config(active_config)
+        return _to_llm_preset_payload(saved)
+
+    @api.delete("/api/llm/presets/{tag}")
+    def delete_llm_preset(tag: str) -> dict[str, Any]:
+        try:
+            normalized = normalize_preset_tag(tag)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        presets = _reload_llm_presets()
+        target = presets.get(normalized)
+        if target is None:
+            raise HTTPException(status_code=404, detail=f"preset not found: {normalized}")
+        if target.source != "user":
+            raise HTTPException(status_code=403, detail="builtin preset cannot be deleted")
+        try:
+            services.user_preset_manager.delete_preset(normalized)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        _reload_llm_presets()
+        active_profile, active_config = services.core_config_manager.load_active()
+        if active_profile != CORE_PROFILE and active_config.preset_tag == normalized:
+            merged = asdict(active_config)
+            merged["preset_tag"] = ""
+            saved = services.core_config_manager.save_profile(active_profile, CoreRuntimeConfig(**merged).normalized())
+            _apply_runtime_config(saved)
+        else:
+            _apply_runtime_config(active_config)
+        return {"status": "deleted", "tag": normalized}
 
     @api.get("/api/i18n/{locale}")
     def get_i18n_catalog(locale: str) -> dict[str, str]:

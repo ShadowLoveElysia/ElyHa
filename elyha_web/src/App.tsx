@@ -8,11 +8,13 @@ import {WindowDialog, type WindowDialogState} from './components/window';
 import {SUPPORTED_LOCALES, loadLocaleDict, tFrom, type TranslationVars} from './i18n';
 import {
   ApiTimeoutError,
+  createLlmPreset,
   createRuntimeProfile,
   createEdge,
   createNode,
   createProject,
   createSnapshot,
+  deleteLlmPreset,
   deleteEdge,
   deleteNode,
   deleteProject,
@@ -27,6 +29,7 @@ import {
   listProjects,
   listSnapshots,
   rollbackProject,
+  renameLlmPreset,
   switchRuntimeProfile,
   updateNode,
   upsertProjectRelationship,
@@ -100,10 +103,12 @@ interface DialogResolve {
 interface RuntimeDraft {
   locale: string;
   llm_provider: string;
+  preset_tag: string;
   llm_transport: 'httpx' | 'openai' | 'anthropic';
   api_url: string;
   api_key: string;
   api_key_mask: string;
+  api_key_slot_masks: Record<string, string>;
   model_name: string;
   web_search_enabled: boolean;
   default_workflow_mode: WorkflowMode;
@@ -117,13 +122,18 @@ function toRuntimeDraft(config: RuntimeConfigPayload): RuntimeDraft {
   const dynamicMask = typeof config.api_key_mask === 'string'
     ? config.api_key_mask
     : '';
+  const slotMasks = config.api_key_slot_masks && typeof config.api_key_slot_masks === 'object'
+    ? config.api_key_slot_masks
+    : {};
   return {
     locale: config.locale,
     llm_provider: 'llmrequester',
+    preset_tag: String(config.preset_tag || '').trim().toLowerCase(),
     llm_transport: llmTransport,
     api_url: config.api_url,
     api_key: '',
     api_key_mask: dynamicMask,
+    api_key_slot_masks: slotMasks,
     model_name: config.model_name,
     web_search_enabled: config.web_search_enabled,
     default_workflow_mode: workflowMode,
@@ -291,10 +301,12 @@ export default function App() {
   const [settingsDraft, setSettingsDraft] = useState<RuntimeDraft>({
     locale: 'zh',
     llm_provider: 'llmrequester',
+    preset_tag: '',
     llm_transport: 'httpx',
     api_url: '',
     api_key: '',
     api_key_mask: '',
+    api_key_slot_masks: {},
     model_name: '',
     web_search_enabled: false,
     default_workflow_mode: 'multi_agent',
@@ -471,7 +483,8 @@ export default function App() {
   const applyRuntimeSettings = useCallback((payload: RuntimeSettingsPayload) => {
     setRuntimeSettings(payload);
     setSettingsDraft(toRuntimeDraft(payload.config));
-    setSelectedPresetScheme('custom');
+    const presetTag = String(payload.config.preset_tag || '').trim().toLowerCase();
+    setSelectedPresetScheme(presetTag ? `preset:${presetTag}` : 'custom');
   }, []);
 
   const loadLlmPresetList = useCallback(async () => {
@@ -1180,6 +1193,7 @@ export default function App() {
     const payload: Partial<RuntimeConfigPayload> = {
       locale: settingsDraft.locale,
       llm_provider: 'llmrequester',
+      preset_tag: settingsDraft.preset_tag,
       llm_transport: settingsDraft.llm_transport,
       api_url: settingsDraft.api_url,
       model_name: settingsDraft.model_name,
@@ -1251,6 +1265,23 @@ export default function App() {
     return profileOptions.some((item) => item.value === activeProfile) ? activeProfile : '';
   }, [profileOptions, runtimeSettings?.active_profile]);
 
+  const selectedPresetTag = useMemo(() => {
+    const current = String(selectedPresetScheme || '').trim();
+    if (!current.startsWith('preset:')) {
+      return '';
+    }
+    return current.slice('preset:'.length).trim().toLowerCase();
+  }, [selectedPresetScheme]);
+
+  const selectedPreset = useMemo(() => {
+    if (!selectedPresetTag) {
+      return null;
+    }
+    return llmPresets.find((item) => item.tag === selectedPresetTag) || null;
+  }, [llmPresets, selectedPresetTag]);
+
+  const canManageSelectedPreset = Boolean(selectedPreset?.is_user);
+
   const applyLlmPreset = useCallback(
     (tag: string) => {
       const preset = llmPresets.find((item) => item.tag === tag);
@@ -1263,9 +1294,12 @@ export default function App() {
         : 'httpx';
       setSettingsDraft((prev) => ({
         ...prev,
+        preset_tag: tag,
         llm_provider: 'llmrequester',
         llm_transport: nextTransport,
         api_url: preset.api_url || prev.api_url,
+        api_key: '',
+        api_key_mask: prev.api_key_slot_masks[tag] || prev.api_key_slot_masks.default || '',
         model_name: nextModel || prev.model_name,
       }));
       setSelectedPresetScheme(`preset:${tag}`);
@@ -1295,6 +1329,12 @@ export default function App() {
       const clean = String(nextValue || '').trim();
       if (!clean || clean === 'custom') {
         setSelectedPresetScheme('custom');
+        setSettingsDraft((prev) => ({
+          ...prev,
+          preset_tag: '',
+          api_key: '',
+          api_key_mask: prev.api_key_slot_masks.default || '',
+        }));
         return;
       }
       if (clean.startsWith('preset:')) {
@@ -1305,6 +1345,90 @@ export default function App() {
     },
     [applyLlmPreset],
   );
+
+  const handleCreatePreset = useCallback(async () => {
+    const presetNameRaw = await askPrompt({
+      title: t('web.runtime.create_preset_title'),
+      message: t('web.runtime.create_preset_body'),
+      placeholder: t('web.runtime.new_profile_placeholder'),
+    });
+    const presetName = (presetNameRaw || '').trim();
+    if (!presetName) {
+      return;
+    }
+    await execute(async () => {
+      const model = settingsDraft.model_name.trim();
+      const created = await createLlmPreset({
+        name: presetName,
+        llm_transport: settingsDraft.llm_transport,
+        api_url: settingsDraft.api_url.trim(),
+        default_model: model,
+        models: model ? [model] : [],
+        auto_complete: true,
+      });
+      setLlmPresets((prev) => {
+        const next = prev.filter((item) => item.tag !== created.tag);
+        next.push(created);
+        next.sort((left, right) => `${left.group}:${left.name}`.localeCompare(`${right.group}:${right.name}`));
+        return next;
+      });
+      setSettingsDraft((prev) => ({
+        ...prev,
+        preset_tag: created.tag,
+        api_key: '',
+        api_key_mask: prev.api_key_slot_masks[created.tag] || prev.api_key_slot_masks.default || '',
+      }));
+      setSelectedPresetScheme(`preset:${created.tag}`);
+      setStatus(t('web.toast.preset_created', {preset: created.name}));
+    }, t('web.error.runtime_preset_create_failed'));
+  }, [askPrompt, execute, setStatus, settingsDraft.api_url, settingsDraft.llm_transport, settingsDraft.model_name, t]);
+
+  const handleRenamePreset = useCallback(async () => {
+    if (!selectedPreset || !selectedPreset.is_user) {
+      return;
+    }
+    const renamedRaw = await askPrompt({
+      title: t('web.runtime.rename_preset_title'),
+      message: t('web.runtime.rename_preset_body', {preset: selectedPreset.name}),
+      defaultValue: selectedPreset.name,
+      placeholder: selectedPreset.name,
+    });
+    const renamed = (renamedRaw || '').trim();
+    if (!renamed || renamed === selectedPreset.name) {
+      return;
+    }
+    await execute(async () => {
+      const updated = await renameLlmPreset(selectedPreset.tag, renamed);
+      setLlmPresets((prev) => {
+        const next = prev.map((item) => (item.tag === updated.tag ? updated : item));
+        next.sort((left, right) => `${left.group}:${left.name}`.localeCompare(`${right.group}:${right.name}`));
+        return next;
+      });
+      setStatus(t('web.toast.preset_renamed', {preset: updated.name}));
+    }, t('web.error.runtime_preset_rename_failed'));
+  }, [askPrompt, execute, selectedPreset, setStatus, t]);
+
+  const handleDeletePreset = useCallback(async () => {
+    if (!selectedPreset || !selectedPreset.is_user) {
+      return;
+    }
+    const confirmed = await askConfirm(
+      t('web.runtime.delete_preset_title'),
+      t('web.runtime.delete_preset_body', {preset: selectedPreset.name}),
+      true,
+    );
+    if (!confirmed) {
+      return;
+    }
+    await execute(async () => {
+      await deleteLlmPreset(selectedPreset.tag);
+      await loadLlmPresetList();
+      const payload = await getRuntimeSettings();
+      applyRuntimeSettings(payload);
+      await applyLocale(payload.config.locale);
+      setStatus(t('web.toast.preset_deleted', {preset: selectedPreset.name}));
+    }, t('web.error.runtime_preset_delete_failed'));
+  }, [applyLocale, applyRuntimeSettings, askConfirm, execute, loadLlmPresetList, selectedPreset, setStatus, t]);
 
   const handleCreateProfile = useCallback(async () => {
     const profileNameRaw = await askPrompt({
@@ -1322,7 +1446,6 @@ export default function App() {
       const saved = await updateRuntimeSettings(buildRuntimePatch());
       applyRuntimeSettings(saved);
       await applyLocale(saved.config.locale);
-      setSelectedPresetScheme('custom');
       setStatus(t('web.toast.runtime_profile_created', {profile: profileName}));
     }, t('web.error.runtime_profile_create_failed'));
   }, [applyLocale, applyRuntimeSettings, askPrompt, buildRuntimePatch, execute, setStatus, t]);
@@ -1509,6 +1632,11 @@ export default function App() {
               <div className="max-w-4xl mx-auto bg-white rounded-2xl border border-slate-200 shadow-sm p-6">
                 <h2 className="text-xl font-bold text-slate-800">{t('web.section.runtime')}</h2>
                 <p className="text-sm text-slate-500 mt-1">{t('web.runtime.panel_hint')}</p>
+                <div className="mt-4 rounded-xl border border-rose-300 bg-rose-50 px-4 py-3">
+                  <p className="text-sm font-semibold text-rose-700">{t('web.runtime.security_warning_title')}</p>
+                  <p className="mt-1 text-sm leading-relaxed text-rose-700">{t('web.runtime.security_warning_body_1')}</p>
+                  <p className="mt-1 text-sm leading-relaxed text-rose-700">{t('web.runtime.security_warning_body_2')}</p>
+                </div>
 
                 {!runtimeSettings ? (
                   <div className="mt-5 text-slate-500">{t('web.runtime.loading')}</div>
@@ -1550,18 +1678,40 @@ export default function App() {
                     </FormRow>
 
                     <FormRow label={t('web.runtime.preset')}>
-                      <select
-                        value={selectedPresetScheme}
-                        onChange={(event) => handlePresetChange(event.target.value)}
-                        className="w-full h-10 rounded-lg border border-slate-200 px-3 text-sm bg-white"
-                      >
-                        <option value="custom">{t('web.runtime.preset_none')}</option>
-                        {presetOptions.map((option) => (
-                          <option key={option.value} value={option.value}>
-                            {option.label}
-                          </option>
-                        ))}
-                      </select>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <select
+                          value={selectedPresetScheme}
+                          onChange={(event) => handlePresetChange(event.target.value)}
+                          className="min-w-[180px] flex-1 h-10 rounded-lg border border-slate-200 px-3 text-sm bg-white"
+                        >
+                          <option value="custom">{t('web.runtime.preset_none')}</option>
+                          {presetOptions.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          onClick={() => void handleCreatePreset()}
+                          className="h-10 px-3 rounded-lg border border-pink-200 text-pink-600 text-sm font-semibold hover:bg-pink-50"
+                        >
+                          {t('web.runtime.create_preset')}
+                        </button>
+                        <button
+                          onClick={() => void handleRenamePreset()}
+                          disabled={!canManageSelectedPreset}
+                          className="h-10 px-3 rounded-lg border border-slate-200 text-slate-600 text-sm font-semibold enabled:hover:bg-slate-100 disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          {t('web.runtime.rename_preset')}
+                        </button>
+                        <button
+                          onClick={() => void handleDeletePreset()}
+                          disabled={!canManageSelectedPreset}
+                          className="h-10 px-3 rounded-lg border border-rose-200 text-rose-600 text-sm font-semibold enabled:hover:bg-rose-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          {t('web.runtime.delete_preset')}
+                        </button>
+                      </div>
                     </FormRow>
 
                     <FormRow label={t('web.runtime.api_url')}>

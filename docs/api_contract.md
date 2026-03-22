@@ -11,6 +11,9 @@
 - `POST /api/settings/runtime/profiles/rename`
 - `DELETE /api/settings/runtime/profiles/{profile}`
 - `GET /api/llm/presets`
+- `POST /api/llm/presets`
+- `POST /api/llm/presets/rename`
+- `DELETE /api/llm/presets/{tag}`
 
 - `GET /api/projects`
 - `POST /api/projects`

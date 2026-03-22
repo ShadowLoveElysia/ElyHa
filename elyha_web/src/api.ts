@@ -7,6 +7,7 @@ import type {
   ChatThreadCreateResponse,
   ChatThreadMessagesResponse,
   ChatThreadsResponse,
+  CreateLlmPresetPayload,
   CreateNodePayload,
   GenerateChapterResponse,
   GraphEdgePayload,
@@ -456,6 +457,29 @@ export async function getRuntimeSettings(): Promise<RuntimeSettingsPayload> {
 
 export async function listLlmPresets(): Promise<LlmPresetPayload[]> {
   return apiRequest<LlmPresetPayload[]>('/api/llm/presets');
+}
+
+export async function createLlmPreset(payload: CreateLlmPresetPayload): Promise<LlmPresetPayload> {
+  return apiRequest<LlmPresetPayload>('/api/llm/presets', {
+    method: 'POST',
+    body: payload,
+  });
+}
+
+export async function renameLlmPreset(tag: string, newName: string): Promise<LlmPresetPayload> {
+  return apiRequest<LlmPresetPayload>('/api/llm/presets/rename', {
+    method: 'POST',
+    body: {
+      tag,
+      new_name: newName,
+    },
+  });
+}
+
+export async function deleteLlmPreset(tag: string): Promise<{status: string; tag: string}> {
+  return apiRequest<{status: string; tag: string}>(`/api/llm/presets/${encodeURIComponent(tag)}`, {
+    method: 'DELETE',
+  });
 }
 
 export async function updateRuntimeSettings(
