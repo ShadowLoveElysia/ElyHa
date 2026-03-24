@@ -110,8 +110,31 @@ interface RuntimeDraft {
   api_key_mask: string;
   api_key_slot_masks: Record<string, string>;
   model_name: string;
+  think_switch: boolean;
+  think_depth: 'low' | 'medium' | 'high';
+  thinking_budget: number;
   web_search_enabled: boolean;
   default_workflow_mode: WorkflowMode;
+}
+
+const THINKING_DEPTH_OPTIONS: Array<{value: RuntimeDraft['think_depth']; label: string}> = [
+  {value: 'low', label: 'low'},
+  {value: 'medium', label: 'medium'},
+  {value: 'high', label: 'high'},
+];
+
+function clampThinkingBudget(value: unknown): number {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  if (!Number.isFinite(parsed)) {
+    return 2048;
+  }
+  if (parsed < 128) {
+    return 128;
+  }
+  if (parsed > 32768) {
+    return 32768;
+  }
+  return parsed;
 }
 
 function toRuntimeDraft(config: RuntimeConfigPayload): RuntimeDraft {
@@ -125,6 +148,10 @@ function toRuntimeDraft(config: RuntimeConfigPayload): RuntimeDraft {
   const slotMasks = config.api_key_slot_masks && typeof config.api_key_slot_masks === 'object'
     ? config.api_key_slot_masks
     : {};
+  const thinkDepthRaw = String(config.think_depth || '').trim().toLowerCase();
+  const thinkDepth: RuntimeDraft['think_depth'] = thinkDepthRaw === 'low' || thinkDepthRaw === 'high'
+    ? thinkDepthRaw
+    : 'medium';
   return {
     locale: config.locale,
     llm_provider: 'llmrequester',
@@ -135,6 +162,9 @@ function toRuntimeDraft(config: RuntimeConfigPayload): RuntimeDraft {
     api_key_mask: dynamicMask,
     api_key_slot_masks: slotMasks,
     model_name: config.model_name,
+    think_switch: Boolean(config.think_switch),
+    think_depth: thinkDepth,
+    thinking_budget: clampThinkingBudget(config.thinking_budget),
     web_search_enabled: config.web_search_enabled,
     default_workflow_mode: workflowMode,
   };
@@ -308,6 +338,9 @@ export default function App() {
     api_key_mask: '',
     api_key_slot_masks: {},
     model_name: '',
+    think_switch: false,
+    think_depth: 'medium',
+    thinking_budget: 2048,
     web_search_enabled: false,
     default_workflow_mode: 'multi_agent',
   });
@@ -1197,6 +1230,9 @@ export default function App() {
       llm_transport: settingsDraft.llm_transport,
       api_url: settingsDraft.api_url,
       model_name: settingsDraft.model_name,
+      think_switch: settingsDraft.think_switch,
+      think_depth: settingsDraft.think_depth,
+      thinking_budget: clampThinkingBudget(settingsDraft.thinking_budget),
       web_search_enabled: settingsDraft.web_search_enabled,
       default_workflow_mode: settingsDraft.default_workflow_mode,
     };
@@ -1771,6 +1807,61 @@ export default function App() {
                         ))}
                       </select>
                     </FormRow>
+
+                    <div className="md:col-span-2 flex items-center gap-2 mt-1">
+                      <input
+                        id="think_switch"
+                        type="checkbox"
+                        checked={settingsDraft.think_switch}
+                        onChange={(event) =>
+                          setSettingsDraft((prev) => ({
+                            ...prev,
+                            think_switch: event.target.checked,
+                          }))
+                        }
+                      />
+                      <label htmlFor="think_switch" className="text-sm text-slate-700">{t('web.runtime.think_switch')}</label>
+                    </div>
+
+                    {settingsDraft.think_switch ? (
+                      <>
+                        <FormRow label={t('web.runtime.think_depth')}>
+                          <select
+                            value={settingsDraft.think_depth}
+                            onChange={(event) =>
+                              setSettingsDraft((prev) => ({
+                                ...prev,
+                                think_depth: event.target.value as RuntimeDraft['think_depth'],
+                              }))
+                            }
+                            className="w-full h-10 rounded-lg border border-slate-200 px-3 text-sm bg-white"
+                          >
+                            {THINKING_DEPTH_OPTIONS.map((option) => (
+                              <option key={option.value} value={option.value}>
+                                {option.label}
+                              </option>
+                            ))}
+                          </select>
+                        </FormRow>
+
+                        <FormRow label={t('web.runtime.thinking_budget')}>
+                          <input
+                            type="number"
+                            min={128}
+                            max={32768}
+                            step={128}
+                            value={settingsDraft.thinking_budget}
+                            onChange={(event) =>
+                              setSettingsDraft((prev) => ({
+                                ...prev,
+                                thinking_budget: clampThinkingBudget(event.target.value),
+                              }))
+                            }
+                            className="w-full h-10 rounded-lg border border-slate-200 px-3 text-sm"
+                          />
+                        </FormRow>
+                      </>
+                    ) : null}
 
                     <div className="md:col-span-2 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
                       <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">

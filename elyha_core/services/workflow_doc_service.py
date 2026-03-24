@@ -165,15 +165,18 @@ class WorkflowDocumentService:
                 clarify_questions=state.clarify_questions,
                 token_budget=max(1200, token_budget),
             )
+            incoming_docs = self._docs_from_draft_result(draft)
             state.pending_docs = self._merge_docs(
                 current=state.pending_docs,
-                incoming=self._docs_from_draft_result(draft),
+                incoming=incoming_docs,
             )
             written = [
                 str(item).strip()
                 for item in list(getattr(draft, "written_keys", []) or [])
                 if str(item).strip()
             ]
+            if not written:
+                written = [key for key, value in incoming_docs.items() if str(value or "").strip()]
             if not written:
                 state.workflow_stage = "collect_plan"
                 state.assistant_message = self._workflow_doc_message_from_result(draft)
@@ -194,15 +197,18 @@ class WorkflowDocumentService:
                 user_feedback=text,
                 token_budget=max(1200, token_budget),
             )
+            incoming_docs = self._docs_from_draft_result(revised)
             state.pending_docs = self._merge_docs(
                 current=state.pending_docs,
-                incoming=self._docs_from_draft_result(revised),
+                incoming=incoming_docs,
             )
             written = [
                 str(item).strip()
                 for item in list(getattr(revised, "written_keys", []) or [])
                 if str(item).strip()
             ]
+            if not written:
+                written = [key for key, value in incoming_docs.items() if str(value or "").strip()]
             if not written:
                 state.workflow_stage = "revise"
                 state.assistant_message = self._workflow_doc_message_from_result(revised)

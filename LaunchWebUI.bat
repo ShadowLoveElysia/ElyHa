@@ -43,6 +43,11 @@ if "%UV_ENV_FROM_USER%"=="0" (
     )
 )
 
+set "PYTHON_LAUNCHER=python"
+if exist "%UV_PROJECT_ENVIRONMENT%\Scripts\python.exe" (
+    set "PYTHON_LAUNCHER=%UV_PROJECT_ENVIRONMENT%\Scripts\python.exe"
+)
+
 echo [ElyHa] Launching Web GUI with db: %DB_PATH%
 echo [ElyHa] Open: http://%HOST%:%PORT%/
 echo [ElyHa] Active config profile: %ACTIVE_PROFILE%
@@ -53,10 +58,14 @@ if %errorlevel%==0 (
     echo [ElyHa] uv environment: %UV_PROJECT_ENVIRONMENT%
     set "ELYHA_DB_PATH=%DB_PATH%"
     uv run uvicorn elyha_api.app:app --host %HOST% --port %PORT%
+    if errorlevel 1 (
+        echo [ElyHa] uv launch failed, fallback to "%PYTHON_LAUNCHER%" -m uvicorn.
+        "%PYTHON_LAUNCHER%" -m uvicorn elyha_api.app:app --host %HOST% --port %PORT%
+    )
 ) else (
-    echo [ElyHa] uv not found, fallback to python -m uvicorn.
+    echo [ElyHa] uv not found, fallback to "%PYTHON_LAUNCHER%" -m uvicorn.
     set "ELYHA_DB_PATH=%DB_PATH%"
-    python -m uvicorn elyha_api.app:app --host %HOST% --port %PORT%
+    "%PYTHON_LAUNCHER%" -m uvicorn elyha_api.app:app --host %HOST% --port %PORT%
 )
 
 if errorlevel 1 (

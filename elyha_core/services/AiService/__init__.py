@@ -1,12 +1,7 @@
-"""Backward-compatible AIService exports.
+"""AIService package entrypoint."""
 
-Implementation moved to `elyha_core.services.AiService` package.
-"""
-
-from __future__ import annotations
-
-from elyha_core.services.AiService import (
-    AIService,
+from .service import AIService
+from .types import (
     BranchOption,
     ChapterDraftResult,
     ChatAssistResult,
